@@ -45,7 +45,7 @@ from hypercoil.loss.scheme import (
     LossArgument,
     UnpackingLossArgument,
 )
-from hypercoil.examples.synthetic.scripts.corr import (
+from hypercoil_examples.synthetic.scripts.corr import (
     synthesise_state_transition,
     synthesise_state_markov_chain,
     get_transitions,
@@ -55,7 +55,7 @@ from hypercoil.examples.synthetic.scripts.corr import (
     correlation_alignment,
     kmeans_init
 )
-from hypercoil.examples.synthetic.experiments.overfit_plot import (
+from hypercoil_examples.synthetic.experiments.overfit_plot import (
     overfit_and_plot_progress,
 )
 
@@ -524,7 +524,7 @@ def unsupervised_state_detection_experiment(
 
 
 def main():
-    from hypercoil.examples.synthetic.experiments.run import run_layer_experiments
+    from hypercoil_examples.synthetic.experiments.run import run_layer_experiments
     run_layer_experiments('corr')
 
 

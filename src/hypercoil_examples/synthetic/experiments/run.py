@@ -57,8 +57,8 @@ def run_experiment(layer, expt, index=None, results=None):
 
 def run_layer_experiments(layer):
     exptdir = pkgrf(
-        'hypercoil',
-        'examples/synthetic/experiments/config'
+        'hypercoil_examples',
+        'synthetic/experiments/config'
     )
     experiments = glob.glob(f'{exptdir}/layer-{layer}*.json')
     for i, experiment in enumerate(experiments):

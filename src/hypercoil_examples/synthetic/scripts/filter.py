@@ -15,7 +15,7 @@ from typing import Optional, Sequence, Tuple
 from jax.numpy.fft import rfft, irfft
 from hypercoil.engine.paramutil import PyTree, Tensor, _to_jax_array
 from hypercoil.functional import complex_decompose
-from hypercoil.examples.synthetic.scripts.mix import synthesise_mixture
+from hypercoil_examples.synthetic.scripts.mix import synthesise_mixture
 
 
 APPROX_ORTHO_THRESH = 0.1

@@ -27,7 +27,7 @@ from hypercoil.loss.scheme import (
     LossArgument,
     UnpackingLossArgument,
 )
-from hypercoil.examples.synthetic.scripts.sylo import (
+from hypercoil_examples.synthetic.scripts.sylo import (
     synthesise_lowrank_block,
     plot_templates,
     plot_outcome,
@@ -164,7 +164,7 @@ def shallow_autoencoder_experiment(
 
 
 def main():
-    from hypercoil.examples.synthetic.experiments.run import (
+    from hypercoil_examples.synthetic.experiments.run import (
         run_layer_experiments
     )
     run_layer_experiments('sylo')

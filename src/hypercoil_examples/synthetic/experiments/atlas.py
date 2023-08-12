@@ -15,7 +15,7 @@ from numpyro.distributions import Uniform
 from typing import Optional, Union
 from matplotlib.pyplot import close
 from hypercoil.engine.paramutil import _to_jax_array
-from hypercoil.examples.synthetic.scripts.atlas import (
+from hypercoil_examples.synthetic.scripts.atlas import (
     hard_atlas_example,
     hard_atlas_homologue,
     soft_atlas_example,
@@ -252,7 +252,7 @@ def atlas_experiment(
 
 
 def main():
-    from hypercoil.examples.synthetic.experiments.run import (
+    from hypercoil_examples.synthetic.experiments.run import (
         run_layer_experiments
     )
     run_layer_experiments('atlas')

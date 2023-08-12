@@ -48,13 +48,13 @@ from hypercoil.loss.nn import (
     SmoothnessLoss,
     BimodalSymmetricLoss,
 )
-from hypercoil.examples.synthetic.scripts.filter import (
+from hypercoil_examples.synthetic.scripts.filter import (
     synthesise_across_bands,
     plot_frequency_partition,
     plot_mvkurtosis
 )
-from hypercoil.examples.synthetic.scripts.mix import synthesise_mixture
-from hypercoil.examples.synthetic.experiments.overfit_plot import (
+from hypercoil_examples.synthetic.scripts.mix import synthesise_mixture
+from hypercoil_examples.synthetic.experiments.overfit_plot import (
     overfit_and_plot_progress
 )
 
@@ -460,7 +460,7 @@ def dynamic_band_identification_experiment(
 
 
 def main():
-    from hypercoil.examples.synthetic.experiments.run import (
+    from hypercoil_examples.synthetic.experiments.run import (
         run_layer_experiments
     )
     run_layer_experiments('fft')

@@ -35,13 +35,13 @@ from hypercoil.loss.nn import (
     QCFCLoss,
     NormedLoss,
 )
-from hypercoil.examples.synthetic.scripts.denoise import (
+from hypercoil_examples.synthetic.scripts.denoise import (
     synthesise_artefact,
     plot_all,
     plot_select,
     plot_norm_reduction
 )
-from hypercoil.examples.synthetic.scripts.mix import (
+from hypercoil_examples.synthetic.scripts.mix import (
     synthesise_mixture
 )
 
@@ -244,7 +244,7 @@ def model_selection_experiment(
 
 
 def main():
-    from hypercoil.examples.synthetic.experiments.run import (
+    from hypercoil_examples.synthetic.experiments.run import (
         run_layer_experiments
     )
     run_layer_experiments('denoise')
