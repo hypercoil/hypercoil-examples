@@ -1,2 +1,2 @@
 recursive-include src/hypercoil_examples/data *
-recursive-include hypercoil_examples/synthetic/experiments/config *
+recursive-include src/hypercoil_examples/synthetic/experiments/config *
