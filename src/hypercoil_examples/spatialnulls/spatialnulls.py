@@ -273,7 +273,7 @@ def configure_report(
             view='lateral',
         ),
         3: dict(view='dorsal'),
-        4: dict(elements=['title', 'label_count', 'iteration']),
+        4: dict(elements=['title', 'label_count', 'iteration', 'epoch']),
         5: dict(view='ventral'),
         6: dict(
             hemisphere='left',
@@ -385,7 +385,7 @@ def train_model(
                         TextBuilder(
                             content=f'null parcellation',
                             bounding_box_height=64,
-                            font_size_multiplier=0.5,
+                            font_size_multiplier=0.7,
                             font_color='#cccccc',
                             priority=-3,
                         ),
@@ -394,7 +394,7 @@ def train_model(
                         TextBuilder(
                             content=f'{n_labels} labels',
                             bounding_box_height=48,
-                            font_size_multiplier=0.55,
+                            font_size_multiplier=0.5,
                             font_color='#cccccc',
                             priority=-2,
                         ),
@@ -403,7 +403,7 @@ def train_model(
                         TextBuilder(
                             content=f'iteration {iteration}',
                             bounding_box_height=48,
-                            font_size_multiplier=0.55,
+                            font_size_multiplier=0.5,
                             font_color='#cccccc',
                             priority=-1,
                         ),
@@ -412,7 +412,7 @@ def train_model(
                         TextBuilder(
                             content=f'epoch {epoch}',
                             bounding_box_height=48,
-                            font_size_multiplier=0.55,
+                            font_size_multiplier=0.5,
                             font_color='#cccccc',
                             priority=0,
                         ),
