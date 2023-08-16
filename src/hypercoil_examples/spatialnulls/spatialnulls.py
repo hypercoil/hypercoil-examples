@@ -289,7 +289,7 @@ def configure_report(
         surf_from_archive(),
         add_surface_overlay(
             'model',
-            surf_scalars_from_array('model', allow_multihemisphere=False, plot=False),
+            surf_scalars_from_array('model', allow_multihemisphere=False),
             parcellate_colormap('network', 'model'),
         ),
         plot_to_image(),
@@ -314,7 +314,7 @@ def forward(
     lh_coor: Tensor,
     rh_coor: Tensor,
     *,
-    key: int,
+    key: 'jax.random.PRNGKey',
 ) -> Tuple[Tensor, Mapping]:
     arg = LossArgument(
         lh = _to_jax_array(model.weight['cortex_L']),
@@ -329,19 +329,19 @@ def train_model(
     atlas: DirichletInitSurfaceAtlas,
     model: AtlasLinear,
     loss: LossScheme,
-    lr: float = 0.05,
-    max_epoch: int = 2001,
-    log_interval: int = 25,
-    out_root: str = '/tmp',
+    lr: float = LR,
+    max_epoch: int = MAX_EPOCH,
+    log_interval: int = LOG_INTERVAL,
+    out_root: str = OUT_ROOT,
     iteration: int = 0,
-    key: int = 0,
+    key: int = KEY,
 ) -> None:
     opt = optax.adam(learning_rate=lr)
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
     lh_coor, rh_coor = get_coor(atlas)
     key = jax.random.PRNGKey(key)
 
-    losses = []
+    loss_history = []
     for epoch in range(max_epoch):
         key = jax.random.fold_in(key, epoch)
         (loss_value, meta), grad = eqx.filter_jit(eqx.filter_value_and_grad(
@@ -351,7 +351,7 @@ def train_model(
         print('\n'.join(str((k, v)) for k, v in meta.items()))
         if np.isnan(loss_value):
             raise ValueError('NaN loss')
-        losses.append(loss_value)
+        loss_history.append(loss_value)
         updates, opt_state = opt.update(
             eqx.filter(grad, eqx.is_inexact_array),
             opt_state,
@@ -454,7 +454,7 @@ def train_model(
 @click.option('--log-interval', default=LOG_INTERVAL, type=int)
 @click.option('--key', default=KEY, type=int)
 def main(
-    out_root: str,
+    out_root: str = OUT_ROOT,
     atlas_template: str = ATLAS_TEMPLATE,
     labels_per_hemisphere: int = LABELS_PER_HEMISPHERE,
     distribution_size: int = DISTRIBUTION_SIZE,
