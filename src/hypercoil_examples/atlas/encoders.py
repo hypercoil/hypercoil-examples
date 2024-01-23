@@ -6,12 +6,17 @@ Atlas encoders
 ~~~~~~~~~~~~~~
 Initialise and visualise atlas encoders
 """
-from typing import Literal
+from typing import Literal, Mapping, Optional, Sequence, Tuple, Union
 import nibabel as nb
 import templateflow.api as tflow
 import numpy as np
 import pyvista as pv
+
+import jax
+import jax.numpy as jnp
+import equinox as eqx
 from hypercoil.engine import Tensor
+from hypercoil.functional import pairedcorr, compartmentalised_linear
 from hypercoil.functional.sphere import icosphere
 from hyve import (
     Cell,
@@ -28,9 +33,111 @@ from hyve import (
 
 
 SUBDIVISIONS = 5
+IMAGE_DIM = 25
+LOCUS_COUNT = (IMAGE_DIM // 5 or 1) ** 2
+LOCUS_RADIUS = 3
 
 
-def get_distmat(coor: Tensor, hemi: Literal['L', 'R'] = 'L') -> Tensor:
+class LocusEncoder(eqx.Module):
+    encoding: Mapping[str, Tensor]
+    limits: Mapping[str, Tuple[int, int]]
+
+    def __call__(
+        self,
+        X: Tensor,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
+        references = compartmentalised_linear(
+            input=X,
+            weight=self.encoding,
+            limits=self.limits,
+        )
+        return pairedcorr(references, X)
+
+
+class LocusDiscEncoder(LocusEncoder):
+    encoding: Mapping[str, Tensor]
+    limits: Mapping[str, Tuple[int, int]]
+
+    def __init__(
+        self,
+        locus_coords: Tensor = None,
+        point_coords: Tensor = None,
+        locus_radius: int = LOCUS_RADIUS,
+        *,
+        key: 'jax.random.PRNGKey',
+    ):
+        distance = (
+            (point_coords ** 2).sum(axis=-1, keepdims=True)
+            + (locus_coords ** 2).sum(axis=-1, keepdims=True).T
+            - 2 * point_coords @ locus_coords.T
+        )
+        self.encoding = {'all': jnp.where(distance < locus_radius ** 2, 1., 0.)}
+        self.limits = {'all': (0, self.encoding['all'].shape[0])}
+
+
+class IcosphereEncoder(eqx.Module):
+    encoding: Mapping[str, Tensor]
+    limits: Mapping[str, Tuple[int, int]]
+
+    def __init__(
+        self,
+        point_coords: Union[Tensor, Mapping[str, Tensor]],
+        subdivisions: int = SUBDIVISIONS,
+        scale: float = 1.,
+        point_mask: Optional[Union[Tensor, Mapping[str, Tensor]]] = None,
+        rotation_target: Optional[Tensor] = None,
+        rotation_secondary: Optional[Tensor] = None,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ):
+        if not isinstance(point_coords, Mapping):
+            point_coords = {'all': point_coords}
+        locus_coords = icosphere(
+            subdivisions=subdivisions,
+            target=rotation_target,
+            secondary=rotation_secondary,
+        )
+        point_coords = {
+            k: (v / np.linalg.norm(v, axis=-1, keepdims=True))
+            for k, v in point_coords.items()
+        }
+        distance = {
+            k: np.arctan2(
+                np.linalg.norm(
+                    np.cross(
+                        v[..., None, :],
+                        locus_coords[None, ...],
+                    ),
+                    axis=-1,
+                ),
+                v @ locus_coords.T,
+            )
+            for k, v in point_coords.items()
+        }
+        if point_mask is not None:
+            if not isinstance(point_mask, Mapping):
+                point_mask = {'all': point_mask}
+            valid = {k: v[distance[k].argmin(0)] for k, v in point_mask.items()}
+            distance = {k: v[..., valid[k]] for k, v in distance.items()}
+        self.encoding = {
+            k: jnp.where(
+                v < (scale * np.arctan(2) / 2 / (subdivisions + 1)),
+                1.,
+                0.,
+            )
+            for k, v in distance.items()
+        }
+        start = 0
+        limits = {}
+        for k, v in self.encoding.items():
+            limits[k] = (start, start + v.shape[0])
+            start += v.shape[0]
+        self.limits = limits
+
+
+def get_coords_and_mask_fslr(hemi: Literal['L', 'R'] = 'L') -> Tensor:
     mask = nb.load(
         tflow.get(
             'fsLR', density='32k', hemi=hemi, space=None, desc='nomedialwall'
@@ -44,50 +151,20 @@ def get_distmat(coor: Tensor, hemi: Literal['L', 'R'] = 'L') -> Tensor:
     )
     ref = ref.darrays[0].data
     ref = ref / np.linalg.norm(ref, axis=-1, keepdims=True)
-    return np.arctan2(
-        np.linalg.norm(np.cross(coor[..., None, :], ref[None, ...]), axis=-1),
-        coor @ ref.T,
-    ), mask
-
-
-def get_discs(
-    coor: Tensor, hemi: Literal['L', 'R'] = 'L', scale: float=1.
-) -> Tensor:
-    distmat, mask = get_distmat(coor=coor, hemi=hemi)
-    valid = mask[distmat.argmin(-1)]
-    # coor_masked = coor[valid, ...]
-    distmat_masked = distmat[valid, ...]
-    return (distmat_masked < (scale * np.arctan(2) / 2 / (SUBDIVISIONS + 1)))
+    return ref, mask
 
 
 def main():
-    r_icosphere = icosphere(
+    coords_L, mask_L = get_coords_and_mask_fslr(hemi='L')
+    coords_R, mask_R = get_coords_and_mask_fslr(hemi='R')
+    encoder = IcosphereEncoder(
         subdivisions=SUBDIVISIONS,
-        target=np.array((0., 0., 1.)),
-        secondary=np.array((0., 1., 0.)),
+        scale=0.5,
+        point_coords={'L': coords_L, 'R': coords_R},
+        point_mask={'L': mask_L, 'R': mask_R},
+        rotation_target=np.array((0., 0., 1.)),
+        rotation_secondary=np.array((0., 1., 0.)),
     )
-
-    disc_L = get_discs(coor=r_icosphere, hemi='L', scale=0.5)
-    disc_R = get_discs(coor=r_icosphere, hemi='R', scale=0.5)
-
-    # print((disc_L.argmax(0) * disc_L.max(0)), (disc_R.argmax(0) * disc_R.max(0)))
-    # print(np.histogram((disc_L.argmax(0) + 1) * disc_L.max(0)))
-    # plot_f = plotdef(
-    #     surf_from_archive(),
-    #     surf_scalars_from_array('icosphere', is_masked=False, allow_multihemisphere=False),
-    #     parcellate_colormap('icosphere', 'network', template='fsLR'),
-    #     #vertex_to_face('icosphere', interpolation='mode'),
-    #     plot_to_display(),
-    # )
-    # plot_f(
-    #     template='fsLR',
-    #     surf_projection='veryinflated',
-    #     icosphere_array_left=((disc_L.argmax(0) + 1) * disc_L.max(0)),
-    #     icosphere_array_right=((disc_R.argmax(0) + 1) * disc_R.max(0)),
-    #     window_size=(600, 500),
-    #     # empty_builders=True,
-    #     # hemisphere='left',
-    # )
 
     layout = Cell() / Cell() / Cell() << (1 / 3)
     layout = layout | layout | layout << (1 / 3)
@@ -144,11 +221,13 @@ def main():
             scalar_bar_action='collect',
         ),
     )
+    disc_L = (encoder.encoding['L'].argmax(-1) + 1) * encoder.encoding['L'].max(-1)
+    disc_R = (encoder.encoding['R'].argmax(-1) + 1) * encoder.encoding['R'].max(-1)
     plot_f(
         template='fsLR',
         surf_projection='veryinflated',
-        icosphere_array_left=((disc_L.argmax(0) + 1) * disc_L.max(0)),
-        icosphere_array_right=((disc_R.argmax(0) + 1) * disc_R.max(0)),
+        icosphere_array_left=disc_L,
+        icosphere_array_right=disc_R,
         window_size=(600, 500),
         hemisphere=['left', 'right', 'both'],
         views={
