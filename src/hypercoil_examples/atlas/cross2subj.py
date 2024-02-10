@@ -66,9 +66,12 @@ class SmoothThreshold(eqx.Module):
 
 
 def visualise(
-    log_prob_L: jnp.ndarray,
-    log_prob_R: jnp.ndarray,
     name: str,
+    log_prob_L: Optional[jnp.ndarray] = None,
+    log_prob_R: Optional[jnp.ndarray] = None,
+    energy_L: Optional[jnp.ndarray] = None,
+    energy_R: Optional[jnp.ndarray] = None,
+    parcellation: bool = True,
 ):
     layout = Cell() / Cell() / Cell() << (1 / 3)
     layout = layout | layout | layout << (1 / 3)
@@ -96,13 +99,28 @@ def visualise(
         ),
     }
     layout = layout.annotate(annotations)
-
+    if parcellation:
+        cmap = 'prism'
+        allow_multihemisphere = False
+        surf_scalars_clim = None
+    else:
+        cmap = 'inferno'
+        allow_multihemisphere = True
+        surf_scalars_clim = 'robust'
+    if log_prob_L is not None:
+        array_left = log_prob_L.argmax(-1)
+    if log_prob_R is not None:
+        array_right = log_prob_R.argmax(-1)
+    if energy_L is not None:
+        array_left = energy_L
+    if energy_R is not None:
+        array_right = energy_R
     plot_f = plotdef(
         surf_from_archive(),
         surf_scalars_from_array(
             'surf_scalars',
             is_masked=True,
-            allow_multihemisphere=False,
+            allow_multihemisphere=allow_multihemisphere,
         ),
         #parcellate_colormap('encoder', 'network', template='fsLR'),
         #vertex_to_face('encoder', interpolation='mode'),
@@ -128,9 +146,10 @@ def visualise(
     plot_f(
         template='fsLR',
         surf_projection='veryinflated',
-        surf_scalars_array_left=log_prob_L.argmax(-1),
-        surf_scalars_array_right=log_prob_R.argmax(-1),
-        surf_scalars_cmap='prism',
+        surf_scalars_array_left=array_left,
+        surf_scalars_array_right=array_right,
+        surf_scalars_cmap=cmap,
+        surf_scalars_clim=surf_scalars_clim,
         window_size=(600, 500),
         hemisphere=['left', 'right', 'both'],
         views={
@@ -184,40 +203,40 @@ def main():
         atlas.coors, forward_mode='map', encode=False, decode_labels=False
     )
 
-    threshold_locus = int(enc['cortex_L'].shape[-2] * 0.9)
-    inflection = jnp.partition(
-        enc['cortex_L'], threshold_locus, axis=-2
-    )[None, threshold_locus, :]
-    scale = jnp.array(3e8)
-    enc['cortex_L'] = SmoothThreshold(
-        inflection=inflection,
-        scale=scale,
-        ingest=lambda x: x,
-        argfn=lambda x: 1,
-    )(enc['cortex_L'])
+    # threshold_locus = int(enc['cortex_L'].shape[-2] * 0.9)
+    # inflection = jnp.partition(
+    #     enc['cortex_L'], threshold_locus, axis=-2
+    # )[None, threshold_locus, :]
+    # scale = jnp.array(3e8)
+    # enc['cortex_L'] = SmoothThreshold(
+    #     inflection=inflection,
+    #     scale=scale,
+    #     ingest=lambda x: x,
+    #     argfn=lambda x: 1,
+    # )(enc['cortex_L'])
 
-    threshold_locus = int(enc['cortex_R'].shape[-2] * 0.9)
-    inflection = jnp.partition(
-        enc['cortex_R'], threshold_locus, axis=-2
-    )[None, threshold_locus, :]
-    enc['cortex_R'] = SmoothThreshold(
-        inflection=inflection,
-        scale=scale,
-        ingest=lambda x: x,
-        argfn=lambda x: 1,
-    )(enc['cortex_R'])
+    # threshold_locus = int(enc['cortex_R'].shape[-2] * 0.9)
+    # inflection = jnp.partition(
+    #     enc['cortex_R'], threshold_locus, axis=-2
+    # )[None, threshold_locus, :]
+    # enc['cortex_R'] = SmoothThreshold(
+    #     inflection=inflection,
+    #     scale=scale,
+    #     ingest=lambda x: x,
+    #     argfn=lambda x: 1,
+    # )(enc['cortex_R'])
 
-    parcels_enc = model(
-        jnp.concatenate((enc['cortex_L'], enc['cortex_R'])),
-        encode=False,
-        decode_labels=False,
-        concatenate=False,
-    )
-    temporal_mu_L = parcels_enc['cortex_L']
-    temporal_mu_R = parcels_enc['cortex_R']
+    # parcels_enc = model(
+    #     jnp.concatenate((enc['cortex_L'], enc['cortex_R'])),
+    #     encode=False,
+    #     decode_labels=False,
+    #     concatenate=False,
+    # )
+    # temporal_mu_L = parcels_enc['cortex_L']
+    # temporal_mu_R = parcels_enc['cortex_R']
 
-    # enc['cortex_L'], temporal_mu_L = whiten_data(enc['cortex_L'], temporal_mu[:180])
-    # enc['cortex_R'], temporal_mu_R = whiten_data(enc['cortex_R'], temporal_mu[180:])
+    enc['cortex_L'], temporal_mu_L = whiten_data(enc['cortex_L'], temporal_mu[:180])
+    enc['cortex_R'], temporal_mu_R = whiten_data(enc['cortex_R'], temporal_mu[180:])
     temporal_L = VonMisesFisher(mu=temporal_mu_L, kappa=10)
     temporal_R = VonMisesFisher(mu=temporal_mu_R, kappa=10)
     spatial_L = VonMisesFisher(mu=spatial_mu[:180], kappa=10)
@@ -230,11 +249,31 @@ def main():
         temporal_R.log_prob(enc['cortex_R']) +
         spatial_R.log_prob(atlas.coors[enc['cortex_L'].shape[0]:])
     )
+    prob_L = jax.nn.softmax(-log_prob_L, axis=-1)
+    prob_R = jax.nn.softmax(-log_prob_R, axis=-1)
+    expected_energy_L = jnp.sum(prob_L * log_prob_L, axis=-1)
+    expected_energy_R = jnp.sum(prob_R * log_prob_R, axis=-1)
+    expected_energy_L = jnp.where(
+        jnp.isnan(expected_energy_L),
+        0,
+        expected_energy_L,
+    )
+    expected_energy_R = jnp.where(
+        jnp.isnan(expected_energy_R),
+        0,
+        expected_energy_R,
+    )
 
     visualise(
         log_prob_L=log_prob_L,
         log_prob_R=log_prob_R,
         name='backprojection',
+    )
+    visualise(
+        energy_L=expected_energy_L,
+        energy_R=expected_energy_R,
+        name='backprojection_energy',
+        parcellation=False,
     )
     print(
         'Total parcels detected (left hemisphere):',
@@ -250,42 +289,41 @@ def main():
     #parcels = model(hcp, encode=False, decode_labels=False)
 
 
+    # threshold_locus = int(enc['cortex_L'].shape[-2] * 0.9)
+    # inflection = jnp.partition(
+    #     enc['cortex_L'], threshold_locus, axis=-2
+    # )[None, threshold_locus, :]
+    # scale = jnp.array(3e8)
+    # enc['cortex_L'] = SmoothThreshold(
+    #     inflection=inflection,
+    #     scale=scale,
+    #     ingest=lambda x: x,
+    #     argfn=lambda x: 1,
+    # )(enc['cortex_L'])
 
-    threshold_locus = int(enc['cortex_L'].shape[-2] * 0.9)
-    inflection = jnp.partition(
-        enc['cortex_L'], threshold_locus, axis=-2
-    )[None, threshold_locus, :]
-    scale = jnp.array(3e8)
-    enc['cortex_L'] = SmoothThreshold(
-        inflection=inflection,
-        scale=scale,
-        ingest=lambda x: x,
-        argfn=lambda x: 1,
-    )(enc['cortex_L'])
+    # threshold_locus = int(enc['cortex_R'].shape[-2] * 0.9)
+    # inflection = jnp.partition(
+    #     enc['cortex_R'], threshold_locus, axis=-2
+    # )[None, threshold_locus, :]
+    # enc['cortex_R'] = SmoothThreshold(
+    #     inflection=inflection,
+    #     scale=scale,
+    #     ingest=lambda x: x,
+    #     argfn=lambda x: 1,
+    # )(enc['cortex_R'])
 
-    threshold_locus = int(enc['cortex_R'].shape[-2] * 0.9)
-    inflection = jnp.partition(
-        enc['cortex_R'], threshold_locus, axis=-2
-    )[None, threshold_locus, :]
-    enc['cortex_R'] = SmoothThreshold(
-        inflection=inflection,
-        scale=scale,
-        ingest=lambda x: x,
-        argfn=lambda x: 1,
-    )(enc['cortex_R'])
-
-    parcels_enc = model(
-        jnp.concatenate((enc['cortex_L'], enc['cortex_R'])),
-        encode=False,
-        decode_labels=False,
-        concatenate=False,
-    )
-    temporal_mu_L = parcels_enc['cortex_L']
-    temporal_mu_R = parcels_enc['cortex_R']
+    # parcels_enc = model(
+    #     jnp.concatenate((enc['cortex_L'], enc['cortex_R'])),
+    #     encode=False,
+    #     decode_labels=False,
+    #     concatenate=False,
+    # )
+    # temporal_mu_L = parcels_enc['cortex_L']
+    # temporal_mu_R = parcels_enc['cortex_R']
 
 
-    # enc['cortex_L'], _ = whiten_data(enc['cortex_L'])
-    # enc['cortex_R'], _ = whiten_data(enc['cortex_R'])
+    enc['cortex_L'], _ = whiten_data(enc['cortex_L'])
+    enc['cortex_R'], _ = whiten_data(enc['cortex_R'])
     log_prob_L = (
         temporal_L.log_prob(enc['cortex_L']) +
         spatial_L.log_prob(atlas.coors[:enc['cortex_L'].shape[0]])
@@ -294,11 +332,31 @@ def main():
         temporal_R.log_prob(enc['cortex_R']) +
         spatial_R.log_prob(atlas.coors[enc['cortex_L'].shape[0]:])
     )
+    prob_L = jax.nn.softmax(-log_prob_L, axis=-1)
+    prob_R = jax.nn.softmax(-log_prob_R, axis=-1)
+    expected_energy_L = jnp.sum(prob_L * log_prob_L, axis=-1)
+    expected_energy_R = jnp.sum(prob_R * log_prob_R, axis=-1)
+    expected_energy_L = jnp.where(
+        jnp.isnan(expected_energy_L),
+        0,
+        expected_energy_L,
+    )
+    expected_energy_R = jnp.where(
+        jnp.isnan(expected_energy_R),
+        0,
+        expected_energy_R,
+    )
 
     visualise(
         log_prob_L=log_prob_L,
         log_prob_R=log_prob_R,
         name='crossprojection',
+    )
+    visualise(
+        energy_L=expected_energy_L,
+        energy_R=expected_energy_R,
+        name='crossprojection_energy',
+        parcellation=False,
     )
     print(
         'Total parcels detected (left hemisphere):',
