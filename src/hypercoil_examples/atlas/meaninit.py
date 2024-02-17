@@ -23,6 +23,7 @@ IMGS = sorted(glob.glob(
     '/Users/rastkociric/Downloads/ds000224-fmriprep/sub-MSC0*/ses-func0*/func/'
     'sub-MSC0*_ses-func0*_task-rest_space-fsLR_den-91k_bold.dtseries.nii'
 ))
+IMGS = IMGS + ['/Users/rastkociric/Downloads/rfMRI_REST1_LR_Atlas_MSMAll.dtseries.nii']
 
 
 def main():
@@ -46,12 +47,9 @@ def main():
             jnp.arange(data.shape[-1])[None, :],
             data,
         )
-        _, parcels_enc, _ = ENCODE_SELF['icosphere'](
-            model=encoder, data=data, atlas=atlas
-        )
         enc = encoder(data)
         enc = jnp.concatenate((enc['cortex_L'], enc['cortex_R']))
-        enc, parcels_enc = whiten_data(enc, parcels_enc)
+        enc, _ = whiten_data(enc)
         enc = enc / jnp.linalg.norm(enc, axis=-1, keepdims=True)
         if i == 0:
             init = enc
