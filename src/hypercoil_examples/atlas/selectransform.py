@@ -9,7 +9,7 @@ selectivity profiles -- for instance, degree normalisation, thresholding,
 Mahalanobis transformation, etc.
 """
 from itertools import permutations
-from typing import Union
+from typing import Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +23,10 @@ from hypercoil_examples.atlas.vmf import (
 )
 from hypercoil_examples.atlas.vmf import (
     whiten_data as incomplete_mahalanobis_transform
+)
+from hyve import (
+    Cell, plotdef, surf_from_archive, surf_scalars_from_array,
+    plot_to_image, save_figure
 )
 
 
@@ -128,8 +132,9 @@ def create_plot(
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     L, Q = jnp.linalg.eigh(jnp.cov(normalised))
+    pcs = (Q.T @ normalised)[selected]
     ax = fig.add_subplot(gs[1, 2])
-    ax.scatter(*(Q.T @ normalised)[selected], s=0.01)
+    ax.scatter(*pcs, s=0.01)
     ax.set_xlim(-1, 1)
     ax.set_ylim(-1, 1)
 
@@ -144,7 +149,67 @@ def create_plot(
     ax.set_xlim(-1, 1)
     ax.set_ylim(-1, 1)
 
-    return fig
+    return fig, (L, pcs, coors)
+
+
+def brain_visualisation(
+    name: str,
+    data: Optional[jnp.ndarray] = None,
+):
+    layout = Cell() / Cell() << (1 / 2)
+    layout = layout | layout << (1 / 2)
+    annotations = {
+        0: dict(
+            hemisphere='left',
+            view='lateral',
+        ),
+        1: dict(
+            hemisphere='left',
+            view='medial',
+        ),
+        2: dict(
+            hemisphere='right',
+            view='lateral',
+        ),
+        3: dict(
+            hemisphere='right',
+            view='medial',
+        ),
+    }
+    layout = layout.annotate(annotations)
+    cmap = 'RdYlBu_r'
+    plot_f = plotdef(
+        surf_from_archive(),
+        surf_scalars_from_array(
+            'surf_scalars',
+            is_masked=True,
+        ),
+        plot_to_image(),
+        save_figure(
+            layout_kernel=layout,
+            padding=10,
+            canvas_size=(1000, 800),
+            canvas_color=(1, 1, 1),
+            fname_spec=f'scalars-{name}',
+            scalar_bar_action='collect',
+        ),
+    )
+    plot_f(
+        template='fsLR',
+        surf_projection='veryinflated',
+        surf_scalars_array=data,
+        surf_scalars_cmap=cmap,
+        surf_scalars_clim='robust',
+        window_size=(500, 400),
+        hemisphere=['left', 'right'],
+        views={
+            'left': ('medial', 'lateral'),
+            'right': ('medial', 'lateral'),
+        },
+        # theme=pv.themes.DarkTheme(),
+        output_dir='/tmp',
+        load_mask=True,
+    )
 
 
 def save_plot(
@@ -154,8 +219,14 @@ def save_plot(
     selected: slice = slice(-2, None),
     fname: str = 'selectivity_space.png',
 ):
-    fig = create_plot(X, vmin, vmax, selected)
-    fig.savefig(fname)
+    fig, (L, pcs, _) = create_plot(X, vmin, vmax, selected)
+    fig.savefig(f'/tmp/{fname}.png')
+    brain_visualisation(f'{fname}pc1', data=pcs[0])
+    brain_visualisation(f'{fname}pc2', data=pcs[1])
+    plt.figure(figsize=(6, 6))
+    plt.plot(range(len(L)), L[::-1], 'o-')
+    plt.savefig(f'/tmp/{fname}eig.png')
+    plt.close('all')
 
 
 def main():
@@ -168,31 +239,32 @@ def main():
     enc = model(data)
     enc = jnp.concatenate((enc['cortex_L'], enc['cortex_R']))
 
-    save_plot(enc, fname='/tmp/enc.png')
+    save_plot(enc, fname='enc')
     enc_deg = degree_norm(jnp.where(enc > 0, enc, 0))
-    save_plot(enc_deg, vmin=0., fname='/tmp/enc_deg.png')
+    save_plot(enc_deg, vmin=0., fname='enc_deg')
     enc_thr1 = topk_threshold(enc, k=0.9, binarise=True, axis=-1)
-    save_plot(enc_thr1, vmin=0., fname='/tmp/enc_thr1.png')
+    save_plot(enc_thr1, vmin=0., fname='enc_thr1')
     enc_thr0 = topk_threshold(enc, k=0.9, binarise=True, axis=-2)
-    save_plot(enc_thr0, vmin=0., fname='/tmp/enc_thr0.png')
+    save_plot(enc_thr0, vmin=0., fname='enc_thr0')
     # enc_thr_deg = degree_norm(jnp.where(enc_thr0 > 0, enc_thr0, 0))
-    # save_plot(enc_thr_deg, vmin=0., fname='/tmp/enc_thr_deg.png')
-    loc = jnp.arctanh(jnp.clip(enc, -0.75, 0.75))
+    # save_plot(enc_thr_deg, vmin=0., fname='enc_thr_deg')
+    # loc = jnp.arctanh(jnp.clip(enc, -0.75, 0.75))
+    loc = enc
     scale = jnp.minimum(-2e-2 * jnp.log(jnp.abs(loc)), 5)
     enc_sig = logistic_mixture_threshold(enc, scale, k=0.9, axis=0)
-    save_plot(enc_sig, vmin=0., fname='/tmp/enc_sig.png')
+    save_plot(enc_sig, vmin=0., fname='enc_sig')
     enc_sph_thr0 = topk_threshold(
         incomplete_mahalanobis_transform(enc)[0], k=0.9, axis=0
     )
-    save_plot(enc_sph_thr0, vmin=0., fname='/tmp/enc_sph_thr0.png')
+    save_plot(enc_sph_thr0, vmin=0., fname='enc_sph_thr0')
     enc_sph_sig = logistic_mixture_threshold(
         incomplete_mahalanobis_transform(loc)[0], scale, k=0.9, axis=-1
     )
-    save_plot(enc_sph_sig, vmin=0., fname='/tmp/enc_sph_sig.png')
+    save_plot(enc_sph_sig, vmin=0., fname='enc_sph_sig')
     enc_sph = incomplete_mahalanobis_transform(enc)[0]
-    save_plot(enc_sph, vmin=0., fname='/tmp/enc_sph.png')
+    save_plot(enc_sph, vmin=0., fname='enc_sph')
     enc_sph_deg = degree_norm(jnp.where(enc_sph > 0, enc_sph, 0))
-    save_plot(enc_sph_deg, vmin=0., fname='/tmp/enc_sph_deg.png')
+    save_plot(enc_sph_deg, vmin=0., fname='enc_sph_deg')
 
 
 if __name__ == '__main__':
