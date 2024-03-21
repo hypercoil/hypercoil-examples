@@ -23,130 +23,33 @@ from hypercoil_examples.atlas.icosphere import (
 )
 
 
-#TODO: Implement a general version of the ELLGAT-UNet below
-# class ELLGATUNet(eqx.Module):
-#     blocks: List[ELLGATBlock]
-#     nlin: callable = jax.nn.leaky_relu
-
-#     def __init__(
-#         self,
-#         subdivisions: Tuple[int, ...],
-#         channels: Tuple[int, ...],
-#         attn_heads: Union[int, Tuple[int, ...]],
-#         nlin: callable = jax.nn.leaky_relu,
-#         *,
-#         key: 'jax.random.PRNGKey',
-#     ):
-#         n_blocks = len(subdivisions) - 1
-#         assert n_blocks == len(channels) - 1
-#         if isinstance(attn_heads, int):
-#             attn_heads = (attn_heads,) * n_blocks
-#         assert n_blocks == len(attn_heads)
-
-#         blocks = []
-#         # contractive path
-#         for i, heads in enumerate(attn_heads):
-#             key_b = jax.random.fold_in(key, i)
-#             blocks.append(
-#                 ELLGATBlock(
-#                     query_features=channels[i],
-#                     key_features=channels[i],
-#                     out_features=channels[i + 1],
-#                     attn_heads=heads,
-#                     nlin=nlin,
-#                     key=key_b,
-#                 )
-#             )
-#             if subdivisions[i + 1] != subdivisions[i]:
-#                 # Bipartite ELLGAT
-#                 key_b = jax.random.split(key_b)[0]
-#                 blocks.append(
-#                     ELLGAT(
-#                         query_features=channels[i + 1],
-#                         key_features=channels[i + 1],
-#                         out_features=channels[i + 1],
-#                         attn_heads=heads,
-#                         nlin=nlin,
-#                         key=key_b,
-#                     )
-#                 )
-
-#         # expansive path
-#         for i, heads in enumerate(attn_heads[::-1]):
-#             key_b = jax.random.fold_in(key, n_blocks + i)
-#             blocks.append(
-#                 ELLGATBlock(
-#                     query_features=channels[-i - 1] + channels[-i - 2],
-#                     key_features=channels[-i - 1] + channels[-i - 2],
-#                     out_features=channels[-i - 2],
-#                     attn_heads=heads,
-#                     nlin=nlin,
-#                     key=key_b,
-#                 )
-#             )
-#             if subdivisions[-i - 2] != subdivisions[-i - 1]:
-#                 # Bipartite ELLGAT
-#                 key_b = jax.random.split(key_b)[0]
-#                 blocks.append(
-#                     ELLGAT(
-#                         query_features=channels[-i - 2],
-#                         key_features=channels[-i - 2],
-#                         out_features=channels[-i - 2],
-#                         attn_heads=heads,
-#                         nlin=nlin,
-#                         key=key_b,
-#                     )
-#                 )
-#         self.blocks = blocks
-
-#     def __call__(
-#         self,
-#         adj: Tensor,
-#         x: Tensor,
-#         *,
-#         key: 'jax.random.PRNGKey',
-#     ) -> Tensor:
-#         pass
-
-
-class IcoELLGATUNet(eqx.Module):
-    contractive: Tuple[ELLGATBlock]
-    expansive: Tuple[ELLGATBlock]
-    resample: Mapping[Tuple[int, int], ELLGAT]
-    ingress: Mapping[Tuple[int, int], ELLGAT]
-    readout: ELLGAT
+class ELLMesh(eqx.Module):
+    resolution: Tuple[int, ...]
     icospheres: Tuple[Tensor, ...]
     bipartite: Mapping[Tuple[int, int], Tensor]
     argadj: Mapping[Tuple[int, int], Tensor]
-    nlin: callable = jax.nn.leaky_relu
+    ingress_level: Tuple[Optional[int], ...]
 
     def __init__(
         self,
         base_coor: Tensor,
-        base_mask: Tensor,
         base_adj: Tensor,
-        in_dim: Tuple[int, int, int],
-        hidden_dim: Tuple[int, int, int],
-        resolution: Tuple[int, int, int],
-        attn_heads: Tuple[int, int, int],
-        readout_dim: int,
-        hidden_readout_dim: int,
-        ingress_level: Tuple[Optional[int], Optional[int], Optional[int]],
-        nlin: callable = jax.nn.leaky_relu,
+        resolution: Tuple[int, ...],
+        ingress_level: Tuple[Optional[int], ...],
+        base_mask: Optional[Tensor] = None,
         max_connections_default: int = 16,
         max_connections_explicit: Optional[
             Mapping[Tuple[int, int], int]
         ] = None,
         *,
-        key: 'jax.random.PRNGKey',
+        key: Optional['jax.random.PRNGKey'] = None,
     ):
         base_coor = jnp.asarray(base_coor)
-        base_mask = jnp.asarray(base_mask)
-        num_levels = len(resolution)
-        assert num_levels == len(attn_heads)
-        assert num_levels == len(in_dim)
-        assert num_levels == len(hidden_dim)
-        assert num_levels == len(ingress_level)
+        base_adj = jnp.asarray(base_adj)
+        if base_mask is None:
+            base_mask = jnp.ones(base_coor.shape[0], dtype=bool)
+        else:
+            base_mask = jnp.asarray(base_mask)
 
         icospheres = ((base_coor, None),) + tuple(
             icosphere(r) for r in resolution[1:]
@@ -169,17 +72,6 @@ class IcoELLGATUNet(eqx.Module):
         for i, (ingress, ico) in enumerate(zip(ingress_level, vertices)):
             if ingress and closest.get((0, i), None) is None:
                 closest[(0, i)] = (base_coor @ ico.T)
-            # if i > 0:
-            #     masks[i] = base_mask[closest[(0, i)].argmax(0)]
-
-        # Mask the closest points and coordinate matrices
-        # Note: we don't end up doing this here because it leads to an (even
-        # more) uneven number of neighbours for each vertex, which results in
-        # a ragged tensor and more unnecessary computation under the ELL
-        # format.
-        # vertices = tuple(ico[masks[i]] for i, ico in enumerate(vertices))
-        # for (i, j), e in closest.items():
-        #     closest[(i, j)] = e[masks[i]][:, masks[j]]
 
         bipartite = {
             (i, j): jax.vmap(
@@ -254,6 +146,45 @@ class IcoELLGATUNet(eqx.Module):
             for (i, j), (u, e, s) in argadj.items()
         }
 
+        self.resolution = resolution
+        self.icospheres = icospheres
+        self.bipartite = bipartite
+        self.argadj = argadj
+        self.ingress_level = ingress_level
+
+
+class IcoELLGATUNet(eqx.Module):
+    contractive: Tuple[ELLGATBlock]
+    expansive: Tuple[ELLGATBlock]
+    resample: Mapping[Tuple[int, int], ELLGAT]
+    ingress: Mapping[Tuple[int, int], ELLGAT]
+    readout: ELLGAT
+    meshes: Mapping[str, ELLMesh]
+    nlin: callable = jax.nn.leaky_relu
+
+    def __init__(
+        self,
+        meshes: Mapping[str, ELLMesh],
+        in_dim: Tuple[int, int, int],
+        hidden_dim: Tuple[int, int, int],
+        attn_heads: Tuple[int, int, int],
+        readout_dim: int,
+        hidden_readout_dim: int,
+        nlin: callable = jax.nn.leaky_relu,
+        *,
+        key: 'jax.random.PRNGKey',
+    ):
+        mesh_names = tuple(meshes.keys())
+        resolution = meshes[mesh_names[0]].resolution
+        ingress_level = meshes[mesh_names[0]].ingress_level
+        num_levels = len(resolution)
+        assert num_levels == len(attn_heads)
+        assert num_levels == len(in_dim)
+        assert num_levels == len(hidden_dim)
+        for mesh in meshes.values():
+            assert num_levels == len(mesh.resolution)
+            assert num_levels == len(mesh.ingress_level)
+
         contractive = []
         expansive = []
         resample = {}
@@ -322,22 +253,27 @@ class IcoELLGATUNet(eqx.Module):
             key=key_r,
         )
 
+        self.meshes = meshes
         self.contractive = tuple(contractive)
         self.expansive = tuple(expansive)
         self.resample = resample
         self.ingress = ingress
         self.readout = readout
-        self.icospheres = icospheres
-        self.bipartite = bipartite
-        self.argadj = argadj
         self.nlin = nlin
 
     def __call__(
         self,
         X: Tuple[Tensor, ...],
+        mesh: Optional[str] = None,
         *,
         key: 'jax.random.PRNGKey',
     ) -> Tensor:
+        if mesh is None:
+            assert len(self.meshes) == 1
+            mesh = next(iter(self.meshes))
+        else:
+            mesh = self.meshes[mesh]
+
         key_c, key_e = jax.random.split(key)
         Q, X = X[0], X[1:]
         Z = []
@@ -350,13 +286,13 @@ class IcoELLGATUNet(eqx.Module):
                 # on a bipartite graph
                 Qi, X = X[0], X[1:]
                 Qir = jnp.zeros(
-                    (Qi.shape[0], self.bipartite[(0, i)].shape[0])
-                ).at[..., self.argadj[(0, i)]].add(Qi)
+                    (Qi.shape[0], mesh.bipartite[(0, i)].shape[0])
+                ).at[..., mesh.argadj[(0, i)]].add(Qi)
                 count = jnp.zeros(
-                    (self.bipartite[(0, i)].shape[0],)
-                ).at[self.argadj[(0, i)]].add(jnp.ones(Qi.shape[1]))
+                    (mesh.bipartite[(0, i)].shape[0],)
+                ).at[mesh.argadj[(0, i)]].add(jnp.ones(Qi.shape[1]))
                 Qi = self.ingress[i](
-                    adj=self.bipartite[(0, i)],
+                    adj=mesh.bipartite[(0, i)],
                     Q=Qir / count,
                     K=Qi,
                     key=key_r,
@@ -373,13 +309,13 @@ class IcoELLGATUNet(eqx.Module):
                 # Prepare scatter-mean as query, and the original Q as key
                 # on a bipartite graph
                 Qr = jnp.zeros(
-                    (Q.shape[0], self.bipartite[(i - 1, i)].shape[0])
-                ).at[..., self.argadj[(i - 1, i)]].add(Q)
+                    (Q.shape[0], mesh.bipartite[(i - 1, i)].shape[0])
+                ).at[..., mesh.argadj[(i - 1, i)]].add(Q)
                 count = jnp.zeros(
-                    (self.bipartite[(i - 1, i)].shape[0],)
-                ).at[self.argadj[(i - 1, i)]].add(jnp.ones(Q.shape[1]))
+                    (mesh.bipartite[(i - 1, i)].shape[0],)
+                ).at[mesh.argadj[(i - 1, i)]].add(jnp.ones(Q.shape[1]))
                 Q = self.resample[(i - 1, i)](
-                    adj=self.bipartite[(i - 1, i)],
+                    adj=mesh.bipartite[(i - 1, i)],
                     Q=Qr / count,
                     K=Q,
                     key=key_r,
@@ -394,7 +330,7 @@ class IcoELLGATUNet(eqx.Module):
             if Qi is not None:
                 Q = jnp.concatenate((Q, Qi), axis=0)
             Q = module(
-                adj=self.icospheres[i],
+                adj=mesh.icospheres[i],
                 Q=Q,
                 key=key_i,
             )
@@ -411,19 +347,19 @@ class IcoELLGATUNet(eqx.Module):
             else:
                 Q = Qn
             Q = module(
-                adj=self.icospheres[idx],
+                adj=mesh.icospheres[idx],
                 Q=Q,
                 key=key_i,
             )
             Q = self.nlin(Q)
-            adjarg = self.argadj.get((idx - 1, idx), None)
+            adjarg = mesh.argadj.get((idx - 1, idx), None)
             if adjarg is not None:
                 # Gather the Q to the original size
                 Q = Q[..., adjarg]
 
         key_r = jax.random.fold_in(key, len(self.contractive))
         Q = self.readout(
-            adj=self.icospheres[0],
+            adj=mesh.icospheres[0],
             Q=Q,
             key=key_r,
         )
@@ -450,17 +386,12 @@ def main():
         nb.load(base_coor_L_path).darrays[1].data,
     )
 
-    model = IcoELLGATUNet(
+    mesh_L = ELLMesh(
         base_coor=base_coor,
-        base_mask=base_mask,
         base_adj=base_adj,
-        in_dim=(3, 16, 64),
-        hidden_dim=(16, 64, 128),
-        hidden_readout_dim=64,
         resolution=(None, 25, 9),
-        attn_heads=(4, 4, 4),
-        readout_dim=200,
         ingress_level=(None, 16, 64),
+        base_mask=base_mask,
         max_connections_explicit={
             (0, 1): 16,
             (0, 2): 64,
@@ -468,33 +399,43 @@ def main():
         },
         key=jax.random.PRNGKey(0),
     )
+    model = IcoELLGATUNet(
+        meshes={'cortex_L': mesh_L},
+        in_dim=(3, 16, 64),
+        hidden_dim=(16, 64, 128),
+        hidden_readout_dim=64,
+        attn_heads=(4, 4, 4),
+        readout_dim=200,
+        key=jax.random.PRNGKey(0),
+    )
     Q = (
         jax.random.normal(
             jax.random.PRNGKey(17),
             (
                 model.contractive[0].layers[0].query_features,
-                model.icospheres[0].shape[0],
+                mesh_L.icospheres[0].shape[0],
             ),
         ),
         jax.random.normal(
             jax.random.PRNGKey(18),
             (
                 model.ingress[1].query_features,
-                model.icospheres[0].shape[0],
-                #model.icospheres[1].shape[0],
+                mesh_L.icospheres[0].shape[0],
+                #mesh_L.icospheres[1].shape[0],
             ),
         ),
         jax.random.normal(
             jax.random.PRNGKey(19),
             (
                 model.ingress[2].query_features,
-                model.icospheres[0].shape[0],
-                #model.icospheres[2].shape[0],
+                mesh_L.icospheres[0].shape[0],
+                #mesh_L.icospheres[2].shape[0],
             ),
         ),
     )
     result = model(
         Q,
+        mesh='cortex_L',
         key=jax.random.PRNGKey(0),
     )
     assert 0
