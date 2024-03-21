@@ -191,7 +191,7 @@ def visualise_surface_encoder(
         surf_projection='veryinflated',
         log_prob_vmf_array=array,
         window_size=(600, 500),
-        surf_scalars_cmap='inferno',
+        surf_scalars_cmap='magma',
         # surf_scalars_clim='robust',
         hemisphere=['left', 'right', 'both'],
         views={
@@ -206,8 +206,8 @@ def visualise_surface_encoder(
     )
 
 
-def get_data(cifti: str):
-    cifti = nb.load(CIFTI[cifti])
+def _get_data(cifti: str):
+    cifti = nb.load(cifti)
     data_full = cifti.get_fdata(dtype=np.float32).T
     data = data_full[~cifti.header.get_axis(1).volume_mask]
 
@@ -220,6 +220,10 @@ def get_data(cifti: str):
         data,
     )
     return data
+
+
+def get_data(cifti: str):
+    return _get_data(CIFTI[cifti])
 
 
 def whiten_data(
