@@ -25,6 +25,7 @@ from hypercoil.engine import Tensor
 from hypercoil.nn.atlas import AtlasLinear
 
 from hypercoil_examples.atlas.cross2subj import ATLAS_PATH, visualise
+from hypercoil_examples.atlas.dccc import dccc, plot_dccc
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
 )
@@ -37,6 +38,8 @@ SPATIAL_PRIOR_WEIGHT = (
     0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0
     #0.0, 1.0, 40, 500.0, 1e6,
 )
+DCCC_SAMPLE_KEY = 71
+DCCC_NUM_NODES = 4000
 
 
 def estimate_distance_distribution(
@@ -95,6 +98,7 @@ def main(
     rotate_back: bool = False,
     transpose: bool = False,
     plot_orig_and_template: bool = False,
+    compute_dccc: bool = False,
 ):
     template = np.load('/tmp/mean_init.npy')
     spatial_loc_left, spatial_loc_right, spatial_data = init_spatial_priors()
@@ -143,7 +147,7 @@ def main(
     temporal_R = VonMisesFisher(mu=temporal_mu_R, kappa=10)
     spatial_L = VonMisesFisher(mu=spatial_mu[:180], kappa=10)
     spatial_R = VonMisesFisher(mu=spatial_mu[180:], kappa=10)
-    if plot_orig_and_template:
+    if plot_orig_and_template or compute_dccc:
         log_prob_L = (
             temporal_L.log_prob(template_left) +
             spatial_L.log_prob(atlas.coors[:enc['cortex_L'].shape[0]])
@@ -152,11 +156,29 @@ def main(
             temporal_R.log_prob(template_right) +
             spatial_R.log_prob(atlas.coors[enc['cortex_L'].shape[0]:])
         )
+    if plot_orig_and_template:
         visualise(
             log_prob_L=log_prob_L,
             log_prob_R=log_prob_R,
             name='template',
         )
+    if compute_dccc:
+        #dccc_assignment = jax.nn.softmax(log_prob_L, -1)
+        dccc_assignment = jnp.eye(log_prob_L.shape[-1])[log_prob_L.argmax(-1)]
+        coors_L = atlas.coors[atlas.compartments.compartments['cortex_L'].mask_array]
+        order = jax.random.permutation(
+            jax.random.PRNGKey(DCCC_SAMPLE_KEY),
+            len(dccc_assignment),
+        )[slice(0, DCCC_NUM_NODES)]
+        result = dccc(
+            coors=coors_L[order],
+            features=msc[:len(dccc_assignment)][order],
+            assignment=dccc_assignment[order],
+            integral_samples=jnp.arange(40) * 0.9,
+        )
+        dccc_result = result.pop('dccc')
+        print(f'DCCC template (MSC): {dccc_result.sum()}')
+        plot_dccc(result, '/tmp/dccc_template_msc.png')
 
     enc['cortex_L'], _ = whiten_data(enc['cortex_L'])
     enc['cortex_R'], _ = whiten_data(enc['cortex_R'])
@@ -172,7 +194,7 @@ def main(
         template_left, template_right = template_left.T, template_right.T
         enc['cortex_L'], enc['cortex_R'] = enc['cortex_L'].T, enc['cortex_R'].T
         spatial_loc_left = spatial_loc_right = jnp.arange(size)[..., None]
-        spatial_data =jnp.ones((size, 1))
+        spatial_data = jnp.ones((size, 1))
     if use_parcel_attention:
         print('Using parcel attention...')
         attention_left, attention_right = parcel_attention(
@@ -306,6 +328,23 @@ def main(
         'Total parcels detected (right hemisphere):',
         len(jnp.unique(log_prob_R.argmax(-1)))
     )
+    if compute_dccc:
+        #dccc_assignment = jax.nn.softmax(log_prob_L, -1)
+        dccc_assignment = jnp.eye(log_prob_L.shape[-1])[log_prob_L.argmax(-1)]
+        coors_L = atlas.coors[atlas.compartments.compartments['cortex_L'].mask_array]
+        order = jax.random.permutation(
+            jax.random.PRNGKey(DCCC_SAMPLE_KEY),
+            len(dccc_assignment),
+        )[slice(0, DCCC_NUM_NODES)]
+        result = dccc(
+            coors=coors_L[order],
+            features=msc[:len(dccc_assignment)][order],
+            assignment=dccc_assignment[order],
+            integral_samples=jnp.arange(40) * 0.9,
+        )
+        dccc_result = result.pop('dccc')
+        print(f'DCCC single-subject (MSC): {dccc_result.sum()}')
+        plot_dccc(result, '/tmp/dccc_subject_msc.png')
 
 
     hcp = get_data('HCP')
@@ -423,4 +462,4 @@ def main(
 
 if __name__ == "__main__":
     for weight in SPATIAL_PRIOR_WEIGHT:
-        main(spatial_prior_weight=weight)
+        main(spatial_prior_weight=weight, compute_dccc=True)
