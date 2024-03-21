@@ -150,6 +150,7 @@ def plot_dccc(
     output_path: str,
 ):
     fig, ax = plt.subplots(2, 2, figsize=(8, 8))
+    fig.suptitle(f'DCCC {result["dccc"].sum()}', fontsize=16)
     ax[0][0].plot(
         result['integral_samples'],
         (
@@ -241,7 +242,7 @@ def main():
         assignment=atlas.maps['cortex_L'].T[order],
         integral_samples=jnp.arange(40) * 0.9,
     )
-    dccc_result = result.pop('dccc')
+    dccc_result = result.get('dccc')
     print(dccc_result.sum())
     plot_dccc(result, '/tmp/dccc.png')
 
@@ -251,7 +252,7 @@ def main():
         assignment=atlas_null.maps['cortex_L'].T[order],
         integral_samples=jnp.arange(40) * 0.9,
     )
-    dccc_result_null = result_null.pop('dccc')
+    dccc_result_null = result_null.get('dccc')
     print(dccc_result_null.sum())
     plot_dccc(result_null, '/tmp/dccc_null.png')
 

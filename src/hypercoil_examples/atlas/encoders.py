@@ -26,6 +26,7 @@ from hypercoil.functional.sphere import icosphere
 from hypercoil.init.atlas import (
     BaseAtlas,
     CortexSubcortexCIfTIAtlas,
+    CortexSubcortexGIfTIAtlas,
     IcosphereAtlas,
 )
 from hypercoil.init.vmf import VonMisesFisher
@@ -113,6 +114,27 @@ def create_consensus_encoder(
             '/Users/rastkociric/Downloads/combined_clusters/'
             f'abcd_template_matching_combined_clusters_thresh{threshold}'
             '.dlabel.nii'
+        ),
+        mask_L=None,
+        mask_R=None,
+        surf_L=tflow.get(
+            'fsLR', density='32k', hemi='L', space=None, suffix='sphere'
+        ),
+        surf_R=tflow.get(
+            'fsLR', density='32k', hemi='R', space=None, suffix='sphere'
+        ),
+    )
+
+
+def create_7net_encoder() -> CortexSubcortexGIfTIAtlas:
+    return CortexSubcortexGIfTIAtlas(
+        data_L=(
+            '/Users/rastkociric/Downloads/DCBC/parcellations/'
+            'Yeo_JNeurophysiol11_7Networks.32k.L.label.gii'
+        ),
+        data_R=(
+            '/Users/rastkociric/Downloads/DCBC/parcellations/'
+            'Yeo_JNeurophysiol11_7Networks.32k.R.label.gii'
         ),
         mask_L=None,
         mask_R=None,
@@ -259,6 +281,16 @@ def main():
     map_R = encoder.maps['cortex_R']
     visualise_surface_encoder(
         encoder_name='Consensus Atlas',
+        array_L=(map_L.argmax(0) + 1) * (map_L.max(0) > 0),
+        array_R=(map_R.argmax(0) + 1) * (map_R.max(0) > 0),
+        is_masked=True,
+    )
+
+    encoder = create_7net_encoder()
+    map_L = encoder.maps['cortex_L']
+    map_R = encoder.maps['cortex_R']
+    visualise_surface_encoder(
+        encoder_name='7Network',
         array_L=(map_L.argmax(0) + 1) * (map_L.max(0) > 0),
         array_R=(map_R.argmax(0) + 1) * (map_R.max(0) > 0),
         is_masked=True,
