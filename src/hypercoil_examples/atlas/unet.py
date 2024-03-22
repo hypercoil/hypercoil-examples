@@ -23,6 +23,39 @@ from hypercoil_examples.atlas.icosphere import (
 )
 
 
+def scatter_mean_bipartite(
+    module: ELLGAT,
+    Q: Tensor,
+    argadj: Tensor,
+    bipartite: Tensor,
+    nlin: callable,
+    *,
+    key: 'jax.random.PRNGKey',
+) -> Tensor:
+    # Prepare scatter-mean as query, and the original Q as key
+    # on a bipartite graph
+    Qr = jnp.zeros(
+        (Q.shape[0], bipartite.shape[0])
+    ).at[..., argadj].add(Q)
+    count = jnp.zeros(
+        (bipartite.shape[0],)
+    ).at[argadj].add(jnp.ones(Q.shape[1]))
+    Q = module(
+        adj=bipartite,
+        Q=Qr / count,
+        K=Q,
+        key=key,
+    )
+    Q = nlin(
+        Q.reshape(
+            *Q.shape[:-3],
+            Q.shape[-3] * Q.shape[-2],
+            Q.shape[-1],
+        )
+    )
+    return Q
+
+
 class ELLMesh(eqx.Module):
     resolution: Tuple[int, ...]
     icospheres: Tuple[Tensor, ...]
@@ -282,50 +315,24 @@ class IcoELLGATUNet(eqx.Module):
             Qi = None
             if self.ingress.get(i, None) is not None:
                 key_i, key_r = jax.random.split(key_i)
-                # Prepare scatter-mean as query, and the original Qi as key
-                # on a bipartite graph
                 Qi, X = X[0], X[1:]
-                Qir = jnp.zeros(
-                    (Qi.shape[0], mesh.bipartite[(0, i)].shape[0])
-                ).at[..., mesh.argadj[(0, i)]].add(Qi)
-                count = jnp.zeros(
-                    (mesh.bipartite[(0, i)].shape[0],)
-                ).at[mesh.argadj[(0, i)]].add(jnp.ones(Qi.shape[1]))
-                Qi = self.ingress[i](
-                    adj=mesh.bipartite[(0, i)],
-                    Q=Qir / count,
-                    K=Qi,
+                Qi = scatter_mean_bipartite(
+                    module=self.ingress[i],
+                    Q=Qi,
+                    argadj=mesh.argadj[(0, i)],
+                    bipartite=mesh.bipartite[(0, i)],
+                    nlin=self.nlin,
                     key=key_r,
-                )
-                Qi = self.nlin(
-                    Qi.reshape(
-                        *Qi.shape[:-3],
-                        Qi.shape[-3] * Qi.shape[-2],
-                        Qi.shape[-1],
-                    )
                 )
             if self.resample.get((i - 1, i), None) is not None:
                 key_i, key_r = jax.random.split(key_i)
-                # Prepare scatter-mean as query, and the original Q as key
-                # on a bipartite graph
-                Qr = jnp.zeros(
-                    (Q.shape[0], mesh.bipartite[(i - 1, i)].shape[0])
-                ).at[..., mesh.argadj[(i - 1, i)]].add(Q)
-                count = jnp.zeros(
-                    (mesh.bipartite[(i - 1, i)].shape[0],)
-                ).at[mesh.argadj[(i - 1, i)]].add(jnp.ones(Q.shape[1]))
-                Q = self.resample[(i - 1, i)](
-                    adj=mesh.bipartite[(i - 1, i)],
-                    Q=Qr / count,
-                    K=Q,
+                Q = scatter_mean_bipartite(
+                    module=self.resample[(i - 1, i)],
+                    Q=Q,
+                    argadj=mesh.argadj[(i - 1, i)],
+                    bipartite=mesh.bipartite[(i - 1, i)],
+                    nlin=self.nlin,
                     key=key_r,
-                )
-                Q = self.nlin(
-                    Q.reshape(
-                        *Q.shape[:-3],
-                        Q.shape[-3] * Q.shape[-2],
-                        Q.shape[-1],
-                    )
                 )
             if Qi is not None:
                 Q = jnp.concatenate((Q, Qi), axis=0)
