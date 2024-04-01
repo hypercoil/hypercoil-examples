@@ -6,6 +6,7 @@ Mean atlas initialisation
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Initialise an alignment atlas tensor as the mean of the input image encodings.
 """
+from typing import Literal
 import glob
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,7 @@ from hypercoil.nn import AtlasLinear
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
 )
+from hypercoil_examples.atlas.multiencoder import configure_multiencoder
 from hypercoil_examples.atlas.vmf import ENCODE_SELF, whiten_data
 
 IMGS = sorted(glob.glob(
@@ -26,19 +28,30 @@ IMGS = sorted(glob.glob(
 IMGS = IMGS + ['/Users/rastkociric/Downloads/rfMRI_REST1_LR_Atlas_MSMAll.dtseries.nii']
 
 
-def main():
-    atlas = create_icosphere_encoder()
-    encoder = AtlasLinear.from_atlas(
-        atlas,
-        encode=True,
-        key=jax.random.PRNGKey(0),
-    )
+def main(
+    encoder_type: Literal['icosphere', 'multiencoder'] = 'icosphere',
+    normalise: bool = True,
+):
+    match encoder_type:
+        case 'icosphere':
+            atlas = create_icosphere_encoder()
+            encoder = AtlasLinear.from_atlas(
+                atlas,
+                encode=True,
+                key=jax.random.PRNGKey(0),
+            )
+        case 'multiencoder':
+            encoder = configure_multiencoder()
     for i, img in enumerate(IMGS):
         print(f'Processing {img} ({i+1}/{len(IMGS)})')
         data = nb.load(img)
         data_full = jnp.asarray(data.get_fdata()).T
         data = data_full[~data.header.get_axis(1).volume_mask] #[atlas.mask.mask_array]
 
+        if normalise:
+            data = data - data.mean(-1, keepdims=True)
+            data = data / data.std(-1, keepdims=True)
+            data = jnp.where(jnp.isnan(data), 0, data)
         gs = data.mean(0, keepdims=True)
         data = residualise(data, gs)
         # Plug zero-variance vertices with ramp (for no NaNs in log prob)
@@ -48,7 +61,8 @@ def main():
             data,
         )
         enc = encoder(data)
-        enc = jnp.concatenate((enc['cortex_L'], enc['cortex_R']))
+        if encoder_type == 'icosphere':
+            enc = jnp.concatenate((enc['cortex_L'], enc['cortex_R']))
         enc, _ = whiten_data(enc)
         enc = enc / jnp.linalg.norm(enc, axis=-1, keepdims=True)
         if i == 0:
@@ -65,4 +79,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main(encoder_type='multiencoder')

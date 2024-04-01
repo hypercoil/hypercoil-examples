@@ -129,12 +129,12 @@ def create_consensus_encoder(
 def create_7net_encoder() -> CortexSubcortexGIfTIAtlas:
     return CortexSubcortexGIfTIAtlas(
         data_L=(
-            '/Users/rastkociric/Downloads/DCBC/parcellations/'
-            'Yeo_JNeurophysiol11_7Networks.32k.L.label.gii'
+            '/Users/rastkociric/Downloads/'
+            'desc-Yeo7_hemi-L_dseg.gii'
         ),
         data_R=(
-            '/Users/rastkociric/Downloads/DCBC/parcellations/'
-            'Yeo_JNeurophysiol11_7Networks.32k.R.label.gii'
+            '/Users/rastkociric/Downloads/'
+            'desc-Yeo7_hemi-R_dseg.gii'
         ),
         mask_L=None,
         mask_R=None,
