@@ -3,7 +3,7 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 """
 Positional encoding
-
+~~~~~~~~~~~~~~~~~~~
 Positional encoding module for the icospherical ELLGAT U-net model. Mostly
 lifted from the analogous module from the SUGAR brain registration network,
 which mostly follows the same architecture that we use here. The original:
@@ -14,17 +14,30 @@ neural radiance field model (NeRF).
 It might be interesting to compare this positional encoding with the geometric
 data from the Pang et al. paper.
 """
-from typing import Any, Mapping, Optional, List, Union, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import nibabel as nb
+import pandas as pd
 
 from hypercoil.engine import Tensor
 
+EIGENMODES_PATH = {
+    'cortex_L': (
+        '/Users/rastkociric/Downloads/template_eigenmodes/'
+        'fsLR_32k_midthickness-lh_emode_200.txt'
+    ),
+    'cortex_R': (
+        '/Users/rastkociric/Downloads/template_eigenmodes/'
+        'fsLR_32k_midthickness-rh_emode_200.txt'
+    ),
+}
+
 
 class PositionalEncoding(eqx.Module):
-    funcs: Tuple[callable]
+    funcs: Tuple[callable, ...]
     freq_bands: Tensor
 
     def __init__(
@@ -32,6 +45,8 @@ class PositionalEncoding(eqx.Module):
         n_freq_bands: int = 4,
         funcs: Optional[Tuple[callable]] = None,
         log_scale: bool = True,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
     ):
         self.funcs = funcs or (
             jnp.sin,
@@ -56,9 +71,96 @@ class PositionalEncoding(eqx.Module):
         return X.reshape(X.shape[:-2] + (-1,))
 
 
+class GeometricEncoding(eqx.Module):
+    default_eigenmodes: Tuple[int, ...]
+    eigenmodes: Mapping[str, Tensor]
+    default_encoding_dim: int
+
+    def __init__(
+        self,
+        eigenmodes_path: Union[str, Mapping[str, str]],
+        mask_path: Union[str, Mapping[str, str]],
+        default_eigenmodes: Union[Sequence[int], Mapping[str, Sequence[int]]],
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ):
+        if isinstance(eigenmodes_path, str):
+            eigenmodes_path = {'all': eigenmodes_path}
+        if isinstance(mask_path, str):
+            mask_path = {'all': mask_path}
+        if not isinstance(default_eigenmodes, Mapping):
+            self.default_eigenmodes = {'all': tuple(default_eigenmodes)}
+        else:
+            self.default_eigenmodes = {
+                k: tuple(v) for k, v in default_eigenmodes.items()
+            }
+        mask = {
+            k: nb.load(v).darrays[0].data.astype(bool)
+            for k, v in mask_path.items()
+        }
+        self.eigenmodes = {
+            k: pd.read_csv(v, sep=' ', header=None).values[mask[k]]
+            for k, v in eigenmodes_path.items()
+        }
+        self.default_encoding_dim = (
+            3 + len(next(iter(self.default_eigenmodes.values())))
+        )
+
+    def __call__(
+        self,
+        X: Tensor,
+        modes: Optional[Sequence[int]] = None,
+        geom: str = 'all',
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
+        if modes is None:
+            modes = self.default_eigenmodes[geom]
+        return jnp.concatenate(
+            [X] + [self.eigenmodes[geom][:, modes]],
+            axis=-1,
+        )
+
+
+def configure_geometric_encoder():
+    import templateflow.api as tflow
+    mask_path = {
+        k: str(
+            tflow.get('fsLR', density='32k', hemi=k[-1], desc='nomedialwall')
+        )
+        for k in ('cortex_L', 'cortex_R')
+    }
+    ge = GeometricEncoding(
+        eigenmodes_path=EIGENMODES_PATH,
+        mask_path=mask_path,
+        default_eigenmodes={
+            k: range(1, 25) for k in ('cortex_L', 'cortex_R')
+        },
+    )
+    return ge
+
+
+def get_coors():
+    import templateflow.api as tflow
+    coor_L_path = tflow.get(
+        'fsLR', density='32k', hemi='L', space=None, suffix='sphere'
+    )
+    coor_R_path = tflow.get(
+        'fsLR', density='32k', hemi='R', space=None, suffix='sphere'
+    )
+    coor_L = nb.load(coor_L_path).darrays[0].data / 100
+    coor_R = nb.load(coor_R_path).darrays[0].data / 100
+    mask_path = {
+        k: str(tflow.get('fsLR', density='32k', hemi=k, desc='nomedialwall'))
+        for k in ('L', 'R')
+    }
+    coor_L = coor_L[nb.load(mask_path['L']).darrays[0].data.astype(bool)]
+    coor_R = coor_R[nb.load(mask_path['R']).darrays[0].data.astype(bool)]
+    return coor_L, coor_R
+
+
 def main():
     import templateflow.api as tflow
-    import nibabel as nb
     from hyve import (
         plotdef,
         surf_from_archive,
@@ -74,45 +176,58 @@ def main():
     )
     coor_L = nb.load(coor_L_path).darrays[0].data / 100
     coor_R = nb.load(coor_R_path).darrays[0].data / 100
+    mask_path = {
+        k: str(tflow.get('fsLR', density='32k', hemi=k, desc='nomedialwall'))
+        for k in ('L', 'R')
+    }
+    coor_L = coor_L[nb.load(mask_path['L']).darrays[0].data.astype(bool)]
+    coor_R = coor_R[nb.load(mask_path['R']).darrays[0].data.astype(bool)]
     pe = PositionalEncoding()
-    result_L = pe(coor_L)
-    result_R = pe(coor_R)
-    result = jnp.concatenate((result_L, result_R), axis=0)
+    pe_L = pe(coor_L)
+    pe_R = pe(coor_R)
+    pe_all = jnp.concatenate((pe_L, pe_R), axis=0)
+
+    ge = configure_geometric_encoder()
+    ge_L = ge(coor_L, geom='cortex_L')
+    ge_R = ge(coor_R, geom='cortex_R')
+    ge_all = jnp.concatenate((ge_L, ge_R), axis=0)
 
     plot_f = plotdef(
         surf_from_archive(),
-        surf_scalars_from_array('projection', is_masked=False),
+        #surf_scalars_from_array('projection', is_masked=False),
+        surf_scalars_from_array('projection', is_masked=True),
         plot_to_image(),
         save_grid(
             n_cols=8,
-            n_rows=result.shape[-1],
+            n_rows=pe_L.shape[-1],
             padding=10,
-            canvas_size=(3200, 300 * result.shape[-1]),
+            canvas_size=(3200, 300 * pe_L.shape[-1]),
             canvas_color=(0, 0, 0),
-            fname_spec='scalars-positionalencoding',
+            fname_spec='scalars-encoding',
             sort_by=['surfscalars'],
             scalar_bar_action='collect',
         ),
     )
-    plot_f(
-        template='fsLR',
-        load_mask=True,
-        # TODO: This shouldn't cause an error! Fix it in hyve.
-        # projection_array=result,
-        projection_array_left=result_L,
-        projection_array_right=result_R,
-        surf_scalars_cmap='RdYlBu_r',
-        surf_projection=('veryinflated',),
-        hemisphere=['left', 'right', None],
-        views={
-            'left': ('medial', 'lateral'),
-            'right': ('medial', 'lateral'),
-            'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
-        },
-        output_dir='/tmp',
-        fname_spec='scalars-positionalencoding',
-        window_size=(800, 600),
-    )
+    for k, v in {'pe': (pe_L, pe_R), 'ge': (ge_L, ge_R)}.items():
+        plot_f(
+            template='fsLR',
+            load_mask=True,
+            # TODO: This shouldn't cause an error! Fix it in hyve.
+            # projection_array=result,
+            projection_array_left=v[0].T,
+            projection_array_right=v[1].T,
+            surf_scalars_cmap='RdYlBu_r',
+            surf_projection=('veryinflated',),
+            hemisphere=['left', 'right', None],
+            views={
+                'left': ('medial', 'lateral'),
+                'right': ('medial', 'lateral'),
+                'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
+            },
+            output_dir='/tmp',
+            fname_spec=f'scalars-{k}',
+            window_size=(800, 600),
+        )
     assert 0
 
 
