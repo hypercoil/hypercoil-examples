@@ -3,14 +3,14 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 """
 ELLGAT u-net
-
+~~~~~~~~~~~~
 A u-net model composed of ELLGAT blocks. We draw considerable inspiration from
 SUGAR, a GAT-based u-net model for brain surface registration. The code for
 this model is available at
 https://github.com/IndiLab/SUGAR/blob/main/models/gatunet_model.py
 """
 from collections import defaultdict
-from typing import Mapping, Optional, Tuple
+from typing import Literal, Mapping, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +42,7 @@ def scatter_mean_bipartite(
     ).at[argadj].add(jnp.ones(Q.shape[1]))
     Q = module(
         adj=bipartite,
-        Q=Qr / count,
+        Q=jnp.where(count == 0, 0, Qr / count),
         K=Q,
         key=key,
     )
@@ -74,6 +74,7 @@ class ELLMesh(eqx.Module):
         max_connections_explicit: Optional[
             Mapping[Tuple[int, int], int]
         ] = None,
+        add_self_connections: bool = True,
         *,
         key: Optional['jax.random.PRNGKey'] = None,
     ):
@@ -139,33 +140,43 @@ class ELLMesh(eqx.Module):
         for (i, j), e in bipartite.items():
             ref_mask = masks[j]
             mask = masks[(i, j)]
-            # missing = jnp.where(~mask & ref_mask)[0]
+            missing = jnp.where(~mask & ref_mask)[0]
             # Shove extra vertices into the closest available downsampled
             # vertex
             extra = jnp.where(mask & ~ref_mask)[0]
             if extra.size > 0:
                 rows = bipartite[(i, j)][extra]
-                indices = rows[masks[i][rows[extra]].at[rows == -1].set(0)]
+                indices = rows[masks[i][rows].at[rows == -1].set(0)]
                 allowed = ref_mask * ((bipartite[(i, j)] == -1).sum(-1) > 0)
                 consistent_rows = (
                     closest[(i, j)][indices] + jnp.where(allowed, 0, -jnp.inf)
                 ).argmax(-1)
+                #if missing: assert 0
                 for row, e in zip(consistent_rows, indices):
                     col = (
                         ~(bipartite[(i, j)][row] == -1)
                     ).argmin() # first -1: an available slot
                     bipartite[(i, j)] = (
-                        bipartite[(i, j)].at[row, col].set(indices[0])
+                        bipartite[(i, j)].at[row, col].set(e)
                     )
         vertices = tuple(ico[masks[i]] for i, ico in enumerate(vertices))
         cumul = {
-            i: (j.cumsum() - 1).at[~masks[i]].set(-1)
+            i: (j.cumsum() - 1).at[~j].set(-1)
             for i, j in masks.items()
         }
+        #if missing: assert 0
         icospheres = tuple(
             cumul[i][e].at[e == -1].set(-1)[masks[i]]
             for i, e in enumerate(icospheres)
         )
+        if add_self_connections:
+            icospheres = tuple(
+                jnp.concatenate(
+                    (jnp.arange(ico.shape[0])[..., None], ico),
+                    axis=-1,
+                )
+                for ico in icospheres
+            )
         bipartite = {
             (i, j): cumul[i][e].at[e == -1].set(-1)[masks[j]]
             for (i, j), e in bipartite.items()
@@ -178,6 +189,8 @@ class ELLMesh(eqx.Module):
             (i, j): e[u != -1] // s
             for (i, j), (u, e, s) in argadj.items()
         }
+        # if len(argadj[(1, 2)]) != len(bipartite[(0, 1)]):
+        #     assert 0
 
         self.resolution = resolution
         self.icospheres = icospheres
@@ -194,6 +207,7 @@ class IcoELLGATUNet(eqx.Module):
     readout: ELLGAT
     meshes: Mapping[str, ELLMesh]
     nlin: callable = jax.nn.leaky_relu
+    norm: Optional[eqx.Module] = None
 
     def __init__(
         self,
@@ -204,6 +218,7 @@ class IcoELLGATUNet(eqx.Module):
         readout_dim: int,
         hidden_readout_dim: int,
         nlin: callable = jax.nn.leaky_relu,
+        norm: Optional[eqx.Module] = None,
         *,
         key: 'jax.random.PRNGKey',
     ):
@@ -262,6 +277,7 @@ class IcoELLGATUNet(eqx.Module):
                     out_features=hidden_dim[i],
                     attn_heads=attn_heads[i],
                     nlin=nlin,
+                    norm=norm,
                     key=key_c,
                 )
             )
@@ -273,6 +289,7 @@ class IcoELLGATUNet(eqx.Module):
                     out_features=expansive_out_dim,
                     attn_heads=attn_heads[i],
                     nlin=nlin,
+                    norm=norm,
                     key=key_e,
                 )
             )
@@ -293,6 +310,9 @@ class IcoELLGATUNet(eqx.Module):
         self.ingress = ingress
         self.readout = readout
         self.nlin = nlin
+        if norm is None:
+            norm = eqx.nn.Identity()
+        self.norm = norm
 
     def __call__(
         self,
@@ -324,6 +344,7 @@ class IcoELLGATUNet(eqx.Module):
                     nlin=self.nlin,
                     key=key_r,
                 )
+                Qi = self.norm(Qi)
             if self.resample.get((i - 1, i), None) is not None:
                 key_i, key_r = jax.random.split(key_i)
                 Q = scatter_mean_bipartite(
@@ -334,6 +355,7 @@ class IcoELLGATUNet(eqx.Module):
                     nlin=self.nlin,
                     key=key_r,
                 )
+                Q = self.norm(Q)
             if Qi is not None:
                 Q = jnp.concatenate((Q, Qi), axis=0)
             Q = module(
@@ -342,6 +364,7 @@ class IcoELLGATUNet(eqx.Module):
                 key=key_i,
             )
             Q = self.nlin(Q)
+            Q = self.norm(Q)
             Z.append(Q)
 
         Q = None
@@ -359,10 +382,16 @@ class IcoELLGATUNet(eqx.Module):
                 key=key_i,
             )
             Q = self.nlin(Q)
+            Q = self.norm(Q)
             adjarg = mesh.argadj.get((idx - 1, idx), None)
             if adjarg is not None:
                 # Gather the Q to the original size
                 Q = Q[..., adjarg]
+            # if (
+            #     (Q is not None and jnp.any(jnp.isnan(Q))) or
+            #     (Qi is not None and jnp.any(jnp.isnan(Qi)))
+            # ):
+            #     assert 0
 
         key_r = jax.random.fold_in(key, len(self.contractive))
         Q = self.readout(
@@ -377,37 +406,115 @@ class IcoELLGATUNet(eqx.Module):
         return Q
 
 
-def main():
+def get_meshes(
+    model: Literal['test', 'full'] = 'test',
+    positional_dim: Optional[int] = None,
+) -> Tuple[ELLMesh, ELLMesh]:
     import templateflow.api as tflow
     import nibabel as nb
-    base_coor_L_path = tflow.get(
-        'fsLR', density='32k', hemi='L', space=None, suffix='sphere'
-    )
-    base_mask_L_path = tflow.get(
-        'fsLR', density='32k', hemi='L', desc='nomedialwall'
-    )
-    base_coor = nb.load(base_coor_L_path).darrays[0].data / 100
-    base_mask = nb.load(base_mask_L_path).darrays[0].data.astype(bool)
-    base_adj = connectivity_matrix(
-        base_coor,
-        nb.load(base_coor_L_path).darrays[1].data,
-    )
 
-    mesh_L = ELLMesh(
-        base_coor=base_coor,
-        base_adj=base_adj,
-        resolution=(None, 25, 9),
-        ingress_level=(None, 16, 64),
-        base_mask=base_mask,
-        max_connections_explicit={
-            (0, 1): 16,
-            (0, 2): 64,
-            (1, 2): 16,
-        },
-        key=jax.random.PRNGKey(0),
-    )
+    def get_base_coor_mask_adj(hemi: str) -> Tuple[Tensor, Tensor, Tensor]:
+        base_coor_path = tflow.get(
+            'fsLR', density='32k', hemi=hemi, space=None, suffix='sphere'
+        )
+        base_mask_path = tflow.get(
+            'fsLR', density='32k', hemi=hemi, desc='nomedialwall'
+        )
+        base_coor = nb.load(base_coor_path).darrays[0].data / 100
+        base_mask = nb.load(base_mask_path).darrays[0].data.astype(bool)
+        base_adj = connectivity_matrix(
+            base_coor,
+            nb.load(base_coor_path).darrays[1].data,
+        )
+        return base_coor, base_mask, base_adj
+
+    def get_mesh(hemi: str) -> ELLMesh:
+        base_coor, base_mask, base_adj = get_base_coor_mask_adj(hemi)
+        if model == 'test':
+            ingress_level = (None, 16, 64)
+        elif model == 'full':
+            ingress_level = (None, 64, 658)
+        if positional_dim is not None:
+            ingress_level = tuple(
+                i + positional_dim if i is not None else i
+                for i in ingress_level
+            )
+        return ELLMesh(
+            base_coor=base_coor,
+            base_adj=base_adj,
+            resolution=(None, 25, 9),
+            ingress_level=ingress_level,
+            base_mask=base_mask,
+            max_connections_explicit={
+                (0, 1): 16,
+                (0, 2): 64,
+                (1, 2): 16,
+            },
+            key=jax.random.PRNGKey(0),
+        )
+
+    mesh_L = get_mesh('L')
+    mesh_R = get_mesh('R')
+    return mesh_L, mesh_R
+
+
+def main(visualise: bool = False):
+    mesh_L, mesh_R = get_meshes()
+
+    if visualise:
+        from hyve import (
+            plotdef,
+            surf_from_archive,
+            surf_scalars_from_array,
+            plot_to_image,
+            save_grid,
+        )
+        plot_f = plotdef(
+            surf_from_archive(),
+            surf_scalars_from_array('pools', is_masked=True),
+            plot_to_image(),
+            save_grid(
+                n_cols=8,
+                n_rows=1,
+                padding=10,
+                canvas_size=(3200, 300),
+                canvas_color=(0, 0, 0),
+                fname_spec='ellgatunet_{hemi}_{surfscalars}.png',
+                sort_by=['surfscalars'],
+                scalar_bar_action='collect',
+            ),
+        )
+        for k in mesh_L.argadj:
+            array_L = mesh_L.argadj[k]
+            array_R = mesh_R.argadj[k]
+            k_orig = k
+            while k[0] != 0:
+                array_L = array_L[mesh_L.argadj[k[0] - 1, k[0]]]
+                array_R = array_R[mesh_R.argadj[k[0] - 1, k[0]]]
+                k = (k[0] - 1, k[1])
+            plot_f(
+                template='fsLR',
+                load_mask=True,
+                pools_array_left=array_L,
+                pools_array_right=array_R,
+                surf_scalars_cmap='prism',
+                surf_projection=('veryinflated',),
+                hemisphere=['left', 'right', None],
+                views={
+                    'left': ('medial', 'lateral'),
+                    'right': ('medial', 'lateral'),
+                    'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
+                },
+                output_dir='/tmp',
+                fname_spec=f'scalars-{k_orig[0]}x{k_orig[1]}',
+                window_size=(800, 600),
+            )
+
     model = IcoELLGATUNet(
-        meshes={'cortex_L': mesh_L},
+        meshes={
+            'cortex_L': mesh_L,
+            'cortex_R': mesh_R,
+        },
         in_dim=(3, 16, 64),
         hidden_dim=(16, 64, 128),
         hidden_readout_dim=64,
@@ -415,38 +522,39 @@ def main():
         readout_dim=200,
         key=jax.random.PRNGKey(0),
     )
+    selected_mesh = ('cortex_R', mesh_R)
     Q = (
         jax.random.normal(
             jax.random.PRNGKey(17),
             (
                 model.contractive[0].layers[0].query_features,
-                mesh_L.icospheres[0].shape[0],
+                selected_mesh[1].icospheres[0].shape[0],
             ),
         ),
         jax.random.normal(
             jax.random.PRNGKey(18),
             (
                 model.ingress[1].query_features,
-                mesh_L.icospheres[0].shape[0],
-                #mesh_L.icospheres[1].shape[0],
+                selected_mesh[1].icospheres[0].shape[0],
+                #selected_mesh[1].icospheres[1].shape[0],
             ),
         ),
         jax.random.normal(
             jax.random.PRNGKey(19),
             (
                 model.ingress[2].query_features,
-                mesh_L.icospheres[0].shape[0],
-                #mesh_L.icospheres[2].shape[0],
+                selected_mesh[1].icospheres[0].shape[0],
+                #selected_mesh[1].icospheres[2].shape[0],
             ),
         ),
     )
     result = model(
         Q,
-        mesh='cortex_L',
+        mesh=selected_mesh[0],
         key=jax.random.PRNGKey(0),
     )
     assert 0
 
 
 if __name__ == "__main__":
-    main()
+    main(visualise=True)
