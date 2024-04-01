@@ -3,7 +3,7 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 """
 ELL-format graph attention network (GAT)
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This is a simple graph attention module that operates on an adjacency index
 that corresponds to an ELL-format sparse matrix. It uses the "GATv2"
 formulation from the paper "How Attentive are Graph Attention Networks?" by
@@ -90,6 +90,7 @@ class ELLGAT(eqx.Module):
             jnp.einsum('...hon,...honk->...honk', Q, K[..., adj])
         )
         attn = jax.nn.softmax(jnp.where(adj == -1, -jnp.inf, X), axis=-1)
+        attn = jnp.where(jnp.isnan(attn), 0, attn)
         # attn = jnp.einsum(
         #     '...hwnk,...hw->...hnk',
         #     attn,
@@ -108,9 +109,24 @@ class ELLGAT(eqx.Module):
         )
 
 
+class UnitSphereNorm(eqx.Module):
+    """
+    A simple normalisation layer that normalises the input to the unit sphere.
+    """
+    def __call__(
+        self,
+        X: Tensor,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
+        norm = jnp.linalg.norm(X, axis=-2, keepdims=True)
+        return jnp.where(norm == 0, X, X / norm)
+
+
 class ELLGATBlock(eqx.Module):
     layers: Tuple[ELLGAT, ELLGAT]
     nlin: callable = jax.nn.leaky_relu
+    norm: Optional[eqx.Module] = None
 
     def __init__(
         self,
@@ -118,6 +134,7 @@ class ELLGATBlock(eqx.Module):
         out_features: int,
         attn_heads: int = 1,
         nlin: callable = jax.nn.leaky_relu,
+        norm: Optional[eqx.Module] = None,
         key_features: Optional[Union[int, Tuple[int, int]]] = None,
         *,
         key: 'jax.random.PRNGKey',
@@ -144,6 +161,7 @@ class ELLGATBlock(eqx.Module):
             ),
         )
         self.nlin = nlin
+        self.norm = norm
 
     def __call__(
         self,
@@ -168,6 +186,8 @@ class ELLGATBlock(eqx.Module):
             Q.shape[-3] * Q.shape[-2],
             Q.shape[-1],
         )
+        if self.norm is not None:
+            Q = self.norm(Q)
         Q = self.layers[1](adj, Q, K2, key=key2)
         # Collapse the head and feature dimensions
         return Q.reshape(
