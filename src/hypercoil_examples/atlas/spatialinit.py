@@ -18,11 +18,11 @@ from hyve import (
     surf_from_archive,
     surf_scalars_from_array,
 )
-from hyve.surf import CortexTriSurface
+from hyve.geom import CortexTriSurface
 
 
 PATH = (
-    '/Users/rastkociric/Downloads/hypercoil-examples/src/hypercoil_examples/'
+    'src/hypercoil_examples/'
     'data/surf/tpl-fsLR_hemi-{hemi}_range-{range}_adjacency.npy'
 )
 

@@ -44,10 +44,11 @@ INDICES = {
     'consensus': (0, 1, 2, 3, 4),
 }
 
+MSC_ROOT = '/mnt/quasar/Data/MSC/ds000224-cifti/'
 CIFTI = {
     'HCP': '/Users/rastkociric/Downloads/rfMRI_REST1_LR_Atlas_MSMAll.dtseries.nii',
     'MSC': (
-        '/Users/rastkociric/Downloads/ds000224-fmriprep/sub-MSC01/ses-func02/func/'
+        f'{MSC_ROOT}/'
         'sub-MSC01_ses-func02_task-rest_space-fsLR_den-91k_bold.dtseries.nii'
     ),
 }

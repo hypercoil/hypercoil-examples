@@ -44,6 +44,10 @@ from hyve import (
     save_figure,
     text_element,
 )
+from hypercoil_examples.atlas.const import (
+    CONSENSUS_ENCODER_ROOT,
+    NETWORK_ENCODER_ROOT,
+)
 
 
 SUBDIVISIONS = 5
@@ -111,7 +115,7 @@ def create_consensus_encoder(
 ) -> CortexSubcortexCIfTIAtlas:
     return CortexSubcortexCIfTIAtlas(
         ref_pointer=(
-            '/Users/rastkociric/Downloads/combined_clusters/'
+            f'{CONSENSUS_ENCODER_ROOT}'
             f'abcd_template_matching_combined_clusters_thresh{threshold}'
             '.dlabel.nii'
         ),
@@ -129,11 +133,11 @@ def create_consensus_encoder(
 def create_7net_encoder() -> CortexSubcortexGIfTIAtlas:
     return CortexSubcortexGIfTIAtlas(
         data_L=(
-            '/Users/rastkociric/Downloads/'
+            f'{NETWORK_ENCODER_ROOT}'
             'desc-Yeo7_hemi-L_dseg.gii'
         ),
         data_R=(
-            '/Users/rastkociric/Downloads/'
+            f'{NETWORK_ENCODER_ROOT}'
             'desc-Yeo7_hemi-R_dseg.gii'
         ),
         mask_L=None,

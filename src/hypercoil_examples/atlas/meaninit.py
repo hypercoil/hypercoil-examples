@@ -15,6 +15,7 @@ import nibabel as nb
 import numpy as np
 from hypercoil.functional import residualise
 from hypercoil.nn import AtlasLinear
+from hypercoil_examples.atlas.const import MSC_DATA_ROOT
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
 )
@@ -22,10 +23,10 @@ from hypercoil_examples.atlas.multiencoder import configure_multiencoder
 from hypercoil_examples.atlas.vmf import ENCODE_SELF, whiten_data
 
 IMGS = sorted(glob.glob(
-    '/Users/rastkociric/Downloads/ds000224-fmriprep/sub-MSC0*/ses-func0*/func/'
+    f'{MSC_DATA_ROOT}/'
     'sub-MSC0*_ses-func0*_task-rest_space-fsLR_den-91k_bold.dtseries.nii'
 ))
-IMGS = IMGS + ['/Users/rastkociric/Downloads/rfMRI_REST1_LR_Atlas_MSMAll.dtseries.nii']
+#IMGS = IMGS + ['/Users/rastkociric/Downloads/rfMRI_REST1_LR_Atlas_MSMAll.dtseries.nii']
 
 
 def main(
@@ -65,6 +66,13 @@ def main(
             enc = jnp.concatenate((enc['cortex_L'], enc['cortex_R']))
         enc, _ = whiten_data(enc)
         enc = enc / jnp.linalg.norm(enc, axis=-1, keepdims=True)
+        if jnp.any(jnp.isnan(enc)):
+            print(f'NaN detected: {img}')
+            print('Please verify the validity of the input. Skipping . . .')
+            continue
+        enc = jnp.where(
+            jnp.isnan(enc), 0, enc
+        )
         if i == 0:
             init = enc
         else:

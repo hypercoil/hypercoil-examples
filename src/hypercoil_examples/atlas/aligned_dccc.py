@@ -25,6 +25,7 @@ from hypercoil.init import (
 from hypercoil.engine import Tensor
 from hypercoil.nn.atlas import AtlasLinear
 
+from hypercoil_examples.atlas.const import MSC_DATA_ROOT
 from hypercoil_examples.atlas.cross2subj import visualise
 from hypercoil_examples.atlas.dccc import (
     dccc, get_atlas_path, plot_dccc
@@ -36,7 +37,6 @@ from hypercoil_examples.atlas.promises import empty_promises
 from hypercoil_examples.atlas.spatialinit import init_spatial_priors
 from hypercoil_examples.atlas.vmf import _get_data, whiten_data
 
-MSC_DATA_ROOT = '/Users/rastkociric/Downloads/ds000224/'
 SPATIAL_PRIOR_WEIGHT = 5e2
 DCCC_SAMPLE_KEY = 71
 DCCC_NUM_NODES = 4000

@@ -24,13 +24,15 @@ import pandas as pd
 
 from hypercoil.engine import Tensor
 
+from hypercoil_examples.atlas.const import EIGENMODES_ROOT
+
 EIGENMODES_PATH = {
     'cortex_L': (
-        '/Users/rastkociric/Downloads/template_eigenmodes/'
+        f'{EIGENMODES_ROOT}'
         'fsLR_32k_midthickness-lh_emode_200.txt'
     ),
     'cortex_R': (
-        '/Users/rastkociric/Downloads/template_eigenmodes/'
+        f'{EIGENMODES_ROOT}'
         'fsLR_32k_midthickness-rh_emode_200.txt'
     ),
 }
