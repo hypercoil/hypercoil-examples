@@ -8,7 +8,7 @@ Multiple encoders are used to encode the input data into different
 representations. Each encoder is initialised to map a different scale of
 selectivity space.
 """
-from typing import Literal, Optional, Sequence
+from typing import Literal, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,8 @@ from hypercoil.engine import Tensor
 class MultiEncoder(eqx.Module):
     encoders: Sequence[eqx.Module]
     mask: Tensor
+    reduced_mask: Tensor
+    reduced_slices: Sequence[Tuple[int, int]]
     scales: Sequence[float]
     transforms: Sequence[callable]
     compartments: Sequence[str]
@@ -69,6 +71,13 @@ class MultiEncoder(eqx.Module):
         for i, cmask in enumerate(compartment_masks):
             mask = mask.at[mask[..., i], i].set(cmask)
         self.mask = mask
+        self.reduced_mask = self.mask[self.mask.any(-1)]
+        self.reduced_slices = [
+            tuple(e) for e in zip(
+                self.reduced_mask.argmax(0).tolist(),
+                self.reduced_mask.sum(0).tolist(),
+            )
+        ]
         self.scales = scales
         self.transforms = transforms
         self.compartments = compartments
@@ -76,27 +85,51 @@ class MultiEncoder(eqx.Module):
         self.input_dim = input_dim
         self.concat = concat
 
-    @property
-    def reduced_mask(self) -> Tensor:
-        return self.mask[self.mask.any(-1)]
-
     def rescale(
         self,
         X: Tensor,
-        use_reduced_mask: bool = True,
+        use_reduced_slices: bool = True,
+        use_reduced_mask: bool = False,
         concatenate: bool = True,
     ) -> Tensor:
         masks = self.reduced_mask if use_reduced_mask else self.mask
-        X = [X[..., mask] for mask in masks.T]
-        X = [
-            enc /
-            jnp.linalg.norm(enc, axis=-1, keepdims=True) *
-            jnp.sqrt(scale)
-            for enc, scale in zip(X, self.scales)
-        ]
-        if not concatenate:
+        if use_reduced_slices:
+            X = [
+                jax.lax.dynamic_slice(
+                    X,
+                    (0,) * (X.ndim - 1) + (s[0],),
+                    X.shape[:-1] + (s[1],),
+                )
+                for s in self.reduced_slices
+            ]
+            X = [
+                enc /
+                jnp.linalg.norm(enc, axis=-1, keepdims=True) *
+                jnp.sqrt(scale)
+                for enc, scale in zip(X, self.scales)
+            ]
+            if concatenate:
+                X = jnp.concatenate(X, axis=-1)
             return X
-        return jnp.concatenate(X, axis=-1)
+        # Doesn't work with jit
+        if not concatenate:
+            X = [X[..., mask] for mask in masks.T]
+            return [
+                enc /
+                jnp.linalg.norm(enc, axis=-1, keepdims=True) *
+                jnp.sqrt(scale)
+                for enc, scale in zip(X, self.scales)
+            ]
+        for mask, scale in zip(masks.T, self.scales):
+            X = jnp.where(
+                jnp.expand_dims(mask, axis=tuple(range(X.ndim - 1))),
+                (
+                    X / jnp.linalg.norm(X * mask, axis=-1, keepdims=True) *
+                    jnp.sqrt(scale)
+                ),
+                X,
+            )
+        return X
 
     def __call__(
         self, X: Tensor, *, key: Optional['jax.random.PRNGKey'] = None

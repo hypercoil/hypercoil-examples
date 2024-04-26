@@ -132,7 +132,15 @@ class StaticEncoder(eqx.Module):
             )
             X_aligned[geom] = X_aligned_geom
             new_M[geom] = new_M_geom
-        return (X, X_aligned, S), (M, new_M, new_update_weight)
+        return (
+            (X, X_aligned, S),
+            (
+                M,
+                new_M,
+                new_update_weight,
+                self.temporal.rescale,
+            ),
+        )
 
 
 class SpatialSelectiveMRF(eqx.Module):
@@ -197,7 +205,7 @@ class SpatialSelectiveMRF(eqx.Module):
         Z: Optional[Tensor] = None,
         D: Optional[Tensor] = None,
     ) -> Tensor:
-        energy = 0
+        energy = jnp.asarray(0)
         # point energies
         if U is not None:
             energy += (Q * U).sum(-1)
@@ -251,80 +259,97 @@ class ForwardParcellationModel(eqx.Module):
 
     def __call__(
         self,
-        T: Tensor,
         coor: Mapping[str, Tensor],
-        M: Tensor,
+        T: Optional[Tensor] = None,
+        M: Optional[Tensor] = None,
         new_M: Optional[Tensor] = None,
         update_weight: int = 0,
         *,
-        encoder: eqx.Module,
+        encoder: Optional[eqx.Module] = None,
+        encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
+        compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
-        (X, X_aligned, S), (M, new_M, new_update_weight) = jax.lax.stop_gradient(
-            encoder(
-                T=T,
-                coor_L=coor['cortex_L'],
-                coor_R=coor['cortex_R'],
-                M=M,
-                new_M=new_M,
-                update_weight=update_weight,
+        if isinstance(compartments, str):
+            compartments = (compartments,)
+        if encoder_result is None:
+            encoder_result = jax.lax.stop_gradient(
+                encoder(
+                    T=T,
+                    coor_L=coor['cortex_L'],
+                    coor_R=coor['cortex_R'],
+                    M=M,
+                    new_M=new_M,
+                    update_weight=update_weight,
+                )
             )
-        )
+        if encoder_result is None:
+            raise ValueError(
+                'Either encoder or encoder_result must be provided.'
+            )
+        (
+            (X, X_aligned, S),
+            (M, new_M, new_update_weight, rescale),
+        ) = encoder_result
         point = {
             compartment: self.regulariser[compartment].point_energy(
                 Z=X_aligned[compartment],
                 S=coor[compartment],
             )
-            for compartment in ('cortex_L', 'cortex_R')
+            for compartment in compartments
         }
         Q = {
             compartment: jax.nn.softmax(-point[compartment], axis=-1)
-            for compartment in ('cortex_L', 'cortex_R')
+            for compartment in compartments
         }
         regulariser = {
             compartment: self.regulariser[compartment].point_mle(
                 Q=Q[compartment],
                 selectivity_data=X[compartment],
                 spatial_data=coor[compartment],
-                selectivity_norm_f=encoder.temporal.rescale,
+                selectivity_norm_f=rescale,
             )
-            for compartment in ('cortex_L', 'cortex_R')
+            for compartment in compartments
         }
-        masks = encoder.temporal.reduced_mask.T[::-1]
+        masks = encoder.temporal.reduced_slices[::-1]
         inputs = {
             compartment: tuple(
                 jnp.concatenate((
-                    X[compartment][..., mask],
+                    jax.lax.dynamic_slice(
+                        X[compartment],
+                        (0,) * (X[compartment].ndim - 1) + (s[0],),
+                        X[compartment].shape[:-1] + (s[1],),
+                    ),
                     S[compartment]
                 ), axis=-1).swapaxes(-1, -2)
-                for mask in masks
+                for s in masks
             )
-            for compartment in ('cortex_L', 'cortex_R')
+            for compartment in compartments
         }
         P = {
             compartment: self.approximator(
                 inputs[compartment],
                 mesh=compartment,
                 key=key,
-            ).swapaxes(-1, -2)
-            for compartment in ('cortex_L', 'cortex_R')
+            )
+            for compartment in compartments
         }
         energy = {
             compartment: regulariser[compartment].expected_energy(
-                Q=P[compartment],
+                Q=P[compartment].swapaxes(-1, -2),
                 S=coor[compartment],
                 Z=X[compartment],
                 D=self.approximator.meshes[compartment].icospheres[0],
             )
-            for compartment in ('cortex_L', 'cortex_R')
+            for compartment in compartments
         }
         energy = jnp.stack(
             tuple(
                 jnp.mean(energy[compartment])
-                for compartment in ('cortex_L', 'cortex_R')
+                for compartment in compartments
             )
         ).mean()
-        return P, energy
+        return P, energy, (M, new_M, new_update_weight)
 
 
 def vmf_mle_mu_only(
@@ -342,7 +367,7 @@ def vmf_mle_mu_only(
         kappa = src_distr.kappa
     else:
         kappa = 10.
-    return VonMisesFisher(mu=mu, kappa=kappa)
+    return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
 
 
 def init_full_model(
@@ -435,6 +460,34 @@ def init_full_model(
     return model, encoder, template
 
 
+def forward(
+    model: ForwardParcellationModel,
+    *,
+    coor: Mapping[str, Tensor],
+    encoder: StaticEncoder,
+    encoder_result: Tuple,
+    compartment: str,
+    key: 'jax.random.PRNGKey',
+):
+    result = model(
+        coor=coor,
+        encoder=encoder,
+        encoder_result=encoder_result,
+        compartments=(compartment,),
+        key=key,
+    )
+    (X, _, _), _ = encoder_result
+    P, energy, _ = result
+    parcel_ts = jnp.linalg.lstsq(
+        P[compartment].swapaxes(-2, -1),
+        X[compartment],
+    )[0]
+    recon_error = jnp.linalg.norm(
+        P[compartment].swapaxes(-2, -1) @ parcel_ts - X[compartment]
+    )
+    return energy + recon_error
+
+
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
     from hypercoil_examples.atlas.aligned_dccc import (
         get_msc_dataset, _get_data
@@ -447,14 +500,25 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         coor_R=coor_R,
         num_parcels=num_parcels,
     )
-    result = model(
+    encoder_result = encoder(
         T=T,
+        coor_L=coor_L,
+        coor_R=coor_R,
+        M=template,
+    )
+    result = eqx.filter_value_and_grad(
+        eqx.filter_jit(forward)
+    )(
+    #result = eqx.filter_value_and_grad(forward)(
+    #result = forward(
+        model,
         coor={
             'cortex_L': coor_L,
             'cortex_R': coor_R,
         },
-        M=template,
+        encoder_result=encoder_result,
         encoder=encoder,
+        compartment='cortex_L',
         key=jax.random.PRNGKey(0),
     )
     assert 0

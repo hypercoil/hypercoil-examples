@@ -32,6 +32,7 @@ from hyve import (
     text_element,
 )
 
+from hypercoil_examples.atlas.const import MSC_DATA_ROOT
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
     create_consensus_encoder,
@@ -44,11 +45,10 @@ INDICES = {
     'consensus': (0, 1, 2, 3, 4),
 }
 
-MSC_ROOT = '/mnt/quasar/Data/MSC/ds000224-cifti/'
 CIFTI = {
     'HCP': '/Users/rastkociric/Downloads/rfMRI_REST1_LR_Atlas_MSMAll.dtseries.nii',
     'MSC': (
-        f'{MSC_ROOT}/'
+        f'{MSC_DATA_ROOT}/'
         'sub-MSC01_ses-func02_task-rest_space-fsLR_den-91k_bold.dtseries.nii'
     ),
 }
