@@ -40,9 +40,11 @@ def scatter_mean_bipartite(
     count = jnp.zeros(
         (bipartite.shape[0],)
     ).at[argadj].add(jnp.ones(Q.shape[1]))
+    Qr = jnp.where(count == 0, 0, Qr)
+    count = jnp.where(count == 0, 1, count)
     Q = module(
         adj=bipartite,
-        Q=jnp.where(count == 0, 0, Qr / count),
+        Q=Qr / count,
         K=Q,
         key=key,
     )
