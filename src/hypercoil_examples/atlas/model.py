@@ -16,8 +16,9 @@ import jax.numpy as jnp
 import equinox as eqx
 import numpyro
 from numpyro.distributions import Distribution
+from scipy.special import softmax
 
-from hypercoil.engine import Tensor
+from hypercoil.engine import Tensor, _to_jax_array
 from hypercoil.functional import residualise
 from hypercoil.init import VonMisesFisher
 
@@ -139,6 +140,7 @@ class StaticEncoder(eqx.Module):
                 new_M,
                 new_update_weight,
                 self.temporal.rescale,
+                T,
             ),
         )
 
@@ -289,7 +291,7 @@ class ForwardParcellationModel(eqx.Module):
             )
         (
             (X, X_aligned, S),
-            (M, new_M, new_update_weight, rescale),
+            (M, new_M, new_update_weight, rescale, _),
         ) = encoder_result
         point = {
             compartment: self.regulariser[compartment].point_energy(
@@ -375,9 +377,11 @@ def init_full_model(
     coor_L: Tensor,
     coor_R: Tensor,
     num_parcels: int = 100,
+    key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
     import numpy as np
     from hypercoil_examples.atlas.spatialinit import init_spatial_priors
+    key = key or jax.random.PRNGKey(0)
     temporal_encoder = configure_multiencoder()
     spatial_encoder = configure_geometric_encoder()
     spatial_loc_left, spatial_loc_right, spatial_data = init_spatial_priors()
@@ -408,9 +412,37 @@ def init_full_model(
         coor_R=coor_R,
         M=template,
     )
+    coor_parcels_L = coor_L[jax.random.choice(
+        key,
+        coor_L.shape[0],
+        shape=(num_parcels,),
+        replace=False,
+    )]
+    coor_parcels_R = np.concatenate(
+        (-coor_parcels_L[..., :1], coor_parcels_L[..., 1:]),
+        axis=-1,
+    )
+    selectivity_parcels = {
+        compartment: softmax(
+            np.exp({
+                'cortex_L': coor_L @ coor_parcels_L.swapaxes(-2, -1),
+                'cortex_R': coor_R @ coor_parcels_R.swapaxes(-2, -1),
+            }[compartment]).T,
+            axis=-1,
+        ) @ result[0][0][compartment]
+        for compartment in ('cortex_L', 'cortex_R')
+    }
+    selectivity_parcels = {
+        compartment: selectivity_parcels[compartment] / jnp.linalg.norm(
+            selectivity_parcels[compartment],
+            axis=-1,
+            keepdims=True,
+        )
+        for compartment in ('cortex_L', 'cortex_R')
+    }
     selectivity_distribution = {
         compartment: VonMisesFisher(
-            mu=result[0][0][compartment][:num_parcels],
+            mu=selectivity_parcels[compartment],
             kappa=10.,
         )
         for compartment in ('cortex_L', 'cortex_R')
@@ -418,9 +450,9 @@ def init_full_model(
     spatial_distribution = {
         compartment: VonMisesFisher(
             mu={
-                'cortex_L': coor_L,
-                'cortex_R': coor_R,
-            }[compartment][:num_parcels],
+                'cortex_L': coor_parcels_L,
+                'cortex_R': coor_parcels_R,
+            }[compartment],
             kappa=10.,
         )
         for compartment in ('cortex_L', 'cortex_R')
@@ -479,16 +511,32 @@ def forward(
         compartments=(compartment,),
         key=key,
     )
-    (X, _, _), _ = encoder_result
+    (_, (_, _, _, _, T)) = encoder_result
     P, energy, _ = result
+    start, size = encoder.temporal.encoders[0].limits[compartment]
+    T = T[..., start:(start + size), :]
     parcel_ts = jnp.linalg.lstsq(
         P[compartment].swapaxes(-2, -1),
-        X[compartment],
+        T,
     )[0]
     recon_error = jnp.linalg.norm(
-        P[compartment].swapaxes(-2, -1) @ parcel_ts - X[compartment]
+        P[compartment].swapaxes(-2, -1) @ parcel_ts - T
     )
-    return energy + recon_error
+    other_hemi = 'cortex_R' if compartment == 'cortex_L' else 'cortex_L'
+    other_coor = _to_jax_array(
+        model.regulariser[other_hemi].spatial_distribution.mu
+    )
+    tether = jnp.linalg.norm(
+        other_coor.at[..., 0].set(-other_coor[..., 0]) - _to_jax_array(
+            model.regulariser[other_hemi].spatial_distribution.mu
+        ),
+        axis=-1,
+    ).sum()
+    return energy + recon_error + tether, {
+        'energy': energy,
+        'recon_error': recon_error,
+        'hemisphere_tether': tether,
+    }
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
@@ -510,9 +558,10 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         M=template,
     )
     result = eqx.filter_value_and_grad(
-        eqx.filter_jit(forward)
+        eqx.filter_jit(forward),
+        has_aux=True,
     )(
-    #result = eqx.filter_value_and_grad(forward)(
+    #result = eqx.filter_value_and_grad(forward, has_aux=True)(
     #result = forward(
         model,
         coor={
