@@ -120,7 +120,8 @@ class UnitSphereNorm(eqx.Module):
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tensor:
         norm = jnp.linalg.norm(X, axis=-2, keepdims=True)
-        return jnp.where(norm == 0, X, X / norm)
+        norm = jnp.where(norm == 0, 1, norm)
+        return X / norm
 
 
 class ELLGATBlock(eqx.Module):
