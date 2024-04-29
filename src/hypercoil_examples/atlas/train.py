@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
+from hypercoil.engine import _to_jax_array
 from hypercoil_examples.atlas.aligned_dccc import (
     get_msc_dataset, _get_data
 )
@@ -18,6 +19,7 @@ from hypercoil_examples.atlas.cross2subj import visualise
 from hypercoil_examples.atlas.model import (
     init_full_model,
     forward,
+    Tensor,
 )
 from hypercoil_examples.atlas.positional import (
     get_coors
@@ -25,6 +27,49 @@ from hypercoil_examples.atlas.positional import (
 
 LEARNING_RATE = 0.001
 REPORT_INTERVAL = 10
+
+
+#jax.config.update('jax_debug_nans', True)
+
+
+
+def update(
+    model,
+    opt_state,
+    *,
+    opt,
+    compartment,
+    coor,
+    encoder,
+    encoder_result,
+    epoch,
+    key,
+):
+    if epoch > 0: jax.config.update('jax_debug_nans', True)
+    (loss, meta), grad = eqx.filter_value_and_grad(
+        eqx.filter_jit(forward),
+        #forward,
+        has_aux=True,
+    )(
+        model,
+        coor=coor,
+        encoder_result=encoder_result,
+        encoder=encoder,
+        compartment=compartment,
+        key=jax.random.PRNGKey(0),
+    )
+    if jnp.isnan(loss):
+        print(f'NaN loss at epoch {epoch}. Skipping update')
+        print(meta)
+        return model, opt_state, None, {}
+    updates, opt_state = opt.update(
+        eqx.filter(grad, eqx.is_inexact_array),
+        opt_state,
+        eqx.filter(model, eqx.is_inexact_array),
+    )
+    model = eqx.apply_updates(model, updates)
+    del updates, grad
+    return model, opt_state, loss.item(), {k: v.item() for k, v in meta.items()}
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
@@ -45,33 +90,40 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         M=template,
     )
     losses = []
+    coor = {
+        'cortex_L': coor_L,
+        'cortex_R': coor_R,
+    }
     for i in range(2000):
         print(i)
-        (loss, meta), grad = eqx.filter_value_and_grad(
-            eqx.filter_jit(forward),
-            has_aux=True,
-        )(
-            model,
-            coor={
-                'cortex_L': coor_L,
-                'cortex_R': coor_R,
-            },
-            encoder_result=encoder_result,
-            encoder=encoder,
+        model, opt_state, loss_L, meta_L = update(
+            model=model,
+            opt_state=opt_state,
+            opt=opt,
             compartment='cortex_L',
+            coor=coor,
+            encoder=encoder,
+            encoder_result=encoder_result,
+            epoch=i,
             key=jax.random.PRNGKey(0),
         )
-        if jnp.isnan(loss):
-            print(f'NaN loss at epoch {i}. Skipping update')
-            continue
-        updates, opt_state = opt.update(
-            eqx.filter(grad, eqx.is_inexact_array),
-            opt_state,
-            eqx.filter(model, eqx.is_inexact_array),
-        )
-        model = eqx.apply_updates(model, updates)
-        losses += [loss.item()]
-        del updates
+        if True:
+            model, opt_state, loss_R, meta_R = update(
+                model=model,
+                opt_state=opt_state,
+                opt=opt,
+                compartment='cortex_R',
+                coor=coor,
+                encoder=encoder,
+                encoder_result=encoder_result,
+                epoch=i,
+                key=jax.random.PRNGKey(0),
+            )
+        else:
+            loss_R = 0
+            meta_R = {k: 0 for k in meta_L}
+        losses += [loss_L + loss_R]
+        meta = {k: meta_L[k] + meta_R[k] for k in meta_L}
         if i % REPORT_INTERVAL == 0:
             print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
             visualise(

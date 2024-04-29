@@ -19,7 +19,7 @@ from numpyro.distributions import Distribution
 from scipy.special import softmax
 
 from hypercoil.engine import Tensor, _to_jax_array
-from hypercoil.functional import residualise
+from hypercoil.functional import residualise, spherical_geodesic
 from hypercoil.init import VonMisesFisher
 
 from hypercoil_examples.atlas.aligned_dccc import param_bimodal_beta
@@ -480,7 +480,7 @@ def init_full_model(
         #in_dim=(14 + encoder.spatial.default_encoding_dim, 64, 512),
         in_dim=(14 + encoder.spatial.default_encoding_dim, 32, 64),
         #hidden_dim=(16, 64, 256),
-        hidden_dim=(16, 32, 64),
+        hidden_dim=(8, 16, 64),
         hidden_readout_dim=num_parcels // 2,
         #attn_heads=(4, 4, 4),
         attn_heads=(4, 4, 4),
@@ -526,11 +526,11 @@ def forward(
     other_coor = _to_jax_array(
         model.regulariser[other_hemi].spatial_distribution.mu
     )
-    tether = jnp.linalg.norm(
-        other_coor.at[..., 0].set(-other_coor[..., 0]) - _to_jax_array(
-            model.regulariser[other_hemi].spatial_distribution.mu
-        ),
-        axis=-1,
+    tether = spherical_geodesic(
+        _to_jax_array(
+            model.regulariser['cortex_L'].spatial_distribution.mu
+        )[..., None, :],
+        other_coor.at[..., 0].set(-other_coor[..., 0])[..., None, :],
     ).sum()
     return energy + recon_error + tether, {
         'energy': energy,
