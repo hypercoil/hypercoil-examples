@@ -75,6 +75,7 @@ def update(
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
+    key = jax.random.PRNGKey(0)
     coor_L, coor_R = get_coors()
     T = _get_data(get_msc_dataset(subject, session))
     model, encoder, template = init_full_model(
@@ -98,6 +99,8 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
     }
     for i in range(2000):
         print(i)
+        key = jax.random.fold_in(key, i)
+        key_l, key_r = jax.random.split(key)
         model, opt_state, loss_L, meta_L = update(
             model=model,
             opt_state=opt_state,
@@ -107,7 +110,7 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
             encoder=encoder,
             encoder_result=encoder_result,
             epoch=i,
-            key=jax.random.PRNGKey(0),
+            key=key_l,
         )
         if True:
             model, opt_state, loss_R, meta_R = update(
@@ -119,7 +122,7 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
                 encoder=encoder,
                 encoder_result=encoder_result,
                 epoch=i,
-                key=jax.random.PRNGKey(0),
+                key=key_r,
             )
         else:
             loss_R = 0
