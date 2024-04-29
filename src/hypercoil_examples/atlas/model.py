@@ -504,6 +504,7 @@ def forward(
     compartment: str,
     key: 'jax.random.PRNGKey',
 ):
+    key_m, key_n = jax.random.split(key, 2)
     result = model(
         coor=coor,
         encoder=encoder,
@@ -526,9 +527,17 @@ def forward(
     other_coor = _to_jax_array(
         model.regulariser[other_hemi].spatial_distribution.mu
     )
+    #TODO: We can get NaN if the two are aligned exactly. Here we add noise
+    #      to avoid this edge case, but we should work out why this occurs.
+    other_coor = other_coor + 1e-4 * jax.random.normal(
+        key_n, other_coor.shape
+    )
+    other_coor = other_coor / jnp.linalg.norm(
+        other_coor, axis=-1, keepdims=True
+    )
     tether = spherical_geodesic(
         _to_jax_array(
-            model.regulariser['cortex_L'].spatial_distribution.mu
+            model.regulariser[compartment].spatial_distribution.mu
         )[..., None, :],
         other_coor.at[..., 0].set(-other_coor[..., 0])[..., None, :],
     ).sum()

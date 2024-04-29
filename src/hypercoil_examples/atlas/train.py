@@ -30,6 +30,11 @@ REPORT_INTERVAL = 10
 
 
 #jax.config.update('jax_debug_nans', True)
+forward_backward = eqx.filter_value_and_grad(
+    eqx.filter_jit(forward),
+    #forward,
+    has_aux=True,
+)
 
 
 
@@ -45,12 +50,9 @@ def update(
     epoch,
     key,
 ):
-    if epoch > 0: jax.config.update('jax_debug_nans', True)
-    (loss, meta), grad = eqx.filter_value_and_grad(
-        eqx.filter_jit(forward),
-        #forward,
-        has_aux=True,
-    )(
+    if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
+    (loss, meta), grad = forward_backward(
+    #forward(
         model,
         coor=coor,
         encoder_result=encoder_result,
@@ -148,21 +150,22 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
                 ),
             )
             #TODO: Load a specific set of subjects and sessions
-            # P, _, _ = model(
-            #     coor={
-            #         'cortex_L': coor_L,
-            #         'cortex_R': coor_R,
-            #     },
-            #     encoder=encoder,
-            #     encoder_result=encoder_result,
-            #     compartments=('cortex_L', 'cortex_R'),
-            #     key=jax.random.PRNGKey(0),
-            # )
-            # visualise(
-            #     name=f'epoch_{i}',
-            #     log_prob_L=P['cortex_L'],
-            #     log_prob_R=P['cortex_R'],
-            # )
+            if False:
+                P, _, _ = model(
+                    coor={
+                        'cortex_L': coor_L,
+                        'cortex_R': coor_R,
+                    },
+                    encoder=encoder,
+                    encoder_result=encoder_result,
+                    compartments=('cortex_L', 'cortex_R'),
+                    key=jax.random.PRNGKey(0),
+                )
+                visualise(
+                    name=f'UNet_epoch_{i}',
+                    log_prob_L=P['cortex_L'].T,
+                    log_prob_R=P['cortex_R'].T,
+                )
     import matplotlib.pyplot as plt
     plt.plot(losses)
     plt.savefig('/tmp/losses.png')

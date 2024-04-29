@@ -89,8 +89,11 @@ class ELLGAT(eqx.Module):
         X = self.nlin(
             jnp.einsum('...hon,...honk->...honk', Q, K[..., adj])
         )
-        attn = jax.nn.softmax(jnp.where(adj == -1, -jnp.inf, X), axis=-1)
-        attn = jnp.where(jnp.isnan(attn), 0, attn)
+        X = jnp.where(adj == -1, -jnp.inf, X)
+        # The following line is required to avoid NaNs in the edge case
+        X = jnp.where((adj != -1).sum(-1, keepdims=True) == 0, 0, X)
+        attn = jax.nn.softmax(X, axis=-1)
+        # attn = jnp.where(jnp.isnan(attn), 0, attn)
         # attn = jnp.einsum(
         #     '...hwnk,...hw->...hnk',
         #     attn,
@@ -119,9 +122,11 @@ class UnitSphereNorm(eqx.Module):
         *,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tensor:
+        mask = jnp.all(X != 0, axis=-2, keepdims=True)
+        X = jnp.where(mask, X, 1)
         norm = jnp.linalg.norm(X, axis=-2, keepdims=True)
         norm = jnp.where(norm == 0, 1, norm)
-        return X / norm
+        return jnp.where(mask, X / norm, 0)
 
 
 class ELLGATBlock(eqx.Module):
