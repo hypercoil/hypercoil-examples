@@ -19,6 +19,22 @@ import equinox as eqx
 from hypercoil.engine import Tensor
 
 
+class Identity_(eqx.Module):
+    """
+    An identity module that does nothing. This differs from the ``Identity``
+    module from Equinox in that it takes additional arguments, which are
+    ignored.
+    """
+    def __call__(
+        self,
+        X: Tensor,
+        *,
+        inference: Optional[bool] = None,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
+        return X
+
+
 class ELLGAT(eqx.Module):
     """
     Graph attention network (GAT) for ELL-format data.
@@ -32,6 +48,7 @@ class ELLGAT(eqx.Module):
     key_weight: Tensor
     attn_weight: Tensor
     nlin: callable = jax.nn.leaky_relu
+    dropout: Optional[callable] = None
     key_features: Optional[int] = None
 
     def __init__(
@@ -40,6 +57,8 @@ class ELLGAT(eqx.Module):
         out_features: int,
         attn_heads: int = 1,
         nlin: callable = jax.nn.leaky_relu,
+        dropout: Optional[float] = None,
+        dropout_inference: bool = False,
         key_features: Optional[int] = None,
         *,
         key: 'jax.random.PRNGKey',
@@ -67,6 +86,13 @@ class ELLGAT(eqx.Module):
             (attn_heads, out_features),
         ) - 0.5) * a_scale
         self.nlin = nlin
+        if dropout is not None:
+            self.dropout = eqx.nn.Dropout(
+                dropout,
+                inference=dropout_inference,
+            )
+        else:
+            self.dropout = Identity_()
 
     def __call__(
         self,
@@ -74,6 +100,7 @@ class ELLGAT(eqx.Module):
         Q: Tensor,
         K: Optional[Tensor] = None,
         *,
+        inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tensor:
         if K is None:
@@ -89,10 +116,12 @@ class ELLGAT(eqx.Module):
         X = self.nlin(
             jnp.einsum('...hon,...honk->...honk', Q, K[..., adj])
         )
+        X = jnp.einsum('...hwnk,...hw->...hnk', X, self.attn_weight)
         X = jnp.where(adj == -1, -jnp.inf, X)
         # The following line is required to avoid NaNs in the edge case
         X = jnp.where((adj != -1).sum(-1, keepdims=True) == 0, 0, X)
         attn = jax.nn.softmax(X, axis=-1)
+        attn = self.dropout(attn, inference=inference, key=key)
         # attn = jnp.where(jnp.isnan(attn), 0, attn)
         # attn = jnp.einsum(
         #     '...hwnk,...hw->...hnk',
@@ -105,10 +134,9 @@ class ELLGAT(eqx.Module):
         #     jnp.where(adj == -1, 0, X),
         # )
         return jnp.einsum(
-            '...hwnk,...hw,...honk->...hon',
-            attn,
-            self.attn_weight,
-            jnp.where(adj == -1, 0, X),
+            '...hnk,...hon->...hon',
+            jnp.where(adj == -1, 0, attn),
+            Q,
         )
 
 
@@ -141,6 +169,8 @@ class ELLGATBlock(eqx.Module):
         attn_heads: int = 1,
         nlin: callable = jax.nn.leaky_relu,
         norm: Optional[eqx.Module] = None,
+        dropout: Optional[float] = None,
+        dropout_inference: bool = False,
         key_features: Optional[Union[int, Tuple[int, int]]] = None,
         *,
         key: 'jax.random.PRNGKey',
@@ -155,6 +185,8 @@ class ELLGATBlock(eqx.Module):
                 out_features=out_features,
                 attn_heads=attn_heads,
                 nlin=nlin,
+                dropout=dropout,
+                dropout_inference=dropout_inference,
                 key=key1,
             ),
             ELLGAT(
@@ -163,6 +195,8 @@ class ELLGATBlock(eqx.Module):
                 out_features=out_features,
                 attn_heads=attn_heads,
                 nlin=nlin,
+                dropout=dropout,
+                dropout_inference=dropout_inference,
                 key=key2,
             ),
         )
@@ -175,6 +209,7 @@ class ELLGATBlock(eqx.Module):
         Q: Tensor,
         K: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
         *,
+        inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tensor:
         if key is None:
@@ -185,7 +220,7 @@ class ELLGATBlock(eqx.Module):
             K1, K2 = K
         else:
             K1 = K2 = K
-        Q = self.layers[0](adj, Q, K1, key=key1)
+        Q = self.layers[0](adj, Q, K1, inference=inference, key=key1)
         # Collapse the head and feature dimensions
         Q = self.nlin(Q).reshape(
             *Q.shape[:-3],
@@ -194,7 +229,7 @@ class ELLGATBlock(eqx.Module):
         )
         if self.norm is not None:
             Q = self.norm(Q)
-        Q = self.layers[1](adj, Q, K2, key=key2)
+        Q = self.layers[1](adj, Q, K2, inference=inference, key=key2)
         # Collapse the head and feature dimensions
         return Q.reshape(
             *Q.shape[:-3],
@@ -210,12 +245,12 @@ def main():
     )
     vertices, faces = icosphere(60)
     edges = connectivity_matrix(vertices, faces)
-    model = ELLGAT(3, 4, 2, key=jax.random.PRNGKey(0))
+    model = ELLGAT(3, 4, 2, dropout=0.6, key=jax.random.PRNGKey(0))
     Q = jax.random.normal(
         jax.random.PRNGKey(17),
         (model.key_features, vertices.shape[0]),
     )
-    out = model(edges, Q)
+    out = model(edges, Q, key=jax.random.PRNGKey(5))
     out = out.reshape(
         *out.shape[:-3],
         out.shape[-3] * out.shape[-2],

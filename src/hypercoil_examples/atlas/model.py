@@ -40,6 +40,8 @@ from hypercoil_examples.atlas.selectransform import (
 )
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
+ELLGAT_DROPOUT = 0.6
+
 
 class EmptyPromises(eqx.Module):
     spatial_prior_loc: Union[Tensor, Mapping[str, Tensor]]
@@ -270,6 +272,7 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
         if isinstance(compartments, str):
@@ -332,6 +335,7 @@ class ForwardParcellationModel(eqx.Module):
             compartment: self.approximator(
                 inputs[compartment],
                 mesh=compartment,
+                inference=inference,
                 key=key,
             )
             for compartment in compartments
@@ -486,6 +490,8 @@ def init_full_model(
         attn_heads=(4, 4, 4),
         readout_dim=num_parcels,
         norm=UnitSphereNorm(),
+        dropout=ELLGAT_DROPOUT,
+        dropout_inference=False,
         key=jax.random.PRNGKey(0),
     )
     model = ForwardParcellationModel(

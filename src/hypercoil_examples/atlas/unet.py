@@ -30,6 +30,7 @@ def scatter_mean_bipartite(
     bipartite: Tensor,
     nlin: callable,
     *,
+    inference: Optional[bool] = None,
     key: 'jax.random.PRNGKey',
 ) -> Tensor:
     # Prepare scatter-mean as query, and the original Q as key
@@ -46,6 +47,7 @@ def scatter_mean_bipartite(
         adj=bipartite,
         Q=Qr / count,
         K=Q,
+        inference=inference,
         key=key,
     )
     Q = nlin(
@@ -221,6 +223,8 @@ class IcoELLGATUNet(eqx.Module):
         hidden_readout_dim: int,
         nlin: callable = jax.nn.leaky_relu,
         norm: Optional[eqx.Module] = None,
+        dropout: Optional[float] = None,
+        dropout_inference: bool = False,
         *,
         key: 'jax.random.PRNGKey',
     ):
@@ -257,6 +261,8 @@ class IcoELLGATUNet(eqx.Module):
                     out_features=in_dim[i],
                     attn_heads=attn_heads[i],
                     nlin=nlin,
+                    dropout=dropout,
+                    dropout_inference=dropout_inference,
                     key=key_i,
                 )
                 #TODO: This should be more flexible
@@ -271,6 +277,8 @@ class IcoELLGATUNet(eqx.Module):
                     out_features=in_dim[i + 1] // attn_heads[i + 1],
                     attn_heads=attn_heads[i + 1],
                     nlin=nlin,
+                    dropout=dropout,
+                    dropout_inference=dropout_inference,
                     key=key_r,
                 )
             contractive.append(
@@ -280,6 +288,8 @@ class IcoELLGATUNet(eqx.Module):
                     attn_heads=attn_heads[i],
                     nlin=nlin,
                     norm=norm,
+                    dropout=dropout,
+                    dropout_inference=dropout_inference,
                     key=key_c,
                 )
             )
@@ -292,6 +302,8 @@ class IcoELLGATUNet(eqx.Module):
                     attn_heads=attn_heads[i],
                     nlin=nlin,
                     norm=norm,
+                    dropout=dropout,
+                    dropout_inference=dropout_inference,
                     key=key_e,
                 )
             )
@@ -302,6 +314,8 @@ class IcoELLGATUNet(eqx.Module):
             out_features=readout_dim,
             attn_heads=1,
             nlin=nlin,
+            dropout=dropout,
+            dropout_inference=dropout_inference,
             key=key_r,
         )
 
@@ -321,6 +335,7 @@ class IcoELLGATUNet(eqx.Module):
         X: Tuple[Tensor, ...],
         mesh: Optional[str] = None,
         *,
+        inference: Optional[bool] = None,
         key: 'jax.random.PRNGKey',
     ) -> Tensor:
         if mesh is None:
@@ -344,6 +359,7 @@ class IcoELLGATUNet(eqx.Module):
                     argadj=mesh.argadj[(0, i)],
                     bipartite=mesh.bipartite[(0, i)],
                     nlin=self.nlin,
+                    inference=inference,
                     key=key_r,
                 )
                 Qi = self.norm(Qi)
@@ -355,6 +371,7 @@ class IcoELLGATUNet(eqx.Module):
                     argadj=mesh.argadj[(i - 1, i)],
                     bipartite=mesh.bipartite[(i - 1, i)],
                     nlin=self.nlin,
+                    inference=inference,
                     key=key_r,
                 )
                 Q = self.norm(Q)
@@ -363,6 +380,7 @@ class IcoELLGATUNet(eqx.Module):
             Q = module(
                 adj=mesh.icospheres[i],
                 Q=Q,
+                inference=inference,
                 key=key_i,
             )
             Q = self.nlin(Q)
@@ -381,6 +399,7 @@ class IcoELLGATUNet(eqx.Module):
             Q = module(
                 adj=mesh.icospheres[idx],
                 Q=Q,
+                inference=inference,
                 key=key_i,
             )
             Q = self.nlin(Q)
@@ -399,6 +418,7 @@ class IcoELLGATUNet(eqx.Module):
         Q = self.readout(
             adj=mesh.icospheres[0],
             Q=Q,
+            inference=inference,
             key=key_r,
         )
         Q = jax.nn.softmax(
@@ -522,6 +542,7 @@ def main(visualise: bool = False):
         hidden_readout_dim=64,
         attn_heads=(4, 4, 4),
         readout_dim=200,
+        dropout=0.6,
         key=jax.random.PRNGKey(0),
     )
     selected_mesh = ('cortex_R', mesh_R)
