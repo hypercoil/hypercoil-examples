@@ -261,7 +261,7 @@ class ForwardParcellationModel(eqx.Module):
     regulariser: Mapping[str, eqx.Module]
     approximator: eqx.Module
 
-    def __call__(
+    def _common_path(
         self,
         coor: Mapping[str, Tensor],
         T: Optional[Tensor] = None,
@@ -272,8 +272,6 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
-        inference: Optional[bool] = None,
-        key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
         if isinstance(compartments, str):
             compartments = (compartments,)
@@ -316,6 +314,84 @@ class ForwardParcellationModel(eqx.Module):
             )
             for compartment in compartments
         }
+        return regulariser, X, S, compartments, (M, new_M, new_update_weight)
+
+    def regulariser_path(
+        self,
+        coor: Mapping[str, Tensor],
+        T: Optional[Tensor] = None,
+        M: Optional[Tensor] = None,
+        new_M: Optional[Tensor] = None,
+        update_weight: int = 0,
+        *,
+        encoder: Optional[eqx.Module] = None,
+        encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
+        compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        inference: Optional[bool] = None,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ):
+        regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
+            self._common_path(
+                coor=coor,
+                T=T,
+                M=M,
+                new_M=new_M,
+                update_weight=update_weight,
+                encoder=encoder,
+                encoder_result=encoder_result,
+                compartments=compartments,
+            )
+        )
+        P = {
+            compartment: regulariser[compartment].point_energy(
+                Z=X[compartment],
+                S=coor[compartment],
+            )
+            for compartment in compartments
+        }
+        energy = {
+            compartment: regulariser[compartment].expected_energy(
+                Q=P[compartment].swapaxes(-1, -2),
+                S=coor[compartment],
+                Z=X[compartment],
+                D=self.approximator.meshes[compartment].icospheres[0],
+            )
+            for compartment in compartments
+        }
+        energy = jnp.stack(
+            tuple(
+                jnp.mean(energy[compartment])
+                for compartment in compartments
+            )
+        ).mean()
+        return P, energy, (M, new_M, new_update_weight)
+
+    def __call__(
+        self,
+        coor: Mapping[str, Tensor],
+        T: Optional[Tensor] = None,
+        M: Optional[Tensor] = None,
+        new_M: Optional[Tensor] = None,
+        update_weight: int = 0,
+        *,
+        encoder: Optional[eqx.Module] = None,
+        encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
+        compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        inference: Optional[bool] = None,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
+            self._common_path(
+                coor=coor,
+                T=T,
+                M=M,
+                new_M=new_M,
+                update_weight=update_weight,
+                encoder=encoder,
+                encoder_result=encoder_result,
+                compartments=compartments,
+            )
+        )
         masks = encoder.temporal.reduced_slices[::-1]
         inputs = {
             compartment: tuple(
@@ -508,15 +584,20 @@ def forward(
     encoder: StaticEncoder,
     encoder_result: Tuple,
     compartment: str,
+    mode: Literal['full', 'regulariser'] = 'full',
     key: 'jax.random.PRNGKey',
 ):
     key_m, key_n = jax.random.split(key, 2)
-    result = model(
+    if mode == 'full':
+        fwd = model
+    else:
+        fwd = model.regulariser_path
+    result = fwd(
         coor=coor,
         encoder=encoder,
         encoder_result=encoder_result,
         compartments=(compartment,),
-        key=key,
+        key=key_m,
     )
     (_, (_, _, _, _, T)) = encoder_result
     P, energy, _ = result
