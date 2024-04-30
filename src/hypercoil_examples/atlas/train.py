@@ -6,10 +6,13 @@ Training loop
 ~~~~~~~~~~~~~
 Training loop for the parcellation model
 """
+from typing import Optional
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+import pyvista as pv
 
 from hypercoil.engine import _to_jax_array
 from hypercoil_examples.atlas.aligned_dccc import (
@@ -24,6 +27,18 @@ from hypercoil_examples.atlas.model import (
 from hypercoil_examples.atlas.positional import (
     get_coors
 )
+from hyve import (
+    Cell,
+    plotdef,
+    surf_from_archive,
+    add_surface_overlay,
+    surf_scalars_from_array,
+    parcellate_colormap,
+    draw_surface_boundary,
+    text_element,
+    plot_to_image,
+    save_figure,
+)
 
 LEARNING_RATE = 0.001
 REPORT_INTERVAL = 10
@@ -36,6 +51,100 @@ forward_backward = eqx.filter_value_and_grad(
     has_aux=True,
 )
 
+
+def visdef():
+    layout = Cell() / Cell() << (1 / 2)
+    layout = layout | Cell() | layout << (1 / 3)
+    layout = Cell() / layout << (1 / 14)
+    #layout = layout / Cell() << (1 / 15)
+    annotations = {
+        0: dict(elements=['title']),
+        1: dict(
+            hemisphere='left',
+            view='lateral',
+        ),
+        2: dict(
+            hemisphere='left',
+            view='medial',
+        ),
+        3: dict(view='dorsal'),
+        4: dict(
+            hemisphere='right',
+            view='lateral',
+        ),
+        5: dict(
+            hemisphere='right',
+            view='medial',
+        ),
+    }
+    layout = layout.annotate(annotations)
+    plot_f = plotdef(
+        surf_from_archive(),
+        add_surface_overlay(
+            'parcellation',
+            surf_scalars_from_array(
+                'parcellation',
+                is_masked=True,
+                allow_multihemisphere=False,
+            ),
+            parcellate_colormap('parcellation'),
+            draw_surface_boundary(
+                'parcellation',
+                'parcellation',
+                copy_values_to_boundary=True,
+                target_domain='face',
+                num_steps=0,
+                v2f_interpolation='mode',
+            ),
+        ),
+        text_element(
+            name='title',
+            content=f'Model',
+            bounding_box_height=128,
+            font_size_multiplier=0.8,
+            font_color='#cccccc',
+            priority=-1,
+        ),
+        plot_to_image(),
+        save_figure(
+            layout_kernel=layout,
+            padding=0,
+            canvas_size=(1200, 440),
+            canvas_color=(0, 0, 0),
+            fname_spec='scalars-{surfscalars}',
+            scalar_bar_action='collect',
+        ),
+    )
+    return plot_f
+
+
+def visualise(
+    name: str,
+    plot_f: callable,
+    log_prob_L: Optional[jnp.ndarray] = None,
+    log_prob_R: Optional[jnp.ndarray] = None,
+):
+    array_left = log_prob_L.argmax(-1)
+    array_right = log_prob_R.argmax(-1)
+    plot_f(
+        template='fsLR',
+        surf_projection='veryinflated',
+        parcellation_array_left=array_left,
+        parcellation_array_right=array_right,
+        parcellation_cmap='network',
+        window_size=(600, 500),
+        hemisphere=['left', 'right', 'both'],
+        views={
+            'left': ('medial', 'lateral'),
+            'right': ('medial', 'lateral'),
+            'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
+        },
+        theme=pv.themes.DarkTheme(),
+        output_dir='/tmp',
+        title_element_content=f'Model: {name}',
+        fname_spec=f'scalars-{name}',
+        load_mask=True,
+    )
 
 
 def update(
@@ -77,6 +186,7 @@ def update(
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
     key = jax.random.PRNGKey(0)
     coor_L, coor_R = get_coors()
+    plot_f = visdef()
     T = _get_data(get_msc_dataset(subject, session))
     model, encoder, template = init_full_model(
         T=T,
@@ -133,6 +243,7 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
             print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
             visualise(
                 name=f'MRF_epoch-{i}',
+                plot_f=plot_f,
                 log_prob_L=model.regulariser[
                     'cortex_L'
                 ].selectivity_distribution.log_prob(
