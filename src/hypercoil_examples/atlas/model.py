@@ -343,10 +343,12 @@ class ForwardParcellationModel(eqx.Module):
             )
         )
         P = {
-            compartment: regulariser[compartment].point_energy(
-                Z=X[compartment],
-                S=coor[compartment],
-            )
+            compartment: jax.nn.softmax(
+                -regulariser[compartment].point_energy(
+                    Z=X[compartment],
+                    S=coor[compartment],
+                ).swapaxes(-1, -2),
+            axis=-2)
             for compartment in compartments
         }
         energy = {

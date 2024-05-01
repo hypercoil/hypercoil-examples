@@ -42,6 +42,8 @@ from hyve import (
 
 LEARNING_RATE = 0.001
 REPORT_INTERVAL = 10
+PATHWAYS = ('regulariser', 'full')
+VISPATH = 'full'
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -137,7 +139,7 @@ def visualise(
         views={
             'left': ('medial', 'lateral'),
             'right': ('medial', 'lateral'),
-            'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
+            'both': ('dorsal',), # 'ventral', 'anterior', 'posterior'),
         },
         theme=pv.themes.DarkTheme(),
         output_dir='/tmp',
@@ -157,6 +159,7 @@ def update(
     encoder,
     encoder_result,
     epoch,
+    pathway,
     key,
 ):
     if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
@@ -167,6 +170,7 @@ def update(
         encoder_result=encoder_result,
         encoder=encoder,
         compartment=compartment,
+        mode=pathway,
         key=jax.random.PRNGKey(0),
     )
     if jnp.isnan(loss):
@@ -211,33 +215,50 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         print(i)
         key = jax.random.fold_in(key, i)
         key_l, key_r = jax.random.split(key)
-        model, opt_state, loss_L, meta_L = update(
-            model=model,
-            opt_state=opt_state,
-            opt=opt,
-            compartment='cortex_L',
-            coor=coor,
-            encoder=encoder,
-            encoder_result=encoder_result,
-            epoch=i,
-            key=key_l,
-        )
-        if True:
-            model, opt_state, loss_R, meta_R = update(
+        meta_L = {}
+        meta_R = {}
+        loss_ = 0
+        for pathway in PATHWAYS:
+            model, opt_state, loss_L, meta_L[pathway] = update(
                 model=model,
                 opt_state=opt_state,
                 opt=opt,
-                compartment='cortex_R',
+                compartment='cortex_L',
                 coor=coor,
                 encoder=encoder,
                 encoder_result=encoder_result,
                 epoch=i,
-                key=key_r,
+                pathway=pathway,
+                key=key_l,
             )
-        else:
-            loss_R = 0
-            meta_R = {k: 0 for k in meta_L}
-        losses += [loss_L + loss_R]
+            if True:
+                model, opt_state, loss_R, meta_R[pathway] = update(
+                    model=model,
+                    opt_state=opt_state,
+                    opt=opt,
+                    compartment='cortex_R',
+                    coor=coor,
+                    encoder=encoder,
+                    encoder_result=encoder_result,
+                    epoch=i,
+                    pathway=pathway,
+                    key=key_r,
+                )
+            else:
+                loss_R = 0
+                meta_R[pathway] = {k: 0 for k in meta_L}
+            loss_ += (loss_L + loss_R)
+        meta_L = {
+            f'{t}_{p}': v
+            for p, e in meta_L.items()
+            for t, v in e.items()
+        }
+        meta_R = {
+            f'{t}_{p}': v
+            for p, e in meta_R.items()
+            for t, v in e.items()
+        }
+        losses += [loss_]
         meta = {k: meta_L[k] + meta_R[k] for k in meta_L}
         if i % REPORT_INTERVAL == 0:
             print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
@@ -265,7 +286,8 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
             )
             #TODO: Load a specific set of subjects and sessions
             if False:
-                P, _, _ = model(
+                fwd = model if VISPATH == 'full' else model.regulariser_path
+                P, _, _ = fwd(
                     coor={
                         'cortex_L': coor_L,
                         'cortex_R': coor_R,
@@ -276,9 +298,10 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
                     key=jax.random.PRNGKey(0),
                 )
                 visualise(
-                    name=f'UNet_epoch_{i}',
+                    name=f'SingleSubj_epoch_{i}',
                     log_prob_L=P['cortex_L'].T,
                     log_prob_R=P['cortex_R'].T,
+                    plot_f=plot_f,
                 )
     import matplotlib.pyplot as plt
     plt.plot(losses)
