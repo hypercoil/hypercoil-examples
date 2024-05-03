@@ -6,6 +6,7 @@ Training loop
 ~~~~~~~~~~~~~
 Training loop for the parcellation model
 """
+from itertools import product
 from typing import Optional
 
 import equinox as eqx
@@ -42,8 +43,13 @@ from hyve import (
 
 LEARNING_RATE = 0.001
 REPORT_INTERVAL = 10
-PATHWAYS = ('regulariser', 'full')
+CHECKPOINT_INTERVAL = 100
+PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 VISPATH = 'full'
+SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+VISUALISE_MRF = True
+VISUALISE_SINGLE = True
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -187,32 +193,60 @@ def update(
     return model, opt_state, loss.item(), {k: v.item() for k, v in meta.items()}
 
 
-def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
+def main(num_parcels: int = 100):
     key = jax.random.PRNGKey(0)
+    data_entities = tuple(product(SESSIONS, SUBJECTS))
+    num_entities = len(data_entities)
     coor_L, coor_R = get_coors()
     plot_f = visdef()
-    T = _get_data(get_msc_dataset(subject, session))
+    T = _get_data(get_msc_dataset('01', '01'))
     model, encoder, template = init_full_model(
         T=T,
         coor_L=coor_L,
         coor_R=coor_R,
         num_parcels=num_parcels,
     )
+    encode = encoder
+    #encode = eqx.filter_jit(encoder)
     opt = optax.adam(learning_rate=LEARNING_RATE)
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
-    encoder_result = encoder(
-        T=T,
-        coor_L=coor_L,
-        coor_R=coor_R,
-        M=template,
-    )
     losses = []
     coor = {
         'cortex_L': coor_L,
         'cortex_R': coor_R,
     }
     for i in range(2000):
-        print(i)
+        session, subject = data_entities[i % num_entities]
+        print(f'Epoch {i} (sub-{subject} ses-{session})')
+        try:
+            T = _get_data(get_msc_dataset(subject, session))
+        except FileNotFoundError:
+            print(
+                f'Data entity sub-{subject} ses-{session} is absent. '
+                'Skipping'
+            )
+        if jnp.any(jnp.isnan(T)):
+            print(
+                f'Invalid data for entity sub-{subject} ses-{session}. '
+                'Skipping'
+            )
+            continue
+        encoder_result = encode(
+            T=T,
+            coor_L=coor_L,
+            coor_R=coor_R,
+            M=template,
+        )
+        if any([
+            jnp.any(jnp.isnan(encoder_result[0][i][compartment])).item()
+            for compartment in ('cortex_L', 'cortex_R')
+            for i in range(3)
+        ]):
+            print(
+                f'Invalid data for entity sub-{subject} ses-{session}. '
+                'Skipping'
+            )
+            continue
         key = jax.random.fold_in(key, i)
         key_l, key_r = jax.random.split(key)
         meta_L = {}
@@ -260,34 +294,35 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         }
         losses += [loss_]
         meta = {k: meta_L[k] + meta_R[k] for k in meta_L}
+        print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
         if i % REPORT_INTERVAL == 0:
-            print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
-            visualise(
-                name=f'MRF_epoch-{i}',
-                plot_f=plot_f,
-                log_prob_L=model.regulariser[
-                    'cortex_L'
-                ].selectivity_distribution.log_prob(
-                    template['cortex_L']
-                ) + model.regulariser[
-                    'cortex_L'
-                ].spatial_distribution.log_prob(
-                    coor_L
-                ),
-                log_prob_R=model.regulariser[
-                    'cortex_R'
-                ].selectivity_distribution.log_prob(
-                    template['cortex_R']
-                ) + model.regulariser[
-                    'cortex_R'
-                ].spatial_distribution.log_prob(
-                    coor_R
-                ),
-            )
+            if VISUALISE_MRF:
+                visualise(
+                    name=f'MRF_epoch-{i}',
+                    plot_f=plot_f,
+                    log_prob_L=model.regulariser[
+                        'cortex_L'
+                    ].selectivity_distribution.log_prob(
+                        template['cortex_L']
+                    ) + model.regulariser[
+                        'cortex_L'
+                    ].spatial_distribution.log_prob(
+                        coor_L
+                    ),
+                    log_prob_R=model.regulariser[
+                        'cortex_R'
+                    ].selectivity_distribution.log_prob(
+                        template['cortex_R']
+                    ) + model.regulariser[
+                        'cortex_R'
+                    ].spatial_distribution.log_prob(
+                        coor_R
+                    ),
+                )
             #TODO: Load a specific set of subjects and sessions
-            if False:
+            if VISUALISE_SINGLE:
                 fwd = model if VISPATH == 'full' else model.regulariser_path
-                P, _, _ = fwd(
+                P, _, _ = eqx.filter_jit(fwd)(
                     coor={
                         'cortex_L': coor_L,
                         'cortex_R': coor_R,
@@ -303,6 +338,18 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
                     log_prob_R=P['cortex_R'].T,
                     plot_f=plot_f,
                 )
+            if i % CHECKPOINT_INTERVAL == 0:
+                print('Serialising model parameters for checkpoint')
+                eqx.tree_serialise_leaves(
+                    f'/tmp/parcellation_model_checkpoint{i}',
+                    model,
+                )
+                eqx.tree_serialise_leaves(
+                    f'/tmp/parcellation_optim_checkpoint{i}',
+                    opt_state,
+                )
+    jnp.save('/tmp/cortexL.npy', P['cortex_L'], allow_pickle=False)
+    jnp.save('/tmp/cortexR.npy', P['cortex_R'], allow_pickle=False)
     import matplotlib.pyplot as plt
     plt.plot(losses)
     plt.savefig('/tmp/losses.png')
