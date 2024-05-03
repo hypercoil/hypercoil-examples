@@ -427,28 +427,28 @@ class IcoELLGATUNet(eqx.Module):
         )
         return Q
 
+def get_base_coor_mask_adj(hemi: str) -> Tuple[Tensor, Tensor, Tensor]:
+    import templateflow.api as tflow
+    import nibabel as nb
+    base_coor_path = tflow.get(
+        'fsLR', density='32k', hemi=hemi, space=None, suffix='sphere'
+    )
+    base_mask_path = tflow.get(
+        'fsLR', density='32k', hemi=hemi, desc='nomedialwall'
+    )
+    base_coor = nb.load(base_coor_path).darrays[0].data / 100
+    base_mask = nb.load(base_mask_path).darrays[0].data.astype(bool)
+    base_adj = connectivity_matrix(
+        base_coor,
+        nb.load(base_coor_path).darrays[1].data,
+    )
+    return base_coor, base_mask, base_adj
+
 
 def get_meshes(
     model: Literal['test', 'full'] = 'test',
     positional_dim: Optional[int] = None,
 ) -> Tuple[ELLMesh, ELLMesh]:
-    import templateflow.api as tflow
-    import nibabel as nb
-
-    def get_base_coor_mask_adj(hemi: str) -> Tuple[Tensor, Tensor, Tensor]:
-        base_coor_path = tflow.get(
-            'fsLR', density='32k', hemi=hemi, space=None, suffix='sphere'
-        )
-        base_mask_path = tflow.get(
-            'fsLR', density='32k', hemi=hemi, desc='nomedialwall'
-        )
-        base_coor = nb.load(base_coor_path).darrays[0].data / 100
-        base_mask = nb.load(base_mask_path).darrays[0].data.astype(bool)
-        base_adj = connectivity_matrix(
-            base_coor,
-            nb.load(base_coor_path).darrays[1].data,
-        )
-        return base_coor, base_mask, base_adj
 
     def get_mesh(hemi: str) -> ELLMesh:
         base_coor, base_mask, base_adj = get_base_coor_mask_adj(hemi)
