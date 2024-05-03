@@ -21,6 +21,7 @@ from scipy.special import softmax
 from hypercoil.engine import Tensor, _to_jax_array
 from hypercoil.functional import residualise, spherical_geodesic
 from hypercoil.init import VonMisesFisher
+from hypercoil.loss.functional import entropy
 
 from hypercoil_examples.atlas.aligned_dccc import param_bimodal_beta
 from hypercoil_examples.atlas.ellgat import UnitSphereNorm
@@ -151,6 +152,7 @@ class SpatialSelectiveMRF(eqx.Module):
     spatial_distribution: Distribution
     selectivity_distribution: Distribution
     doublet_distribution: Distribution
+    mass_distribution: Optional[Distribution] = None
     spatial_mle: Optional[callable] = None
     selectivity_mle: Optional[callable] = None
 
@@ -159,6 +161,7 @@ class SpatialSelectiveMRF(eqx.Module):
         spatial_distribution: Distribution,
         selectivity_distribution: Distribution,
         doublet_distribution: Distribution,
+        mass_distribution: Optional[Distribution] = None,
         spatial_mle: Optional[callable] = None,
         selectivity_mle: Optional[callable] = None,
         *,
@@ -167,6 +170,7 @@ class SpatialSelectiveMRF(eqx.Module):
         self.spatial_distribution = spatial_distribution
         self.selectivity_distribution = selectivity_distribution
         self.doublet_distribution = doublet_distribution
+        self.mass_distribution = mass_distribution
         self.spatial_mle = spatial_mle
         self.selectivity_mle = selectivity_mle
 
@@ -218,6 +222,8 @@ class SpatialSelectiveMRF(eqx.Module):
         # doublet energies
         if D is not None:
             energy += self.doublet_energy(D=D, Q=Q).sum(-1)
+        if self.mass_distribution is not None:
+            energy += -self.mass_distribution.log_prob(Q.sum(-2))
         return energy
 
     def point_mle(
@@ -242,6 +248,7 @@ class SpatialSelectiveMRF(eqx.Module):
                 src_distr=self.selectivity_distribution,
             ),
             doublet_distribution=self.doublet_distribution,
+            mass_distribution=self.mass_distribution,
             spatial_mle=self.spatial_mle,
             selectivity_mle=self.selectivity_mle,
         )
@@ -545,6 +552,10 @@ def init_full_model(
             spatial_distribution=spatial_distribution[compartment],
             selectivity_distribution=selectivity_distribution[compartment],
             doublet_distribution=doublet_distribution,
+            mass_distribution=numpyro.distributions.DirichletMultinomial(
+                jnp.ones(num_parcels).astype(int) * 10,
+                total_count=template[compartment].shape[0],
+            ),
             spatial_mle=vmf_mle_mu_only,
             selectivity_mle=vmf_mle_mu_only,
         )
@@ -587,8 +598,13 @@ def forward(
     encoder_result: Tuple,
     compartment: str,
     mode: Literal['full', 'regulariser'] = 'full',
+    energy_nu: float = 1.,
+    recon_nu: float = 1.,
+    tether_nu: float = 1.,
+    nkl_nu: float = 1e2,
     key: 'jax.random.PRNGKey',
 ):
+    meta = {}
     key_m, key_n = jax.random.split(key, 2)
     if mode == 'full':
         fwd = model
@@ -603,38 +619,52 @@ def forward(
     )
     (_, (_, _, _, _, T)) = encoder_result
     P, energy, _ = result
-    start, size = encoder.temporal.encoders[0].limits[compartment]
-    T = T[..., start:(start + size), :]
-    parcel_ts = jnp.linalg.lstsq(
-        P[compartment].swapaxes(-2, -1),
-        T,
-    )[0]
-    recon_error = jnp.linalg.norm(
-        P[compartment].swapaxes(-2, -1) @ parcel_ts - T
-    )
-    other_hemi = 'cortex_R' if compartment == 'cortex_L' else 'cortex_L'
-    other_coor = _to_jax_array(
-        model.regulariser[other_hemi].spatial_distribution.mu
-    )
-    #TODO: We can get NaN if the two are aligned exactly. Here we add noise
-    #      to avoid this edge case, but we should work out why this occurs.
-    other_coor = other_coor + 1e-4 * jax.random.normal(
-        key_n, other_coor.shape
-    )
-    other_coor = other_coor / jnp.linalg.norm(
-        other_coor, axis=-1, keepdims=True
-    )
-    tether = spherical_geodesic(
-        _to_jax_array(
-            model.regulariser[compartment].spatial_distribution.mu
-        )[..., None, :],
-        other_coor.at[..., 0].set(-other_coor[..., 0])[..., None, :],
-    ).sum()
-    return energy + recon_error + tether, {
-        'energy': energy,
-        'recon_error': recon_error,
-        'hemisphere_tether': tether,
-    }
+    energy = energy_nu * energy
+    if energy_nu != 0:
+        meta = {**meta, 'energy': energy}
+    if recon_nu != 0:
+        start, size = encoder.temporal.encoders[0].limits[compartment]
+        T = T[..., start:(start + size), :]
+        parcel_ts = jnp.linalg.lstsq(
+            P[compartment].swapaxes(-2, -1),
+            T,
+        )[0]
+        recon_error = recon_nu * jnp.linalg.norm(
+            P[compartment].swapaxes(-2, -1) @ parcel_ts - T
+        )
+        meta = {**meta, 'recon_error': recon_error}
+    else:
+        recon_error = 0
+    if tether_nu != 0:
+        other_hemi = 'cortex_R' if compartment == 'cortex_L' else 'cortex_L'
+        other_coor = _to_jax_array(
+            model.regulariser[other_hemi].spatial_distribution.mu
+        )
+        #TODO: We can get NaN if the two are aligned exactly. Here we add noise
+        #      to avoid this edge case, but we should work out why this occurs.
+        other_coor = other_coor + 1e-4 * jax.random.normal(
+            key_n, other_coor.shape
+        )
+        other_coor = other_coor / jnp.linalg.norm(
+            other_coor, axis=-1, keepdims=True
+        )
+        tether = tether_nu * spherical_geodesic(
+            _to_jax_array(
+                model.regulariser[compartment].spatial_distribution.mu
+            )[..., None, :],
+            other_coor.at[..., 0].set(-other_coor[..., 0])[..., None, :],
+        ).sum()
+        meta = {**meta, 'hemisphere_tether': tether}
+    else:
+        tether = 0
+    if nkl_nu != 0:
+        nkl = nkl_nu * (
+            jnp.log(P[compartment]) / P[compartment].shape[0]
+        ).sum(0).mean()
+        meta = {**meta, 'nkl': nkl}
+    else:
+        nkl = 0
+    return energy + recon_error + tether + nkl, meta
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):

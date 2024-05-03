@@ -50,6 +50,10 @@ SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 VISUALISE_MRF = True
 VISUALISE_SINGLE = True
+ENERGY_NU = 1.,
+RECON_NU = 1.,
+TETHER_NU = 1.,
+NKL_NU = 1e2,
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -177,6 +181,10 @@ def update(
         encoder=encoder,
         compartment=compartment,
         mode=pathway,
+        energy_nu=ENERGY_NU,
+        recon_nu=RECON_NU,
+        tether_nu=TETHER_NU,
+        nkl_nu=NKL_NU,
         key=jax.random.PRNGKey(0),
     )
     if jnp.isnan(loss):
@@ -206,8 +214,8 @@ def main(num_parcels: int = 100):
         coor_R=coor_R,
         num_parcels=num_parcels,
     )
-    encode = encoder
-    #encode = eqx.filter_jit(encoder)
+    #encode = encoder
+    encode = eqx.filter_jit(encoder)
     opt = optax.adam(learning_rate=LEARNING_RATE)
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
     losses = []
