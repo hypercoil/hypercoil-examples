@@ -105,17 +105,15 @@ class ELLGAT(eqx.Module):
     ) -> Tensor:
         if K is None:
             K = Q
-        K = jnp.einsum('...hoi,...in->...hon', self.key_weight, K)
+        Ko = jnp.einsum('...hoi,...in->...hon', self.key_weight, K)[..., adj]
         # X = self.nlin(
         #     jnp.einsum(
         #         '...hoi,...in,...honk->...honk',
         #         self.query_weight, Q, K[..., adj],
         #     )
         # )
-        Q = jnp.einsum('...hoi,...in->...hon', self.query_weight, Q)
-        X = self.nlin(
-            jnp.einsum('...hon,...honk->...honk', Q, K[..., adj])
-        )
+        Qo = jnp.einsum('...hoi,...in->...hon', self.query_weight, Q)
+        X = self.nlin(Qo[..., None] + Ko)
         X = jnp.einsum('...hwnk,...hw->...hnk', X, self.attn_weight)
         X = jnp.where(adj == -1, -jnp.inf, X)
         # The following line is required to avoid NaNs in the edge case
@@ -134,9 +132,9 @@ class ELLGAT(eqx.Module):
         #     jnp.where(adj == -1, 0, X),
         # )
         return jnp.einsum(
-            '...hnk,...hon->...hon',
+            '...hnk,...honk->...hon',
             jnp.where(adj == -1, 0, attn),
-            Q,
+            Ko,
         )
 
 
