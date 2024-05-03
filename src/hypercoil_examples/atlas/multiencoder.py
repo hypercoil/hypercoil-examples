@@ -27,6 +27,7 @@ class MultiEncoder(eqx.Module):
     transforms: Sequence[callable]
     compartments: Sequence[str]
     compartment_masks: Sequence[Tensor]
+    compartment_slices: Optional[Sequence[Tuple[int, int]]]
     input_dim: int
     concat: Optional[Literal['pretransform', 'posttransform']]
 
@@ -82,6 +83,22 @@ class MultiEncoder(eqx.Module):
         self.transforms = transforms
         self.compartments = compartments
         self.compartment_masks = compartment_masks
+        # Try to build compartment slices--if we can, then the forward pass
+        # of the encoder will be JIT-able
+        compartment_slices = [False for _ in compartment_masks]
+        for i, cmask in enumerate(compartment_masks):
+            if cmask.all():
+                compartment_slices[i] = None
+            else:
+                indices = jnp.where(cmask)[0]
+                start = indices.min()
+                end = indices.max() + 1
+                if jnp.all(cmask[start:end]):
+                    compartment_slices[i] = (start.item(), end.item())
+        if all([cs is not False for cs in compartment_slices]):
+            self.compartment_slices = tuple(compartment_slices)
+        else:
+            self.compartment_slices = None
         self.input_dim = input_dim
         self.concat = concat
 
@@ -141,12 +158,22 @@ class MultiEncoder(eqx.Module):
             )
             for enc in encoded
         ]
-        encoded = [
-            enc[..., mask] for enc, mask in zip(
-                encoded,
-                self.compartment_masks,
-            )
-        ]
+        if self.compartment_slices is not None:
+            encoded = [
+                enc if s is None else jax.lax.dynamic_slice(
+                    enc,
+                    (0,) * (enc.ndim - 1) + (s[0],),
+                    enc.shape[:-1] + (s[1],),
+                )
+                for enc, s in zip(encoded, self.compartment_slices)
+            ]
+        else:
+            encoded = [
+                enc[..., mask] for enc, mask in zip(
+                    encoded,
+                    self.compartment_masks,
+                )
+            ]
         if self.concat == 'pretransform':
             encoded = [jnp.concatenate(encoded, axis=-1)]
         for transform in self.transforms:
@@ -154,8 +181,12 @@ class MultiEncoder(eqx.Module):
         if len(encoded) == 1:
             concat = True
             encoded = [
-                encoded[0][..., self.mask[self.mask.any(-1), i]]
-                for i in range(len(self.encoders))
+                jax.lax.dynamic_slice(
+                    encoded[0],
+                    (0,) * (encoded[0].ndim - 1) + (s[0],),
+                    encoded[0].shape[:-1] + (s[1],),
+                )
+                for s in self.reduced_slices
             ]
         else:
             concat = False
