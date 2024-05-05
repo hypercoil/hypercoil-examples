@@ -120,10 +120,11 @@ def doublet_energy(
 
 def param_bimodal_beta(n_classes: int):
     """Bimodal beta distribution with a minimum at the maximum entropy"""
+    from hypercoil_examples.atlas.beta import BetaCompat
     alpha = jnp.log(n_classes) / (
         jnp.log(n_classes) - jnp.log(1 - 1 / n_classes)
-    )
-    return Beta(alpha, 1 - alpha)
+    ).item()
+    return BetaCompat(alpha, 1 - alpha)
 
 
 def compute_dccc(

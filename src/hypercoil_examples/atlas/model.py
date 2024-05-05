@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 import numpyro
+from jax.scipy.special import logit
 from numpyro.distributions import Distribution
 from scipy.special import softmax
 
@@ -471,6 +472,7 @@ def init_full_model(
     import numpy as np
     from hypercoil_examples.atlas.spatialinit import init_spatial_priors
     key = key or jax.random.PRNGKey(0)
+    key_r, key_a = jax.random.split(key)
     temporal_encoder = configure_multiencoder()
     spatial_encoder = configure_geometric_encoder()
     spatial_loc_left, spatial_loc_right, spatial_data = init_spatial_priors()
@@ -502,7 +504,7 @@ def init_full_model(
         M=template,
     )
     coor_parcels_L = coor_L[jax.random.choice(
-        key,
+        key_r,
         coor_L.shape[0],
         shape=(num_parcels,),
         replace=False,
@@ -546,7 +548,7 @@ def init_full_model(
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
-    doublet_distribution = param_bimodal_beta(jnp.sqrt(num_parcels))
+    doublet_distribution = param_bimodal_beta(jnp.sqrt(num_parcels).item())
     regulariser = {
         compartment: SpatialSelectiveMRF(
             spatial_distribution=spatial_distribution[compartment],
@@ -581,7 +583,7 @@ def init_full_model(
         norm=UnitSphereNorm(),
         dropout=ELLGAT_DROPOUT,
         dropout_inference=False,
-        key=jax.random.PRNGKey(0),
+        key=key_a,
     )
     model = ForwardParcellationModel(
         regulariser=regulariser,
@@ -601,7 +603,8 @@ def forward(
     energy_nu: float = 1.,
     recon_nu: float = 1.,
     tether_nu: float = 1.,
-    nkl_nu: float = 1e2,
+    div_nu: float = 1e3,
+    inference: bool = False,
     key: 'jax.random.PRNGKey',
 ):
     meta = {}
@@ -615,6 +618,7 @@ def forward(
         encoder=encoder,
         encoder_result=encoder_result,
         compartments=(compartment,),
+        inference=inference,
         key=key_m,
     )
     (_, (_, _, _, _, T)) = encoder_result
@@ -657,14 +661,21 @@ def forward(
         meta = {**meta, 'hemisphere_tether': tether}
     else:
         tether = 0
-    if nkl_nu != 0:
-        nkl = nkl_nu * (
-            jnp.log(P[compartment]) / P[compartment].shape[0]
-        ).sum(0).mean()
-        meta = {**meta, 'nkl': nkl}
+    if div_nu != 0:
+        maxent = 1 / P[compartment].shape[0]
+        div = div_nu * (
+            jnp.exp(-(
+                logit(
+                    P[compartment]
+                    # convex combine, else this term can grow without bound
+                    #(1 - maxent ** 2) * P[compartment] + maxent ** 3
+                ) - logit(maxent)
+            ) ** 2)
+        ).mean()
+        meta = {**meta, 'div': div}
     else:
-        nkl = 0
-    return energy + recon_error + tether + nkl, meta
+        div = 0
+    return energy + recon_error + tether + div, meta
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):

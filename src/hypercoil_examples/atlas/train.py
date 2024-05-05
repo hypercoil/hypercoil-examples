@@ -42,6 +42,8 @@ from hyve import (
 )
 
 LEARNING_RATE = 0.001
+MAX_EPOCH = 10000
+SEED = 0
 REPORT_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
@@ -50,10 +52,10 @@ SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 VISUALISE_MRF = True
 VISUALISE_SINGLE = True
-ENERGY_NU = 1.,
-RECON_NU = 1.,
-TETHER_NU = 1.,
-NKL_NU = 1e2,
+ENERGY_NU = 1.
+RECON_NU = 1.
+TETHER_NU = 1.
+DIV_NU = 1e3
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -184,8 +186,8 @@ def update(
         energy_nu=ENERGY_NU,
         recon_nu=RECON_NU,
         tether_nu=TETHER_NU,
-        nkl_nu=NKL_NU,
-        key=jax.random.PRNGKey(0),
+        div_nu=DIV_NU,
+        key=key,
     )
     if jnp.isnan(loss):
         print(f'NaN loss at epoch {epoch}. Skipping update')
@@ -201,8 +203,11 @@ def update(
     return model, opt_state, loss.item(), {k: v.item() for k, v in meta.items()}
 
 
-def main(num_parcels: int = 100):
-    key = jax.random.PRNGKey(0)
+def main(
+    num_parcels: int = 100,
+    start_epoch: Optional[int] = 3400,
+):
+    key = jax.random.PRNGKey(SEED)
     data_entities = tuple(product(SESSIONS, SUBJECTS))
     num_entities = len(data_entities)
     coor_L, coor_R = get_coors()
@@ -223,7 +228,18 @@ def main(num_parcels: int = 100):
         'cortex_L': coor_L,
         'cortex_R': coor_R,
     }
-    for i in range(2000):
+    if start_epoch is not None:
+        model = eqx.tree_deserialise_leaves(
+            f'/tmp/parcellation_model_checkpoint{start_epoch}',
+            like=model,
+        )
+        opt_state = eqx.tree_deserialise_leaves(
+            f'/tmp/parcellation_optim_checkpoint{start_epoch}',
+            like=opt_state,
+        )
+    else:
+        start_epoch = -1
+    for i in range(start_epoch + 1, MAX_EPOCH):
         session, subject = data_entities[i % num_entities]
         print(f'Epoch {i} (sub-{subject} ses-{session})')
         try:
@@ -255,8 +271,8 @@ def main(num_parcels: int = 100):
                 'Skipping'
             )
             continue
-        key = jax.random.fold_in(key, i)
-        key_l, key_r = jax.random.split(key)
+        key_e = jax.random.fold_in(key, i)
+        key_l, key_r = jax.random.split(key_e)
         meta_L = {}
         meta_R = {}
         loss_ = 0
@@ -338,7 +354,8 @@ def main(num_parcels: int = 100):
                     encoder=encoder,
                     encoder_result=encoder_result,
                     compartments=('cortex_L', 'cortex_R'),
-                    key=jax.random.PRNGKey(0),
+                    inference=True,
+                    key=key,
                 )
                 visualise(
                     name=f'SingleSubj_epoch_{i}',
@@ -347,7 +364,7 @@ def main(num_parcels: int = 100):
                     plot_f=plot_f,
                 )
             if i % CHECKPOINT_INTERVAL == 0:
-                print('Serialising model parameters for checkpoint')
+                print('Serialising model and optimiser state for checkpoint')
                 eqx.tree_serialise_leaves(
                     f'/tmp/parcellation_model_checkpoint{i}',
                     model,
