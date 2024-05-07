@@ -25,6 +25,41 @@ MAX_EPOCH = 100
 LEARNING_RATE = 0.001
 
 
+class ControlModel(eqx.Module):
+    block: ELLGATBlock
+    readout: ELLGAT
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        readout_dim: int,
+        nlin: callable = jax.nn.leaky_relu,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ):
+        key = jax.random.split(key, 3)
+        self.block = eqx.nn.Sequential((
+            eqx.nn.Linear(in_dim, hidden_dim, use_bias=False, key=key[0]),
+            eqx.nn.Lambda(nlin),
+            eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=key[1]),
+            eqx.nn.Lambda(nlin),
+        ))
+        self.readout = eqx.nn.Linear(hidden_dim, readout_dim, use_bias=False, key=key[2])
+
+    def __call__(
+        self,
+        adj, # Does nothing, here for consistency
+        X,
+        *,
+        inference: bool = False, # Does nothing, here for consistency
+        key: Optional['jax.random.PRNGKey'] = None,
+    ):
+        key = jax.random.split(key, 2)
+        X = self.block(X, key=key[0])
+        X = self.readout(X, key=key[1])
+        return X
+
+
 class TestModel(eqx.Module):
     block: ELLGATBlock
     readout: ELLGAT
@@ -94,12 +129,18 @@ def main():
     }
     data_L = arrays['cortex_L']
     data_R = arrays['cortex_R']
-    model = TestModel(
+    # model = TestModel(
+    #     in_dim=200,
+    #     hidden_dim=64,
+    #     readout_dim=200,
+    #     attn_heads=4,
+    #     dropout=0.1,
+    #     key=jax.random.PRNGKey(0),
+    # )
+    model = ControlModel(
         in_dim=200,
-        hidden_dim=64,
+        hidden_dim=256,
         readout_dim=200,
-        attn_heads=4,
-        dropout=0.1,
         key=jax.random.PRNGKey(0),
     )
     _, mask_L, adj_L = get_base_coor_mask_adj('L')
