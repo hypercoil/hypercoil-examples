@@ -222,7 +222,10 @@ class SpatialSelectiveMRF(eqx.Module):
             energy += (Q * self.point_energy(Z=Z, S=S)).sum(-1)
         # doublet energies
         if D is not None:
-            energy += self.doublet_energy(D=D, Q=Q).sum(-1)
+            energy += self.doublet_energy(
+                D=D,
+                Q=jnp.clip(Q, 1e-6, 1 - 1e-6),
+            ).sum(-1)
         if self.mass_distribution is not None:
             energy += -self.mass_distribution.log_prob(Q.sum(-2))
         return energy
@@ -417,6 +420,7 @@ class ForwardParcellationModel(eqx.Module):
             )
             for compartment in compartments
         }
+        inputs = {k: (v[0], v[0], v[1]) for k, v in inputs.items()}
         P = {
             compartment: self.approximator(
                 inputs[compartment],
@@ -462,18 +466,10 @@ def vmf_mle_mu_only(
     return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
 
 
-def init_full_model(
-    T: Tensor,
-    coor_L: Tensor,
-    coor_R: Tensor,
-    num_parcels: int = 100,
-    key: Optional['jax.random.PRNGKey'] = None,
-) -> Tuple[eqx.Module, eqx.Module]:
+def init_encoder_model(coor_L: Tensor):
     import numpy as np
     from hypercoil_examples.atlas.spatialinit import init_spatial_priors
-    key = key or jax.random.PRNGKey(0)
-    key_r, key_a = jax.random.split(key)
-    temporal_encoder = configure_multiencoder()
+    temporal_encoder = configure_multiencoder(use_7net=False)
     spatial_encoder = configure_geometric_encoder()
     spatial_loc_left, spatial_loc_right, spatial_data = init_spatial_priors()
     alignment = EmptyPromises(
@@ -497,6 +493,20 @@ def init_full_model(
         'cortex_L': template[:size_left],
         'cortex_R': template[size_left:],
     }
+    return encoder, template
+
+
+def init_full_model(
+    T: Tensor,
+    coor_L: Tensor,
+    coor_R: Tensor,
+    num_parcels: int = 100,
+    key: Optional['jax.random.PRNGKey'] = None,
+) -> Tuple[eqx.Module, eqx.Module]:
+    import numpy as np
+    key = key or jax.random.PRNGKey(0)
+    key_r, key_a = jax.random.split(key)
+    encoder, template = init_encoder_model(coor_L)
     result = encoder(
         T=T,
         coor_L=coor_L,
@@ -573,14 +583,14 @@ def init_full_model(
             'cortex_R': mesh_R,
         },
         #in_dim=(14 + encoder.spatial.default_encoding_dim, 64, 512),
-        in_dim=(14 + encoder.spatial.default_encoding_dim, 32, 64),
+        in_dim=(64 + encoder.spatial.default_encoding_dim, 32, 64),
         #hidden_dim=(16, 64, 256),
         hidden_dim=(8, 16, 64),
         hidden_readout_dim=num_parcels // 2,
         #attn_heads=(4, 4, 4),
         attn_heads=(4, 4, 4),
         readout_dim=num_parcels,
-        norm=UnitSphereNorm(),
+        #norm=UnitSphereNorm(),
         dropout=ELLGAT_DROPOUT,
         dropout_inference=False,
         key=key_a,
@@ -666,7 +676,7 @@ def forward(
         div = div_nu * (
             jnp.exp(-(
                 logit(
-                    P[compartment]
+                    jnp.clip(P[compartment], 1e-6, 1 - 1e-6)
                     # convex combine, else this term can grow without bound
                     #(1 - maxent ** 2) * P[compartment] + maxent ** 3
                 ) - logit(maxent)
@@ -683,7 +693,11 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         get_msc_dataset, _get_data
     )
     coor_L, coor_R = get_coors()
-    T = _get_data(get_msc_dataset(subject, session))
+    T = _get_data(
+        get_msc_dataset(subject, session),
+        normalise=False,
+        gsr=False,
+    )
     model, encoder, template = init_full_model(
         T=T,
         coor_L=coor_L,

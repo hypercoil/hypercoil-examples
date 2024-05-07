@@ -8,7 +8,7 @@ Multiple encoders are used to encode the input data into different
 representations. Each encoder is initialised to map a different scale of
 selectivity space.
 """
-from typing import Literal, Optional, Sequence, Tuple
+from typing import Literal, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -201,7 +201,12 @@ class MultiEncoder(eqx.Module):
         return encoded
 
 
-def configure_multiencoder():
+def configure_multiencoder(
+    use_icosphere: bool = True,
+    use_consensus: bool = True,
+    use_7net: bool = True,
+    scales: Union[Sequence[float], Literal['auto']] = 'auto',
+):
     from hypercoil_examples.atlas.encoders import (
         create_icosphere_encoder,
         create_consensus_encoder,
@@ -212,11 +217,13 @@ def configure_multiencoder():
         logistic_mixture_threshold,
     )
     encoders = (
-        create_icosphere_encoder(),
-        create_consensus_encoder(),
-        create_7net_encoder(),
+        create_icosphere_encoder() if use_icosphere else None,
+        create_consensus_encoder() if use_consensus else None,
+        create_7net_encoder() if use_7net else None,
     )
-    scales = (1 / 3, 1 / 3, 1 / 3)
+    encoders = tuple(e for e in encoders if e is not None)
+    if scales == 'auto':
+        scales = (1 / len(encoders),) * len(encoders)
     def transform(enc: Tensor) -> Tensor:
         loc = enc
         scale = jnp.minimum(-2e-2 * jnp.log(jnp.abs(loc)), 5)
@@ -235,7 +242,7 @@ def configure_multiencoder():
 
 
 def main():
-    multiencoder = configure_multiencoder()
+    multiencoder = configure_multiencoder(use_7net=False)
     X = jax.random.uniform(
         key=jax.random.PRNGKey(0),
         shape=(multiencoder.input_dim, 100),
@@ -246,11 +253,22 @@ def main():
         for mask in multiencoder.mask[multiencoder.mask.any(-1)].T
     ])
     tst = jnp.asarray(
-        [(1 / 3) / jnp.sqrt(i) for i in multiencoder.mask.sum(0)]
+        [
+            (1 / len(multiencoder.encoders)) / jnp.sqrt(i)
+            for i in multiencoder.mask.sum(0)
+        ]
     )
     assert (
         jnp.abs(tst[..., None] - means).argmin(0) == jnp.arange(len(means))
     ).all()
+    sizes = [0] + jnp.cumsum(multiencoder.reduced_mask.sum(0)).tolist()
+    assert all([
+        jnp.allclose(
+            jnp.linalg.norm(X[..., start:end], axis=-1) ** 2,
+            1 / len(multiencoder.encoders)
+        )
+        for start, end in zip(sizes[:-1], sizes[1:])
+    ])
     for m, t in zip(means, tst):
         assert m > t
     assert 0

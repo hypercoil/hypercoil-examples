@@ -42,7 +42,7 @@ def main(
                 key=jax.random.PRNGKey(0),
             )
         case 'multiencoder':
-            encoder = configure_multiencoder()
+            encoder = configure_multiencoder(use_7net=False)
     for i, img in enumerate(IMGS):
         print(f'Processing {img} ({i+1}/{len(IMGS)})')
         data = nb.load(img)
@@ -82,6 +82,8 @@ def main(
     plt.figure(figsize=(10, 10))
     plt.hist(jnp.linalg.norm(init, axis=-1), bins=200)
     plt.savefig('/tmp/mean_init.png')
+    if encoder_type == 'multiencoder':
+        init = encoder.rescale(init)
     np.save('/tmp/mean_init.npy', np.asarray(init), allow_pickle=False)
     assert 0
 
