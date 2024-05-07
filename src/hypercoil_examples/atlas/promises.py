@@ -86,15 +86,15 @@ def empty_promises(
         #       we're mostly cotransporting probabilities.
     new_update_weight = update_weight + 1
     if new_M is None:
-        new_M = jnp.zeros_like(M)
+        new_M = jnp.zeros_like(M).T
     new_M = (
         update_weight / new_update_weight * new_M + 
-       1 / new_update_weight * X
+        1 / new_update_weight * X.T
     )
     if return_loading:
-        state = (new_M.T, new_update_weight, R, Q, P) # P.T @ R.T @ Q)
+        state = (new_M, new_update_weight, R, Q, P) # P.T @ R.T @ Q)
     else:
-        state = (new_M.T, new_update_weight)
+        state = (new_M, new_update_weight)
     if cotransport is not None:
         return X.T, state, cotransport
     return X.T, state
