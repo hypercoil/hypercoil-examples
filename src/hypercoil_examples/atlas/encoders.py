@@ -182,11 +182,18 @@ def consensus_encode(
     )
     coors = jnp.concatenate((coors_L.T, coors_R.T))
     parcels_enc = model.enc(basis, ref=data)
-    return (
-        coors,
-        parcels_enc,
-        atlas.coors[~atlas.ref.imobj.header.get_axis(1).volume_mask],
-    )
+    try:
+        return (
+            coors,
+            parcels_enc,
+            atlas.coors[~atlas.ref.imobj.header.get_axis(1).volume_mask],
+        )
+    except AttributeError:
+        return (
+            coors,
+            parcels_enc,
+            atlas.coors,
+        )
 
 
 def visualise_surface_encoder(

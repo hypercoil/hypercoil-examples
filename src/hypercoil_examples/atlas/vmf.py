@@ -36,6 +36,7 @@ from hypercoil_examples.atlas.const import MSC_DATA_ROOT
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
     create_consensus_encoder,
+    create_7net_encoder,
     icosphere_encode,
     consensus_encode,
 )
@@ -43,6 +44,7 @@ from hypercoil_examples.atlas.encoders import (
 INDICES = {
     'icosphere': (0, 1, 2, 3, 4), # (0, 22, 37, 131, 207), #
     'consensus': (0, 1, 2, 3, 4),
+    '7net': (0, 1, 2, 3, 4),
 }
 
 CIFTI = {
@@ -56,11 +58,13 @@ CIFTI = {
 ENCODER_FACTORY = {
     'icosphere': create_icosphere_encoder,
     'consensus': create_consensus_encoder,
+    '7net': create_7net_encoder,
 }
 
 ENCODE_SELF = {
     'icosphere': icosphere_encode,
     'consensus': consensus_encode,
+    '7net': consensus_encode,
 }
 
 N_COMPONENTS = 64
@@ -207,17 +211,28 @@ def visualise_surface_encoder(
     )
 
 
-def _get_data(cifti: str):
+def _get_data(
+    cifti: str,
+    normalise: bool = True,
+    gsr: bool = True,
+    key: Optional['jax.random.PRNGKey'] = None,
+):
+    key = jax.random.PRNGKey(0) if key is None else key
     cifti = nb.load(cifti)
     data_full = cifti.get_fdata(dtype=np.float32).T
     data = data_full[~cifti.header.get_axis(1).volume_mask]
+    if normalise:
+        data = data - data.mean(-1, keepdims=True)
+        data = data / data.std(-1, keepdims=True)
+        data = jnp.where(jnp.isnan(data), 0, data)
 
-    gs = data.mean(0, keepdims=True)
-    data = residualise(data, gs)
+    if gsr:
+        gs = data.mean(0, keepdims=True)
+        data = residualise(data, gs)
     # Plug zero-variance vertices with ramp (for no NaNs in log prob)
     data = jnp.where(
-        (data.sum(-1) == 0)[..., None],
-        np.arange(data.shape[-1])[None, :],
+        jnp.isclose(data.std(-1), 0)[..., None],
+        jax.random.normal(key, data.shape),
         data,
     )
     return data
@@ -381,9 +396,9 @@ def visualise(
 
 
 def main():
-    encoder = 'icosphere'
+    encoder = '7net'
     visualise(
-        INDICES[encoder], 'MSC', encoder, threshold_locus=0.9, binarise=True, whiten=True
+        INDICES[encoder], 'MSC', encoder, whiten=True
     )
 
 
