@@ -6,6 +6,7 @@ Training loop
 ~~~~~~~~~~~~~
 Training loop for the parcellation model
 """
+import pickle
 from itertools import product
 from typing import Optional
 
@@ -41,7 +42,7 @@ from hyve import (
     save_figure,
 )
 
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.002
 MAX_EPOCH = 10000
 SEED = 0
 REPORT_INTERVAL = 10
@@ -62,6 +63,10 @@ DIV_NU = 1e3
 forward_backward = eqx.filter_value_and_grad(
     eqx.filter_jit(forward),
     #forward,
+    has_aux=True,
+)
+forward_backward_bkp = eqx.filter_value_and_grad(
+    forward,
     has_aux=True,
 )
 
@@ -175,23 +180,39 @@ def update(
     key,
 ):
     if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
-    (loss, meta), grad = forward_backward(
-    #forward(
-        model,
-        coor=coor,
-        encoder_result=encoder_result,
-        encoder=encoder,
-        compartment=compartment,
-        mode=pathway,
-        energy_nu=ENERGY_NU,
-        recon_nu=RECON_NU,
-        tether_nu=TETHER_NU,
-        div_nu=DIV_NU,
-        key=key,
-    )
-    if jnp.isnan(loss):
-        print(f'NaN loss at epoch {epoch}. Skipping update')
+    try:
+        (loss, meta), grad = forward_backward(
+        #forward(
+            model,
+            coor=coor,
+            encoder_result=encoder_result,
+            encoder=encoder,
+            compartment=compartment,
+            mode=pathway,
+            energy_nu=ENERGY_NU,
+            recon_nu=RECON_NU,
+            tether_nu=TETHER_NU,
+            div_nu=DIV_NU,
+            key=key,
+        )
+    except FloatingPointError:
+        forward(
+            model,
+            coor=coor,
+            encoder_result=encoder_result,
+            encoder=encoder,
+            compartment=compartment,
+            mode=pathway,
+            energy_nu=ENERGY_NU,
+            recon_nu=RECON_NU,
+            tether_nu=TETHER_NU,
+            div_nu=DIV_NU,
+            key=key,
+        )
+    if jnp.isnan(loss) or jnp.isinf(loss):
+        print(f'NaN or infinite loss at epoch {epoch}. Skipping update')
         print(meta)
+        breakpoint()
         return model, opt_state, None, {}
     updates, opt_state = opt.update(
         eqx.filter(grad, eqx.is_inexact_array),
@@ -203,16 +224,42 @@ def update(
     return model, opt_state, loss.item(), {k: v.item() for k, v in meta.items()}
 
 
+def accumulate_metadata(
+    meta_acc: dict,
+    meta: dict,
+    epoch: int,
+    num_entities: int,
+) -> dict:
+    epoch_complete = ((epoch % num_entities == 0) and (epoch > 0))
+    old_meta_acc = None
+    epoch_loss = None
+    for k, v in meta.items():
+        if k not in meta_acc:
+            meta_acc[k] = []
+        meta_acc[k] += [v]
+    if epoch_complete:
+        for k, v in meta_acc.items():
+            meta_acc[k] = jnp.mean(jnp.asarray(v)).item()
+        epoch_loss = sum(meta_acc.values())
+        print('\nEPOCH RESULTS')
+        print('\n'.join([f'[]{k}: {v}' for k, v in meta_acc.items()]))
+        print(f'Total mean loss (train): {epoch_loss}\n')
+        old_meta_acc = meta_acc
+        meta_acc = {}
+    return meta_acc, epoch_complete, old_meta_acc, epoch_loss
+
+
 def main(
     num_parcels: int = 100,
-    start_epoch: Optional[int] = 3400,
+    start_epoch: Optional[int] = 100,
 ):
     key = jax.random.PRNGKey(SEED)
     data_entities = tuple(product(SESSIONS, SUBJECTS))
     num_entities = len(data_entities)
     coor_L, coor_R = get_coors()
     plot_f = visdef()
-    T = _get_data(get_msc_dataset('01', '01'))
+    # The encoder will handle data normalisation and GSR
+    T = _get_data(get_msc_dataset('01', '01'), normalise=False, gsr=False)
     model, encoder, template = init_full_model(
         T=T,
         coor_L=coor_L,
@@ -221,9 +268,10 @@ def main(
     )
     #encode = encoder
     encode = eqx.filter_jit(encoder)
-    opt = optax.adam(learning_rate=LEARNING_RATE)
+    opt = optax.adamw(learning_rate=LEARNING_RATE)
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
     losses = []
+    epoch_history = []
     coor = {
         'cortex_L': coor_L,
         'cortex_R': coor_R,
@@ -237,13 +285,24 @@ def main(
             f'/tmp/parcellation_optim_checkpoint{start_epoch}',
             like=opt_state,
         )
+        try:
+            with open('/tmp/epoch_history.pkl', 'rb') as f:
+                epoch_history = pickle.load(f)
+        except FileNotFoundError:
+            print('No epoch history found--starting new record')
     else:
         start_epoch = -1
-    for i in range(start_epoch + 1, MAX_EPOCH):
+    meta_acc = {}
+    for i in range(start_epoch + 1, MAX_EPOCH + 1):
         session, subject = data_entities[i % num_entities]
         print(f'Epoch {i} (sub-{subject} ses-{session})')
         try:
-            T = _get_data(get_msc_dataset(subject, session))
+            # The encoder will handle data normalisation and GSR
+            T = _get_data(
+                get_msc_dataset(subject, session),
+                normalise=False,
+                gsr=False,
+            )
         except FileNotFoundError:
             print(
                 f'Data entity sub-{subject} ses-{session} is absent. '
@@ -319,6 +378,13 @@ def main(
         losses += [loss_]
         meta = {k: meta_L[k] + meta_R[k] for k in meta_L}
         print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
+        (
+            meta_acc, epoch_complete, old_meta_acc, epoch_loss
+        ) = accumulate_metadata(meta_acc, meta, i, num_entities)
+        if epoch_complete:
+            epoch_history += [(epoch_loss, old_meta_acc)]
+            with open('/tmp/epoch_history.pkl', 'wb') as f:
+                pickle.dump(epoch_history, f)
         if i % REPORT_INTERVAL == 0:
             if VISUALISE_MRF:
                 visualise(
@@ -376,7 +442,7 @@ def main(
     jnp.save('/tmp/cortexL.npy', P['cortex_L'], allow_pickle=False)
     jnp.save('/tmp/cortexR.npy', P['cortex_R'], allow_pickle=False)
     import matplotlib.pyplot as plt
-    plt.plot(losses)
+    plt.plot([e[0] for e in epoch_history]) # training loss
     plt.savefig('/tmp/losses.png')
     assert 0
 
