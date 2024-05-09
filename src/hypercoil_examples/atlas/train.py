@@ -44,6 +44,8 @@ from hyve import (
 
 LEARNING_RATE = 0.002
 MAX_EPOCH = 10000
+ENCODER_ARCH = '64x64'
+MODEL_ARCH = 'series'
 SEED = 0
 REPORT_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
@@ -193,6 +195,9 @@ def update(
             recon_nu=RECON_NU,
             tether_nu=TETHER_NU,
             div_nu=DIV_NU,
+            encoder_type=ENCODER_ARCH,
+            model_type=MODEL_ARCH,
+            inference=False,
             key=key,
         )
     except FloatingPointError:
@@ -209,6 +214,7 @@ def update(
             div_nu=DIV_NU,
             key=key,
         )
+    #return model, opt_state, 0, {}
     if jnp.isnan(loss) or jnp.isinf(loss):
         print(f'NaN or infinite loss at epoch {epoch}. Skipping update')
         print(meta)
@@ -251,7 +257,7 @@ def accumulate_metadata(
 
 def main(
     num_parcels: int = 100,
-    start_epoch: Optional[int] = 100,
+    start_epoch: Optional[int] = None,
 ):
     key = jax.random.PRNGKey(SEED)
     data_entities = tuple(product(SESSIONS, SUBJECTS))
@@ -265,6 +271,8 @@ def main(
         coor_L=coor_L,
         coor_R=coor_R,
         num_parcels=num_parcels,
+        encoder_type=ENCODER_ARCH,
+        model_type=MODEL_ARCH,
     )
     #encode = encoder
     encode = eqx.filter_jit(encoder)
@@ -420,6 +428,8 @@ def main(
                     encoder=encoder,
                     encoder_result=encoder_result,
                     compartments=('cortex_L', 'cortex_R'),
+                    encoder_type=ENCODER_ARCH,
+                    model_type=MODEL_ARCH,
                     inference=True,
                     key=key,
                 )

@@ -42,7 +42,7 @@ from hypercoil_examples.atlas.selectransform import (
 )
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
-ELLGAT_DROPOUT = 0.6
+ELLGAT_DROPOUT = 0.1
 
 
 class EmptyPromises(eqx.Module):
@@ -338,8 +338,12 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
-        inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
+        # The below arguments are here only for uniformity of the interface.
+        # They do nothing.
+        encoder_type: Literal['64x64', '3res'] = '64x64',
+        model_type: Literal['parallel', 'series'] = 'parallel',
+        inference: Optional[bool] = None,
     ):
         regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
             self._common_path(
@@ -390,6 +394,8 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        encoder_type: Literal['64x64', '3res'] = '64x64',
+        model_type: Literal['parallel', 'series'] = 'parallel',
         inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
@@ -420,7 +426,27 @@ class ForwardParcellationModel(eqx.Module):
             )
             for compartment in compartments
         }
-        inputs = {k: (v[0], v[0], v[1]) for k, v in inputs.items()}
+        if encoder_type == '64x64':
+            inputs = {k: (v[0], v[0], v[1]) for k, v in inputs.items()}
+        if model_type == 'series':
+            P = {
+                compartment: jax.nn.softmax(
+                    -regulariser[compartment].point_energy(
+                        Z=X[compartment],
+                        S=coor[compartment],
+                    ).swapaxes(-2, -1),
+                axis=-2)
+                for compartment in compartments
+            }
+            inputs = {
+                compartment: (
+                    jnp.concatenate(
+                        (inputs[compartment][0], P[compartment])
+                    ),
+                    *inputs[compartment][1:],
+                )
+                for compartment in compartments
+            }
         P = {
             compartment: self.approximator(
                 inputs[compartment],
@@ -466,10 +492,15 @@ def vmf_mle_mu_only(
     return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
 
 
-def init_encoder_model(coor_L: Tensor):
+def init_encoder_model(
+    coor_L: Tensor,
+    encoder_type: Literal['64x64', '3res'] = '64x64',
+):
     import numpy as np
     from hypercoil_examples.atlas.spatialinit import init_spatial_priors
-    temporal_encoder = configure_multiencoder(use_7net=False)
+    temporal_encoder = configure_multiencoder(
+        use_7net=(encoder_type == '3res')
+    )
     spatial_encoder = configure_geometric_encoder()
     spatial_loc_left, spatial_loc_right, spatial_data = init_spatial_priors()
     alignment = EmptyPromises(
@@ -501,12 +532,14 @@ def init_full_model(
     coor_L: Tensor,
     coor_R: Tensor,
     num_parcels: int = 100,
+    encoder_type: Literal['64x64', '3res'] = '64x64',
+    model_type: Literal['parallel', 'series'] = 'parallel',
     key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
     import numpy as np
     key = key or jax.random.PRNGKey(0)
     key_r, key_a = jax.random.split(key)
-    encoder, template = init_encoder_model(coor_L)
+    encoder, template = init_encoder_model(coor_L, encoder_type=encoder_type)
     result = encoder(
         T=T,
         coor_L=coor_L,
@@ -577,13 +610,24 @@ def init_full_model(
         model='full',
         positional_dim=encoder.spatial.default_encoding_dim,
     )
+    base_in_dim = 0
+    match encoder_type:
+        case '64x64':
+            base_in_dim = 64
+        case '3res':
+            base_in_dim = 14
+    match model_type:
+        case 'parallel':
+            base_in_dim += 0
+        case 'series':
+            base_in_dim += num_parcels
     approximator = IcoELLGATUNet(
         meshes={
             'cortex_L': mesh_L,
             'cortex_R': mesh_R,
         },
         #in_dim=(14 + encoder.spatial.default_encoding_dim, 64, 512),
-        in_dim=(64 + encoder.spatial.default_encoding_dim, 32, 64),
+        in_dim=(base_in_dim + encoder.spatial.default_encoding_dim, 32, 64),
         #hidden_dim=(16, 64, 256),
         hidden_dim=(8, 16, 64),
         hidden_readout_dim=num_parcels // 2,
@@ -615,6 +659,8 @@ def forward(
     tether_nu: float = 1.,
     div_nu: float = 1e3,
     inference: bool = False,
+    encoder_type: Literal['64x64', '3res'] = '64x64',
+    model_type: Literal['parallel', 'series'] = 'parallel',
     key: 'jax.random.PRNGKey',
 ):
     meta = {}
@@ -629,6 +675,8 @@ def forward(
         encoder_result=encoder_result,
         compartments=(compartment,),
         inference=inference,
+        encoder_type=encoder_type,
+        model_type=model_type,
         key=key_m,
     )
     (_, (_, _, _, _, T)) = encoder_result
