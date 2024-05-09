@@ -12,6 +12,7 @@ from typing import Optional
 
 import equinox as eqx
 import jax.numpy as jnp
+import numpy as np
 
 from hypercoil.engine import _to_jax_array
 from hypercoil_examples.atlas.aligned_dccc import (
@@ -20,7 +21,7 @@ from hypercoil_examples.atlas.aligned_dccc import (
 from hypercoil_examples.atlas.model import init_encoder_model
 from hypercoil_examples.atlas.positional import get_coors
 
-MAX_EPOCH = 1000
+MAX_EPOCH = 2000
 CHECKPOINT_INTERVAL = 100
 SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
@@ -89,15 +90,18 @@ def main():
             delta_norm = delta_norm_L + delta_norm_R
             epoch_history += [(delta_norm,)]
             print(f'Epoch {i} delta norm: {delta_norm}')
-            template = model.temporal.rescale(new_template)
+            template = {
+                compartment: model.temporal.rescale(new_template[compartment])
+                for compartment in ('cortex_L', 'cortex_R')
+            }
             update_weight = 0
         if i % CHECKPOINT_INTERVAL == 0:
             print('Serialising template for checkpoint')
-            jnp.save(
-                '/tmp/templateL.npy', template['cortex_L'], allow_pickle=False
-            )
-            jnp.save(
-                '/tmp/templateR.npy', template['cortex_R'], allow_pickle=False
+            template_concat = np.asarray(jnp.concatenate(
+                (template['cortex_L'], template['cortex_R'])
+            ))
+            np.save(
+                '/tmp/template.npy', template_concat, allow_pickle=False
             )
     import matplotlib.pyplot as plt
     plt.plot([e[0] for e in epoch_history]) # training loss
