@@ -43,6 +43,7 @@ from hypercoil_examples.atlas.selectransform import (
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
 ELLGAT_DROPOUT = 0.1
+VMF_KAPPA = 10
 
 
 class EmptyPromises(eqx.Module):
@@ -488,7 +489,7 @@ def vmf_mle_mu_only(
     if src_distr is not None:
         kappa = src_distr.kappa
     else:
-        kappa = 10.
+        kappa = VMF_KAPPA
     return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
 
 
@@ -525,6 +526,134 @@ def init_encoder_model(
         'cortex_R': template[size_left:],
     }
     return encoder, template
+
+
+def refine_parcels(
+    spatial_coor_parcels: Mapping[str, Tensor],
+    spatial_coor: Mapping[str, Tensor],
+    selectivity_coor_parcels: Mapping[str, Tensor],
+    selectivity_coor: Mapping[str, Tensor],
+    *,
+    # There's absolutely no convergence guarantee here.
+    # We should at least do this jointly, but I guess this alternating method
+    # is probably better than nothing.
+    num_iter: int = 20,
+) -> Tuple[Tensor, Tensor]:
+    compartments = spatial_coor.keys()
+    spatial_coor_parcels_best = None
+    selectivity_coor_parcels_best = None
+    best_delta = float('inf')
+    for i in range(num_iter):
+        spatial_distribution = {
+            compartment: VonMisesFisher(
+                mu=spatial_coor_parcels[compartment],
+                kappa=VMF_KAPPA,
+            )
+            for compartment in ('cortex_L', 'cortex_R')
+        }
+        selectivity_expect = {
+            compartment: jax.nn.softmax(
+                spatial_distribution[compartment].log_prob(
+                    spatial_coor[compartment]
+                ),
+                axis=-1,
+            )
+            for compartment in compartments
+        }
+        selectivity_coor_parcels_new = {
+            compartment: (
+                selectivity_expect[compartment].T @
+                selectivity_coor[compartment]
+            )
+            for compartment in compartments
+        }
+        selectivity_coor_parcels_new = {
+            compartment: (
+                selectivity_coor_parcels_new[compartment] / jnp.linalg.norm(
+                    selectivity_coor_parcels_new[compartment],
+                    axis=-1,
+                    keepdims=True,
+                )
+            )
+            for compartment in compartments
+        }
+        selectivity_delta = sum([
+            jnp.linalg.norm(
+                selectivity_coor_parcels_new[compartment] -
+                selectivity_coor_parcels[compartment]
+            ).item()
+            for compartment in compartments
+        ])
+        selectivity_coor_parcels = selectivity_coor_parcels_new
+        selectivity_distribution = {
+            compartment: VonMisesFisher(
+                mu=selectivity_coor_parcels[compartment],
+                kappa=VMF_KAPPA,
+            )
+            for compartment in ('cortex_L', 'cortex_R')
+        }
+        spatial_expect = {
+            compartment: jax.nn.softmax(
+                selectivity_distribution[compartment].log_prob(
+                    selectivity_coor[compartment]
+                ),
+                axis=-1,
+            )
+            for compartment in compartments
+        }
+        spatial_coor_parcels_new = {
+            compartment: (
+                spatial_expect[compartment].T @ spatial_coor[compartment]
+            )
+            for compartment in compartments
+        }
+        spatial_coor_parcels_new_compl = {
+            compartment: jnp.concatenate(
+                (
+                    -spatial_coor_parcels_new[other][..., :1],
+                    spatial_coor_parcels_new[other][..., 1:],
+                ),
+                axis=-1,
+            )
+            for compartment, other in (
+                ('cortex_L', 'cortex_R'),
+                ('cortex_R', 'cortex_L'),
+            )
+        }
+        spatial_coor_parcels_new = {
+            compartment: (
+                spatial_coor_parcels_new[compartment] +
+                spatial_coor_parcels_new_compl[compartment] / 2
+            )
+            for compartment in compartments
+        }
+        spatial_coor_parcels_new = {
+            compartment: (
+                spatial_coor_parcels_new[compartment] / jnp.linalg.norm(
+                    spatial_coor_parcels_new[compartment],
+                    axis=-1,
+                    keepdims=True,
+                )
+            )
+            for compartment in compartments
+        }
+        spatial_delta = sum([
+            jnp.linalg.norm(
+                spatial_coor_parcels_new[compartment] -
+                spatial_coor_parcels[compartment]
+            ).item()
+            for compartment in compartments
+        ])
+        spatial_coor_parcels = spatial_coor_parcels_new
+        delta = selectivity_delta + spatial_delta
+        if delta < best_delta:
+            spatial_coor_parcels_best = spatial_coor_parcels
+            selectivity_coor_parcels_best = selectivity_coor_parcels
+        print(f'Iteration {i}: delta {delta}')
+    return (
+        spatial_coor_parcels_best,
+        selectivity_coor_parcels_best,
+    )
 
 
 def init_full_model(
@@ -574,20 +703,30 @@ def init_full_model(
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
+    (spatial_coor_parcels, selectivity_coor_parcels) = refine_parcels(
+        spatial_coor_parcels={
+            'cortex_L': coor_parcels_L,
+            'cortex_R': coor_parcels_R,
+        },
+        spatial_coor={
+            'cortex_L': coor_L,
+            'cortex_R': coor_R,
+        },
+        selectivity_coor_parcels=selectivity_parcels,
+        selectivity_coor=template,
+        num_iter=20,
+    )
     selectivity_distribution = {
         compartment: VonMisesFisher(
-            mu=selectivity_parcels[compartment],
-            kappa=10.,
+            mu=selectivity_coor_parcels[compartment],
+            kappa=VMF_KAPPA,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
     spatial_distribution = {
         compartment: VonMisesFisher(
-            mu={
-                'cortex_L': coor_parcels_L,
-                'cortex_R': coor_parcels_R,
-            }[compartment],
-            kappa=10.,
+            mu=spatial_coor_parcels[compartment],
+            kappa=VMF_KAPPA,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
@@ -752,6 +891,7 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         coor_R=coor_R,
         num_parcels=num_parcels,
     )
+    print('Model initialised!')
     encoder_result = encoder(
         T=T,
         coor_L=coor_L,
