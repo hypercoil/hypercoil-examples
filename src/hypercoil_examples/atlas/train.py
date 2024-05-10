@@ -59,6 +59,9 @@ ENERGY_NU = 1.
 RECON_NU = 1.
 TETHER_NU = 1.
 DIV_NU = 1e3
+POINT_POTENTIALS_NU = 1.
+DOUBLET_POTENTIALS_NU = 2.
+MASS_POTENTIALS_NU = 100.
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -195,6 +198,9 @@ def update(
             recon_nu=RECON_NU,
             tether_nu=TETHER_NU,
             div_nu=DIV_NU,
+            point_potentials_nu=POINT_POTENTIALS_NU,
+            doublet_potentials_nu=DOUBLET_POTENTIALS_NU,
+            mass_potentials_nu=MASS_POTENTIALS_NU,
             encoder_type=ENCODER_ARCH,
             model_type=MODEL_ARCH,
             inference=False,

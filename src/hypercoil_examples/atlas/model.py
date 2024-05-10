@@ -153,8 +153,8 @@ class StaticEncoder(eqx.Module):
 class SpatialSelectiveMRF(eqx.Module):
     spatial_distribution: Distribution
     selectivity_distribution: Distribution
-    doublet_distribution: Distribution
-    mass_distribution: Optional[Distribution] = None
+    doublet_potential: callable
+    mass_potential: Optional[callable] = None
     spatial_mle: Optional[callable] = None
     selectivity_mle: Optional[callable] = None
 
@@ -162,8 +162,8 @@ class SpatialSelectiveMRF(eqx.Module):
         self,
         spatial_distribution: Distribution,
         selectivity_distribution: Distribution,
-        doublet_distribution: Distribution,
-        mass_distribution: Optional[Distribution] = None,
+        doublet_potential: callable,
+        mass_potential: Optional[callable] = None,
         spatial_mle: Optional[callable] = None,
         selectivity_mle: Optional[callable] = None,
         *,
@@ -171,8 +171,8 @@ class SpatialSelectiveMRF(eqx.Module):
     ):
         self.spatial_distribution = spatial_distribution
         self.selectivity_distribution = selectivity_distribution
-        self.doublet_distribution = doublet_distribution
-        self.mass_distribution = mass_distribution
+        self.doublet_potential = doublet_potential
+        self.mass_potential = mass_potential
         self.spatial_mle = spatial_mle
         self.selectivity_mle = selectivity_mle
 
@@ -204,7 +204,7 @@ class SpatialSelectiveMRF(eqx.Module):
             Q[..., D, :],
             Q,
         )
-        result = -self.doublet_distribution.log_prob(coassignment)
+        result = self.doublet_potential(coassignment)
         return jnp.where(D < 0, 0., result)
 
     def expected_energy(
@@ -214,21 +214,25 @@ class SpatialSelectiveMRF(eqx.Module):
         S: Optional[Tensor] = None,
         Z: Optional[Tensor] = None,
         D: Optional[Tensor] = None,
+        *,
+        point_nu: float = 1.,
+        doublet_nu: float = 1.,
+        mass_nu: float = 1.,
     ) -> Tensor:
         energy = jnp.asarray(0)
         # point energies
         if U is not None:
-            energy += (Q * U).sum(-1)
+            energy += point_nu * (Q * U).sum(-1)
         elif Z is not None and S is not None:
-            energy += (Q * self.point_energy(Z=Z, S=S)).sum(-1)
+            energy += point_nu * (Q * self.point_energy(Z=Z, S=S)).sum(-1)
         # doublet energies
         if D is not None:
-            energy += self.doublet_energy(
+            energy += doublet_nu * self.doublet_energy(
                 D=D,
                 Q=jnp.clip(Q, 1e-6, 1 - 1e-6),
             ).sum(-1)
-        if self.mass_distribution is not None:
-            energy += -self.mass_distribution.log_prob(Q.sum(-2))
+        if self.mass_potential is not None:
+            energy += mass_nu * self.mass_potential(Q.sum(-2))
         return energy
 
     def point_mle(
@@ -252,8 +256,8 @@ class SpatialSelectiveMRF(eqx.Module):
                 norm_f=selectivity_norm_f,
                 src_distr=self.selectivity_distribution,
             ),
-            doublet_distribution=self.doublet_distribution,
-            mass_distribution=self.mass_distribution,
+            doublet_potential=self.doublet_potential,
+            mass_potential=self.mass_potential,
             spatial_mle=self.spatial_mle,
             selectivity_mle=self.selectivity_mle,
         )
@@ -339,6 +343,9 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        point_nu: float = 1.,
+        doublet_nu: float = 1.,
+        mass_nu: float = 1.,
         key: Optional['jax.random.PRNGKey'] = None,
         # The below arguments are here only for uniformity of the interface.
         # They do nothing.
@@ -373,6 +380,9 @@ class ForwardParcellationModel(eqx.Module):
                 S=coor[compartment],
                 Z=X[compartment],
                 D=self.approximator.meshes[compartment].icospheres[0],
+                point_nu=point_nu,
+                doublet_nu=doublet_nu,
+                mass_nu=mass_nu,
             )
             for compartment in compartments
         }
@@ -399,6 +409,9 @@ class ForwardParcellationModel(eqx.Module):
         model_type: Literal['parallel', 'series'] = 'parallel',
         inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
+        point_nu: float = 1.,
+        doublet_nu: float = 1.,
+        mass_nu: float = 1.,
     ) -> Tuple[Tensor, Tensor]:
         regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
             self._common_path(
@@ -463,6 +476,9 @@ class ForwardParcellationModel(eqx.Module):
                 S=coor[compartment],
                 Z=X[compartment],
                 D=self.approximator.meshes[compartment].icospheres[0],
+                point_nu=point_nu,
+                doublet_nu=doublet_nu,
+                mass_nu=mass_nu,
             )
             for compartment in compartments
         }
@@ -526,6 +542,12 @@ def init_encoder_model(
         'cortex_R': template[size_left:],
     }
     return encoder, template
+
+
+def marginal_entropy(counts: Tensor) -> Tensor:
+    P = counts / counts.sum(-1, keepdims=True)
+    P = jnp.clip(P, 1e-6, 1 - 1e-6)
+    return -jnp.sum(P * jnp.log(P), axis=-1)
 
 
 def refine_parcels(
@@ -735,11 +757,17 @@ def init_full_model(
         compartment: SpatialSelectiveMRF(
             spatial_distribution=spatial_distribution[compartment],
             selectivity_distribution=selectivity_distribution[compartment],
-            doublet_distribution=doublet_distribution,
-            mass_distribution=numpyro.distributions.DirichletMultinomial(
-                jnp.ones(num_parcels).astype(int) * 10,
-                total_count=template[compartment].shape[0],
-            ),
+            # doublet_distribution=doublet_distribution,
+            # mass_distribution=numpyro.distributions.DirichletMultinomial(
+            #     jnp.ones(num_parcels).astype(int) * 10,
+            #     total_count=template[compartment].shape[0],
+            # ),
+            doublet_potential=lambda x: logit_normal_divergence(
+                x.swapaxes(-1, -2),
+                1 / num_parcels,
+                scale=5.,
+            ).swapaxes(-1, -2),
+            mass_potential=lambda x: -marginal_entropy(x),
             spatial_mle=vmf_mle_mu_only,
             selectivity_mle=vmf_mle_mu_only,
         )
@@ -797,6 +825,9 @@ def forward(
     recon_nu: float = 1.,
     tether_nu: float = 1.,
     div_nu: float = 1e3,
+    point_potentials_nu: float = 1.,
+    doublet_potentials_nu: float = 1.,
+    mass_potentials_nu: float = 1.,
     inference: bool = False,
     encoder_type: Literal['64x64', '3res'] = '64x64',
     model_type: Literal['parallel', 'series'] = 'parallel',
@@ -814,6 +845,9 @@ def forward(
         encoder_result=encoder_result,
         compartments=(compartment,),
         inference=inference,
+        point_nu=point_potentials_nu,
+        doublet_nu=doublet_potentials_nu,
+        mass_nu=mass_potentials_nu,
         encoder_type=encoder_type,
         model_type=model_type,
         key=key_m,
@@ -859,20 +893,31 @@ def forward(
     else:
         tether = 0
     if div_nu != 0:
-        maxent = 1 / P[compartment].shape[0]
-        div = div_nu * (
-            jnp.exp(-(
-                logit(
-                    jnp.clip(P[compartment], 1e-6, 1 - 1e-6)
-                    # convex combine, else this term can grow without bound
-                    #(1 - maxent ** 2) * P[compartment] + maxent ** 3
-                ) - logit(maxent)
-            ) ** 2)
-        ).mean()
+        div = div_nu * logit_normal_maxent_divergence(P[compartment]).mean()
         meta = {**meta, 'div': div}
     else:
         div = 0
     return energy + recon_error + tether + div, meta
+
+
+def logit_normal_divergence(
+    P: Tensor,
+    Q: Tensor,
+    scale: Tensor = 1.,
+) -> Tensor:
+    return jnp.exp(
+        -(
+            (
+                logit(jnp.clip(P, 1e-6, 1 - 1e-6)) -
+                logit(jnp.clip(Q, 1e-6, 1 - 1e-6))
+            ) / scale
+        ) ** 2
+    )
+
+
+def logit_normal_maxent_divergence(P: Tensor, scale: Tensor = 1.) -> Tensor:
+    maxent = 1 / P.shape[-2]
+    return logit_normal_divergence(P, maxent, scale=scale)
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
@@ -898,12 +943,12 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         coor_R=coor_R,
         M=template,
     )
-    result = eqx.filter_value_and_grad(
-        eqx.filter_jit(forward),
-        has_aux=True,
-    )(
+    # result = eqx.filter_value_and_grad(
+    #     eqx.filter_jit(forward),
+    #     has_aux=True,
+    # )(
     #result = eqx.filter_value_and_grad(forward, has_aux=True)(
-    #result = forward(
+    result = forward(
         model,
         coor={
             'cortex_L': coor_L,
