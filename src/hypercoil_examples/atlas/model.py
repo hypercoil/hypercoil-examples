@@ -9,7 +9,7 @@ The complete parcellation model, including the indirect (approximator) network
 energy function that combines the two, and the selectivity-space encoder that
 constructs the inputs to both the U-Net and MRF models.
 """
-from typing import Literal, Mapping, Optional, Tuple, Union
+from typing import Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -350,7 +350,9 @@ class ForwardParcellationModel(eqx.Module):
         # The below arguments are here only for uniformity of the interface.
         # They do nothing.
         encoder_type: Literal['64x64', '3res'] = '64x64',
-        model_type: Literal['parallel', 'series'] = 'parallel',
+        injection_points: Sequence[
+            Literal['input', 'readout', 'residual']
+        ] = (),
         inference: Optional[bool] = None,
     ):
         regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
@@ -406,7 +408,9 @@ class ForwardParcellationModel(eqx.Module):
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
         encoder_type: Literal['64x64', '3res'] = '64x64',
-        model_type: Literal['parallel', 'series'] = 'parallel',
+        injection_points: Sequence[
+            Literal['input', 'readout', 'residual']
+        ] = (),
         inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
         point_nu: float = 1.,
@@ -442,22 +446,41 @@ class ForwardParcellationModel(eqx.Module):
         }
         if encoder_type == '64x64':
             inputs = {k: (v[0], v[0], v[1]) for k, v in inputs.items()}
-        if model_type == 'series':
-            P = {
-                compartment: jax.nn.softmax(
-                    -regulariser[compartment].point_energy(
-                        Z=X[compartment],
-                        S=coor[compartment],
-                    ).swapaxes(-2, -1),
-                axis=-2)
+        if len(injection_points) > 0:
+            energy = {
+                compartment: regulariser[compartment].point_energy(
+                    Z=X[compartment],
+                    S=coor[compartment],
+                ).swapaxes(-2, -1)
                 for compartment in compartments
             }
+            P = {
+                compartment: jax.nn.softmax(-energy[compartment], axis=-2)
+                for compartment in compartments
+            }
+            if 'input' in injection_points:
+                inputs = {
+                    compartment: (
+                        jnp.concatenate(
+                            (inputs[compartment][0], P[compartment])
+                        ),
+                        *inputs[compartment][1:],
+                    )
+                    for compartment in compartments
+                }
             inputs = {
                 compartment: (
-                    jnp.concatenate(
-                        (inputs[compartment][0], P[compartment])
+                    *inputs[compartment],
+                    (
+                        P[compartment]
+                        if 'readout' in injection_points
+                        else None
                     ),
-                    *inputs[compartment][1:],
+                    (
+                        energy[compartment]
+                        if 'residual' in injection_points
+                        else None
+                    ),
                 )
                 for compartment in compartments
             }
@@ -684,7 +707,7 @@ def init_full_model(
     coor_R: Tensor,
     num_parcels: int = 100,
     encoder_type: Literal['64x64', '3res'] = '64x64',
-    model_type: Literal['parallel', 'series'] = 'parallel',
+    injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
     key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
     import numpy as np
@@ -778,16 +801,16 @@ def init_full_model(
         positional_dim=encoder.spatial.default_encoding_dim,
     )
     base_in_dim = 0
+    readout_skip_dim = 0
     match encoder_type:
         case '64x64':
             base_in_dim = 64
         case '3res':
             base_in_dim = 14
-    match model_type:
-        case 'parallel':
-            base_in_dim += 0
-        case 'series':
-            base_in_dim += num_parcels
+    if 'input' in injection_points:
+        base_in_dim += num_parcels
+    if 'readout' in injection_points:
+        readout_skip_dim = num_parcels
     approximator = IcoELLGATUNet(
         meshes={
             'cortex_L': mesh_L,
@@ -804,6 +827,7 @@ def init_full_model(
         #norm=UnitSphereNorm(),
         dropout=ELLGAT_DROPOUT,
         dropout_inference=False,
+        readout_skip_dim=readout_skip_dim,
         key=key_a,
     )
     model = ForwardParcellationModel(
@@ -830,7 +854,7 @@ def forward(
     mass_potentials_nu: float = 1.,
     inference: bool = False,
     encoder_type: Literal['64x64', '3res'] = '64x64',
-    model_type: Literal['parallel', 'series'] = 'parallel',
+    injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
     key: 'jax.random.PRNGKey',
 ):
     meta = {}
@@ -849,7 +873,7 @@ def forward(
         doublet_nu=doublet_potentials_nu,
         mass_nu=mass_potentials_nu,
         encoder_type=encoder_type,
-        model_type=model_type,
+        injection_points=injection_points,
         key=key_m,
     )
     (_, (_, _, _, _, T)) = encoder_result
@@ -943,12 +967,12 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         coor_R=coor_R,
         M=template,
     )
-    # result = eqx.filter_value_and_grad(
-    #     eqx.filter_jit(forward),
-    #     has_aux=True,
-    # )(
+    result = eqx.filter_value_and_grad(
+        eqx.filter_jit(forward),
+        has_aux=True,
+    )(
     #result = eqx.filter_value_and_grad(forward, has_aux=True)(
-    result = forward(
+    #result = forward(
         model,
         coor={
             'cortex_L': coor_L,

@@ -45,7 +45,7 @@ from hyve import (
 LEARNING_RATE = 0.002
 MAX_EPOCH = 10000
 ENCODER_ARCH = '64x64'
-MODEL_ARCH = 'series'
+SERIAL_INJECTION_SITES = ('readout', 'residual')
 SEED = 0
 REPORT_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
@@ -202,7 +202,7 @@ def update(
             doublet_potentials_nu=DOUBLET_POTENTIALS_NU,
             mass_potentials_nu=MASS_POTENTIALS_NU,
             encoder_type=ENCODER_ARCH,
-            model_type=MODEL_ARCH,
+            injection_points=SERIAL_INJECTION_SITES,
             inference=False,
             key=key,
         )
@@ -278,7 +278,7 @@ def main(
         coor_R=coor_R,
         num_parcels=num_parcels,
         encoder_type=ENCODER_ARCH,
-        model_type=MODEL_ARCH,
+        injection_points=SERIAL_INJECTION_SITES,
     )
     #encode = encoder
     encode = eqx.filter_jit(encoder)
@@ -435,7 +435,7 @@ def main(
                     encoder_result=encoder_result,
                     compartments=('cortex_L', 'cortex_R'),
                     encoder_type=ENCODER_ARCH,
-                    model_type=MODEL_ARCH,
+                    injection_points=SERIAL_INJECTION_SITES,
                     inference=True,
                     key=key,
                 )

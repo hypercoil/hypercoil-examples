@@ -225,6 +225,7 @@ class IcoELLGATUNet(eqx.Module):
         norm: Optional[eqx.Module] = None,
         dropout: Optional[float] = None,
         dropout_inference: bool = False,
+        readout_skip_dim: int = 0,
         *,
         key: 'jax.random.PRNGKey',
     ):
@@ -310,7 +311,7 @@ class IcoELLGATUNet(eqx.Module):
 
         key_r = jax.random.fold_in(key, num_levels)
         readout = ELLGAT(
-            query_features=hidden_readout_dim * attn_heads[0],
+            query_features=hidden_readout_dim * attn_heads[0] + readout_skip_dim,
             out_features=readout_dim,
             attn_heads=1,
             nlin=nlin,
@@ -376,7 +377,7 @@ class IcoELLGATUNet(eqx.Module):
                 )
                 Q = self.norm(Q)
             if Qi is not None:
-                Q = jnp.concatenate((Q, Qi), axis=0)
+                Q = jnp.concatenate((Q, Qi), axis=-2)
             Q = module(
                 adj=mesh.icospheres[i],
                 Q=Q,
@@ -393,7 +394,7 @@ class IcoELLGATUNet(eqx.Module):
             idx = len(self.expansive) - i - 1
             Z, Qn = Z[:-1], Z[-1]
             if Q is not None:
-                Q = jnp.concatenate((Q, Qn), axis=0)
+                Q = jnp.concatenate((Q, Qn), axis=-2)
             else:
                 Q = Qn
             Q = module(
@@ -415,12 +416,19 @@ class IcoELLGATUNet(eqx.Module):
             #     assert 0
 
         key_r = jax.random.fold_in(key, len(self.contractive))
+        if len(X) > 0 and X[0] is not None:
+            Qi, X = X[0], X[1:]
+            Q = jnp.concatenate((Q, Qi), axis=-2)
         Q = self.readout(
             adj=mesh.icospheres[0],
             Q=Q,
             inference=inference,
             key=key_r,
         )
+        if len(X) > 0 and X[0] is not None:
+            # Residual learning
+            Qi, X = X[0], X[1:]
+            Q = Q + Qi
         Q = jax.nn.softmax(
             Q.reshape(*Q.shape[:-3], *Q.shape[-2:]),
             axis=-2,
