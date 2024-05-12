@@ -43,7 +43,8 @@ from hypercoil_examples.atlas.selectransform import (
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
 ELLGAT_DROPOUT = 0.1
-VMF_KAPPA = 10
+VMF_SPATIAL_KAPPA = 50
+VMF_SELECTIVITY_KAPPA = 20
 
 
 class EmptyPromises(eqx.Module):
@@ -528,7 +529,7 @@ def vmf_mle_mu_only(
     if src_distr is not None:
         kappa = src_distr.kappa
     else:
-        kappa = VMF_KAPPA
+        kappa = VMF_SELECTIVITY_KAPPA
     return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
 
 
@@ -592,7 +593,7 @@ def refine_parcels(
         spatial_distribution = {
             compartment: VonMisesFisher(
                 mu=spatial_coor_parcels[compartment],
-                kappa=VMF_KAPPA,
+                kappa=VMF_SPATIAL_KAPPA,
             )
             for compartment in ('cortex_L', 'cortex_R')
         }
@@ -633,7 +634,7 @@ def refine_parcels(
         selectivity_distribution = {
             compartment: VonMisesFisher(
                 mu=selectivity_coor_parcels[compartment],
-                kappa=VMF_KAPPA,
+                kappa=VMF_SELECTIVITY_KAPPA,
             )
             for compartment in ('cortex_L', 'cortex_R')
         }
@@ -764,14 +765,14 @@ def init_full_model(
     selectivity_distribution = {
         compartment: VonMisesFisher(
             mu=selectivity_coor_parcels[compartment],
-            kappa=VMF_KAPPA,
+            kappa=VMF_SELECTIVITY_KAPPA,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
     spatial_distribution = {
         compartment: VonMisesFisher(
             mu=spatial_coor_parcels[compartment],
-            kappa=VMF_KAPPA,
+            kappa=VMF_SPATIAL_KAPPA,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
