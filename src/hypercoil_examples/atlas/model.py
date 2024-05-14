@@ -267,9 +267,10 @@ class SpatialSelectiveMRF(eqx.Module):
         Z: Tensor,
         S: Tensor,
         D: Optional[Tensor] = None,
+        temperature: float = 1.,
     ) -> Tensor:
         U = self.point_energy(Z=Z, S=S)
-        Q = jax.nn.softmax(-U, axis=-1)
+        Q = jax.nn.softmax(-U / temperature, axis=-1)
         return self.expected_energy(Q=Q, U=U, D=D)
 
 
@@ -869,6 +870,7 @@ def forward(
     recon_nu: float = 1.,
     tether_nu: float = 1.,
     div_nu: float = 1e3,
+    template_energy_nu: float = 1.,
     point_potentials_nu: float = 1.,
     doublet_potentials_nu: float = 1.,
     mass_potentials_nu: float = 1.,
@@ -943,6 +945,14 @@ def forward(
         meta = {**meta, 'div': div}
     else:
         div = 0
+    if template_energy_nu != 0:
+        M = encoder_result[1][0]
+        template_energy = template_energy_nu * model.regulariser[compartment](
+            M[compartment],
+            coor[compartment],
+            model.approximator.meshes[compartment].icospheres[0],
+        ).mean()
+        meta = {**meta, 'template_energy': template_energy}
     return energy + recon_error + tether + div, meta
 
 

@@ -64,6 +64,7 @@ ENERGY_NU = 1.
 RECON_NU = 1.
 TETHER_NU = 1.
 DIV_NU = 1e3
+TEMPLATE_ENERGY_NU = 1.
 POINT_POTENTIALS_NU = 1.
 DOUBLET_POTENTIALS_NU = 2.
 MASS_POTENTIALS_NU = 100.
@@ -223,6 +224,9 @@ def update(
     key,
 ):
     #if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
+    template_energy_nu = (
+        TEMPLATE_ENERGY_NU if pathway == 'regulariser' else 0.
+    )
     try:
         (loss, meta), grad = forward_backward(
         #forward(
@@ -236,6 +240,7 @@ def update(
             recon_nu=RECON_NU,
             tether_nu=TETHER_NU,
             div_nu=DIV_NU,
+            template_energy_nu=template_energy_nu,
             point_potentials_nu=POINT_POTENTIALS_NU,
             doublet_potentials_nu=DOUBLET_POTENTIALS_NU,
             mass_potentials_nu=MASS_POTENTIALS_NU,
