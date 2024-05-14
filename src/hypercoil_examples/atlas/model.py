@@ -42,9 +42,7 @@ from hypercoil_examples.atlas.selectransform import (
 )
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
-ELLGAT_DROPOUT = 0.1
-VMF_SPATIAL_KAPPA = 50
-VMF_SELECTIVITY_KAPPA = 20
+VMF_BASE_KAPPA = 10
 
 
 class EmptyPromises(eqx.Module):
@@ -106,8 +104,9 @@ class StaticEncoder(eqx.Module):
     ) -> Tuple[Tensor, Tensor]:
         # 1. Global signal regression
         T = T - T.mean(-1, keepdims=True)
-        T = T / T.std(-1, keepdims=True)
-        T = jnp.where(jnp.isnan(T), 0, T)
+        denom = T.std(-1, keepdims=True)
+        denom = jnp.where(denom == 0, 1., denom)
+        T = T / denom
         gs = T.mean(0, keepdims=True)
         T = residualise(T, gs)
         # 2. Temporal encode
@@ -289,6 +288,7 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        temperature: float = 1.,
     ) -> Tuple[Tensor, Tensor]:
         if isinstance(compartments, str):
             compartments = (compartments,)
@@ -319,7 +319,10 @@ class ForwardParcellationModel(eqx.Module):
             for compartment in compartments
         }
         Q = {
-            compartment: jax.nn.softmax(-point[compartment], axis=-1)
+            compartment: jax.nn.softmax(
+                -point[compartment] / temperature,
+                axis=-1,
+            )
             for compartment in compartments
         }
         regulariser = {
@@ -354,6 +357,7 @@ class ForwardParcellationModel(eqx.Module):
         injection_points: Sequence[
             Literal['input', 'readout', 'residual']
         ] = (),
+        temperature: float = 1.,
         inference: Optional[bool] = None,
     ):
         regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
@@ -366,6 +370,7 @@ class ForwardParcellationModel(eqx.Module):
                 encoder=encoder,
                 encoder_result=encoder_result,
                 compartments=compartments,
+                temperature=temperature,
             )
         )
         P = {
@@ -373,8 +378,9 @@ class ForwardParcellationModel(eqx.Module):
                 -regulariser[compartment].point_energy(
                     Z=X[compartment],
                     S=coor[compartment],
-                ).swapaxes(-1, -2),
-            axis=-2)
+                ).swapaxes(-1, -2) / temperature,
+                axis=-2,
+            )
             for compartment in compartments
         }
         energy = {
@@ -408,15 +414,16 @@ class ForwardParcellationModel(eqx.Module):
         encoder: Optional[eqx.Module] = None,
         encoder_result: Optional[Tuple[Tuple, Tuple]] = None,
         compartments: Union[str, Tuple[str]] = ('cortex_L', 'cortex_R'),
+        point_nu: float = 1.,
+        doublet_nu: float = 1.,
+        mass_nu: float = 1.,
         encoder_type: Literal['64x64', '3res'] = '64x64',
         injection_points: Sequence[
             Literal['input', 'readout', 'residual']
         ] = (),
+        temperature: float = 1.,
         inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
-        point_nu: float = 1.,
-        doublet_nu: float = 1.,
-        mass_nu: float = 1.,
     ) -> Tuple[Tensor, Tensor]:
         regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
             self._common_path(
@@ -428,6 +435,7 @@ class ForwardParcellationModel(eqx.Module):
                 encoder=encoder,
                 encoder_result=encoder_result,
                 compartments=compartments,
+                temperature=temperature,
             )
         )
         masks = encoder.temporal.reduced_slices[::-1]
@@ -456,7 +464,10 @@ class ForwardParcellationModel(eqx.Module):
                 for compartment in compartments
             }
             P = {
-                compartment: jax.nn.softmax(-energy[compartment], axis=-2)
+                compartment: jax.nn.softmax(
+                    -energy[compartment] / temperature,
+                    axis=-2,
+                )
                 for compartment in compartments
             }
             if 'input' in injection_points:
@@ -490,6 +501,7 @@ class ForwardParcellationModel(eqx.Module):
                 inputs[compartment],
                 mesh=compartment,
                 inference=inference,
+                temperature=temperature,
                 key=key,
             )
             for compartment in compartments
@@ -529,7 +541,7 @@ def vmf_mle_mu_only(
     if src_distr is not None:
         kappa = src_distr.kappa
     else:
-        kappa = VMF_SELECTIVITY_KAPPA
+        kappa = VMF_BASE_KAPPA
     return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
 
 
@@ -584,6 +596,8 @@ def refine_parcels(
     # We should at least do this jointly, but I guess this alternating method
     # is probably better than nothing.
     num_iter: int = 20,
+    spatial_kappa: float = VMF_BASE_KAPPA,
+    selectivity_kappa: float = VMF_BASE_KAPPA,
 ) -> Tuple[Tensor, Tensor]:
     compartments = spatial_coor.keys()
     spatial_coor_parcels_best = None
@@ -593,7 +607,7 @@ def refine_parcels(
         spatial_distribution = {
             compartment: VonMisesFisher(
                 mu=spatial_coor_parcels[compartment],
-                kappa=VMF_SPATIAL_KAPPA,
+                kappa=spatial_kappa,
             )
             for compartment in ('cortex_L', 'cortex_R')
         }
@@ -634,7 +648,7 @@ def refine_parcels(
         selectivity_distribution = {
             compartment: VonMisesFisher(
                 mu=selectivity_coor_parcels[compartment],
-                kappa=VMF_SELECTIVITY_KAPPA,
+                kappa=selectivity_kappa,
             )
             for compartment in ('cortex_L', 'cortex_R')
         }
@@ -709,6 +723,9 @@ def init_full_model(
     num_parcels: int = 100,
     encoder_type: Literal['64x64', '3res'] = '64x64',
     injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
+    spatial_kappa: float = VMF_BASE_KAPPA,
+    selectivity_kappa: float = VMF_BASE_KAPPA,
+    dropout: float = 0.1,
     key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
     import numpy as np
@@ -760,19 +777,21 @@ def init_full_model(
         },
         selectivity_coor_parcels=selectivity_parcels,
         selectivity_coor=template,
+        spatial_kappa=spatial_kappa,
+        selectivity_kappa=selectivity_kappa,
         num_iter=20,
     )
     selectivity_distribution = {
         compartment: VonMisesFisher(
             mu=selectivity_coor_parcels[compartment],
-            kappa=VMF_SELECTIVITY_KAPPA,
+            kappa=selectivity_kappa,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
     spatial_distribution = {
         compartment: VonMisesFisher(
             mu=spatial_coor_parcels[compartment],
-            kappa=VMF_SPATIAL_KAPPA,
+            kappa=spatial_kappa,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
@@ -826,7 +845,7 @@ def init_full_model(
         attn_heads=(4, 4, 4),
         readout_dim=num_parcels,
         #norm=UnitSphereNorm(),
-        dropout=ELLGAT_DROPOUT,
+        dropout=dropout,
         dropout_inference=False,
         readout_skip_dim=readout_skip_dim,
         key=key_a,
@@ -853,6 +872,7 @@ def forward(
     point_potentials_nu: float = 1.,
     doublet_potentials_nu: float = 1.,
     mass_potentials_nu: float = 1.,
+    temperature: float = 1.,
     inference: bool = False,
     encoder_type: Literal['64x64', '3res'] = '64x64',
     injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
@@ -874,6 +894,7 @@ def forward(
         doublet_nu=doublet_potentials_nu,
         mass_nu=mass_potentials_nu,
         encoder_type=encoder_type,
+        temperature=temperature,
         injection_points=injection_points,
         key=key_m,
     )

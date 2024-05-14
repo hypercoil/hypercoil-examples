@@ -337,6 +337,7 @@ class IcoELLGATUNet(eqx.Module):
         mesh: Optional[str] = None,
         *,
         inference: Optional[bool] = None,
+        temperature: float = 1.0,
         key: 'jax.random.PRNGKey',
     ) -> Tensor:
         if mesh is None:
@@ -430,7 +431,7 @@ class IcoELLGATUNet(eqx.Module):
             Qi, X = X[0], X[1:]
             Q = Q + Qi
         Q = jax.nn.softmax(
-            Q.reshape(*Q.shape[:-3], *Q.shape[-2:]),
+            Q.reshape(*Q.shape[:-3], *Q.shape[-2:]) / temperature,
             axis=-2,
         )
         return Q

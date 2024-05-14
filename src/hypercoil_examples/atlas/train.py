@@ -17,6 +17,7 @@ import optax
 import pyvista as pv
 
 from hypercoil.engine import _to_jax_array
+from hypercoil.functional import sample_overlapping_windows_existing_ax
 from hypercoil_examples.atlas.aligned_dccc import (
     get_msc_dataset, _get_data
 )
@@ -46,15 +47,19 @@ LEARNING_RATE = 0.002
 MAX_EPOCH = 10000
 ENCODER_ARCH = '64x64'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
+PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 SEED = 0
+
 REPORT_INTERVAL = 10
 CHECKPOINT_INTERVAL = 100
-PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 VISPATH = 'full'
+VISUALISE_TEMPLATE = True
+VISUALISE_SINGLE = True
+
 SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
-VISUALISE_MRF = True
-VISUALISE_SINGLE = True
+
+ELLGAT_DROPOUT = 0.1
 ENERGY_NU = 1.
 RECON_NU = 1.
 TETHER_NU = 1.
@@ -62,6 +67,38 @@ DIV_NU = 1e3
 POINT_POTENTIALS_NU = 1.
 DOUBLET_POTENTIALS_NU = 2.
 MASS_POTENTIALS_NU = 100.
+VMF_SPATIAL_KAPPA = 50.
+VMF_SELECTIVITY_KAPPA = 20.
+
+# Temperature sampler takes the form of a tuple:
+# The first element is the number of samples to take
+# The second element is a callable that takes a single seed argument and
+# returns a temperature value
+# The third element is an integer that is folded into the epoch key to
+# determine the seed for the temperature sampler
+TEMPERATURE_SAMPLER = None
+TEMPERATURE_SAMPLER = (
+    5,
+    lambda s: jnp.exp(-2 * jax.random.uniform(s, shape=(1,))),
+    3829,
+)
+# Window sampler takes the form of a tuple:
+# The first element is the number of samples to take
+# The second element is a callable that takes time series and seed arguments
+# and returns a windowed time series
+# The third element is an integer that is folded into the epoch key to
+# determine the seed for the window sampler
+WINDOW_SIZE = 500
+WINDOW_SAMPLER = None
+WINDOW_SAMPLER = (
+    3,
+    lambda x, s: sample_overlapping_windows_existing_ax(
+        x,
+        WINDOW_SIZE,
+        key=s,
+    ),
+    2704,
+)
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -182,9 +219,10 @@ def update(
     encoder_result,
     epoch,
     pathway,
+    temperature,
     key,
 ):
-    if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
+    #if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
     try:
         (loss, meta), grad = forward_backward(
         #forward(
@@ -203,6 +241,7 @@ def update(
             mass_potentials_nu=MASS_POTENTIALS_NU,
             encoder_type=ENCODER_ARCH,
             injection_points=SERIAL_INJECTION_SITES,
+            temperature=temperature,
             inference=False,
             key=key,
         )
@@ -224,7 +263,6 @@ def update(
     if jnp.isnan(loss) or jnp.isinf(loss):
         print(f'NaN or infinite loss at epoch {epoch}. Skipping update')
         print(meta)
-        breakpoint()
         return model, opt_state, None, {}
     updates, opt_state = opt.update(
         eqx.filter(grad, eqx.is_inexact_array),
@@ -241,6 +279,7 @@ def accumulate_metadata(
     meta: dict,
     epoch: int,
     num_entities: int,
+    print_results: bool = True,
 ) -> dict:
     epoch_complete = ((epoch % num_entities == 0) and (epoch > 0))
     old_meta_acc = None
@@ -253,9 +292,10 @@ def accumulate_metadata(
         for k, v in meta_acc.items():
             meta_acc[k] = jnp.mean(jnp.asarray(v)).item()
         epoch_loss = sum(meta_acc.values())
-        print('\nEPOCH RESULTS')
-        print('\n'.join([f'[]{k}: {v}' for k, v in meta_acc.items()]))
-        print(f'Total mean loss (train): {epoch_loss}\n')
+        if print_results:
+            print('\nEPOCH RESULTS')
+            print('\n'.join([f'[]{k}: {v}' for k, v in meta_acc.items()]))
+            print(f'Total mean loss (train): {epoch_loss}\n')
         old_meta_acc = meta_acc
         meta_acc = {}
     return meta_acc, epoch_complete, old_meta_acc, epoch_loss
@@ -279,6 +319,9 @@ def main(
         num_parcels=num_parcels,
         encoder_type=ENCODER_ARCH,
         injection_points=SERIAL_INJECTION_SITES,
+        spatial_kappa=VMF_SPATIAL_KAPPA,
+        selectivity_kappa=VMF_SELECTIVITY_KAPPA,
+        dropout=ELLGAT_DROPOUT,
     )
     #encode = encoder
     encode = eqx.filter_jit(encoder)
@@ -290,6 +333,17 @@ def main(
         'cortex_L': coor_L,
         'cortex_R': coor_R,
     }
+    # Configuration for data augmentation
+    (
+        n_temperature_samples,
+        temperature_sampler,
+        temperature_seed,
+    ) = TEMPERATURE_SAMPLER or (1, lambda x: 1., 0)
+    (
+        n_window_samples,
+        window_sampler,
+        window_seed,
+    ) = WINDOW_SAMPLER or (1, lambda x, s: x, 0)
     if start_epoch is not None:
         model = eqx.tree_deserialise_leaves(
             f'/tmp/parcellation_model_checkpoint{start_epoch}',
@@ -308,6 +362,7 @@ def main(
         start_epoch = -1
     meta_acc = {}
     for i in range(start_epoch + 1, MAX_EPOCH + 1):
+        key_e = jax.random.fold_in(key, i)
         session, subject = data_entities[i % num_entities]
         print(f'Epoch {i} (sub-{subject} ses-{session})')
         try:
@@ -322,75 +377,108 @@ def main(
                 f'Data entity sub-{subject} ses-{session} is absent. '
                 'Skipping'
             )
+            continue
         if jnp.any(jnp.isnan(T)):
             print(
                 f'Invalid data for entity sub-{subject} ses-{session}. '
                 'Skipping'
             )
+            breakpoint()
             continue
-        encoder_result = encode(
-            T=T,
-            coor_L=coor_L,
-            coor_R=coor_R,
-            M=template,
-        )
-        if any([
-            jnp.any(jnp.isnan(encoder_result[0][i][compartment])).item()
-            for compartment in ('cortex_L', 'cortex_R')
-            for i in range(3)
-        ]):
-            print(
-                f'Invalid data for entity sub-{subject} ses-{session}. '
-                'Skipping'
+        Ts = [
+            window_sampler(
+                T,
+                jax.random.fold_in(key_e, (s + 1) * window_seed),
             )
-            continue
-        key_e = jax.random.fold_in(key, i)
-        key_l, key_r = jax.random.split(key_e)
-        meta_L = {}
-        meta_R = {}
-        loss_ = 0
-        for pathway in PATHWAYS:
-            model, opt_state, loss_L, meta_L[pathway] = update(
-                model=model,
-                opt_state=opt_state,
-                opt=opt,
-                compartment='cortex_L',
-                coor=coor,
-                encoder=encoder,
-                encoder_result=encoder_result,
-                epoch=i,
-                pathway=pathway,
-                key=key_l,
+            for s in range(n_window_samples)
+        ]
+        meta = {}
+        for j, T in enumerate(Ts):
+            T = jnp.where(
+                jnp.isclose(T.std(-1), 0)[..., None],
+                jax.random.normal(jax.random.fold_in(key_e, 54), T.shape),
+                T,
             )
-            if True:
-                model, opt_state, loss_R, meta_R[pathway] = update(
-                    model=model,
-                    opt_state=opt_state,
-                    opt=opt,
-                    compartment='cortex_R',
-                    coor=coor,
-                    encoder=encoder,
-                    encoder_result=encoder_result,
-                    epoch=i,
-                    pathway=pathway,
-                    key=key_r,
+            encoder_result = encode(
+                T=T,
+                coor_L=coor_L,
+                coor_R=coor_R,
+                M=template,
+            )
+            if any([
+                jnp.any(jnp.isnan(encoder_result[0][i][compartment])).item()
+                for compartment in ('cortex_L', 'cortex_R')
+                for i in range(3)
+            ]):
+                print(
+                    f'Invalid encoding for entity sub-{subject} '
+                    f'ses-{session}. Skipping'
                 )
-            else:
-                loss_R = 0
-                meta_R[pathway] = {k: 0 for k in meta_L}
-            loss_ += (loss_L + loss_R)
-        meta_L = {
-            f'{t}_{p}': v
-            for p, e in meta_L.items()
-            for t, v in e.items()
-        }
-        meta_R = {
-            f'{t}_{p}': v
-            for p, e in meta_R.items()
-            for t, v in e.items()
-        }
+                continue
+            key_l, key_r = jax.random.split(key_e)
+            temperatures = [
+                temperature_sampler(
+                    jax.random.fold_in(key_e, (s + 1) * temperature_seed),
+                )
+                for s in range(n_temperature_samples)
+            ]
+            for k, temperature in enumerate(temperatures):
+                meta_L_call = {}
+                meta_R_call = {}
+                #loss_ = 0
+                for pathway in PATHWAYS:
+                    model, opt_state, loss_L, meta_L_call[pathway] = update(
+                        model=model,
+                        opt_state=opt_state,
+                        opt=opt,
+                        compartment='cortex_L',
+                        coor=coor,
+                        encoder=encoder,
+                        encoder_result=encoder_result,
+                        epoch=i,
+                        pathway=pathway,
+                        temperature=temperature,
+                        key=key_l,
+                    )
+                    model, opt_state, loss_R, meta_R_call[pathway] = update(
+                        model=model,
+                        opt_state=opt_state,
+                        opt=opt,
+                        compartment='cortex_R',
+                        coor=coor,
+                        encoder=encoder,
+                        encoder_result=encoder_result,
+                        epoch=i,
+                        pathway=pathway,
+                        temperature=temperature,
+                        key=key_r,
+                    )
+                    #loss_ += (loss_L + loss_R)
+                meta_L_call = {
+                    f'{t}_{p}': v
+                    for p, e in meta_L_call.items()
+                    for t, v in e.items()
+                }
+                meta_R_call = {
+                    f'{t}_{p}': v
+                    for p, e in meta_R_call.items()
+                    for t, v in e.items()
+                }
+                meta_call = {
+                    k: meta_L_call[k] + meta_R_call[k]
+                    for k in meta_L_call
+                }
+                (
+                    meta, _, new_meta, loss_
+                ) = accumulate_metadata(
+                    meta,
+                    meta_call,
+                    j * n_temperature_samples + k + 1,
+                    n_temperature_samples * n_window_samples,
+                    print_results=False,
+                )
+        meta = new_meta
         losses += [loss_]
-        meta = {k: meta_L[k] + meta_R[k] for k in meta_L}
         print('\n'.join([f'[]{k}: {v}' for k, v in meta.items()]))
         (
             meta_acc, epoch_complete, old_meta_acc, epoch_loss
@@ -400,7 +488,7 @@ def main(
             with open('/tmp/epoch_history.pkl', 'wb') as f:
                 pickle.dump(epoch_history, f)
         if i % REPORT_INTERVAL == 0:
-            if VISUALISE_MRF:
+            if VISUALISE_TEMPLATE:
                 visualise(
                     name=f'MRF_epoch-{i}',
                     plot_f=plot_f,
