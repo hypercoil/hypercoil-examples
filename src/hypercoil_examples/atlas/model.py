@@ -731,6 +731,7 @@ def init_full_model(
     injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
     spatial_kappa: float = VMF_BASE_KAPPA,
     selectivity_kappa: float = VMF_BASE_KAPPA,
+    disaffiliation_penalty: float = 1.,
     dropout: float = 0.1,
     key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
@@ -815,7 +816,7 @@ def init_full_model(
                 x.swapaxes(-1, -2),
                 1 / num_parcels,
                 scale=5.,
-            ).swapaxes(-1, -2),
+            ).swapaxes(-1, -2) - x * disaffiliation_penalty,
             mass_potential=lambda x: -marginal_entropy(x),
             spatial_mle=vmf_mle_mu_only,
             selectivity_mle=vmf_mle_mu_only,
