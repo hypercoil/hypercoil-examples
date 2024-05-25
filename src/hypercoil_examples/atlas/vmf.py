@@ -33,6 +33,7 @@ from hyve import (
 )
 
 from hypercoil_examples.atlas.const import MSC_DATA_ROOT
+from hypercoil_examples.atlas.data import _get_data
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
     create_consensus_encoder,
@@ -209,33 +210,6 @@ def visualise_surface_encoder(
         load_mask=True,
         # hemisphere='left',
     )
-
-
-def _get_data(
-    cifti: str,
-    normalise: bool = True,
-    gsr: bool = True,
-    key: Optional['jax.random.PRNGKey'] = None,
-):
-    key = jax.random.PRNGKey(0) if key is None else key
-    cifti = nb.load(cifti)
-    data_full = cifti.get_fdata(dtype=np.float32).T
-    data = data_full[~cifti.header.get_axis(1).volume_mask]
-    if normalise:
-        data = data - data.mean(-1, keepdims=True)
-        data = data / data.std(-1, keepdims=True)
-        data = jnp.where(jnp.isnan(data), 0, data)
-
-    if gsr:
-        gs = data.mean(0, keepdims=True)
-        data = residualise(data, gs)
-    # Plug zero-variance vertices with ramp (for no NaNs in log prob)
-    data = jnp.where(
-        jnp.isclose(data.std(-1), 0)[..., None],
-        jax.random.normal(key, data.shape),
-        data,
-    )
-    return data
 
 
 def get_data(cifti: str):

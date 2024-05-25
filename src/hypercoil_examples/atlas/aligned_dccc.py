@@ -27,6 +27,7 @@ from hypercoil.nn.atlas import AtlasLinear
 
 from hypercoil_examples.atlas.const import MSC_DATA_ROOT
 from hypercoil_examples.atlas.cross2subj import visualise
+from hypercoil_examples.atlas.data import _get_data, get_msc_dataset
 from hypercoil_examples.atlas.dccc import (
     dccc, get_atlas_path, plot_dccc
 )
@@ -35,7 +36,7 @@ from hypercoil_examples.atlas.encoders import (
 )
 from hypercoil_examples.atlas.promises import empty_promises
 from hypercoil_examples.atlas.spatialinit import init_spatial_priors
-from hypercoil_examples.atlas.vmf import _get_data, whiten_data
+from hypercoil_examples.atlas.vmf import whiten_data
 
 SPATIAL_PRIOR_WEIGHT = 5e2
 DCCC_SAMPLE_KEY = 71
@@ -47,16 +48,6 @@ MLE_TEMPERATURE = 0.5
 MAX_ITER_ENERGY_EQUILIBRIUM = 20
 SPATIAL_KAPPA_LIM = (1e1, 3e1)
 TEMPORAL_KAPPA_LIM = (1e1, None)
-
-
-def get_msc_dataset(
-    subject: str,
-    session: str,
-) -> str:
-    return (
-        f'{MSC_DATA_ROOT}/sub-MSC{subject}_ses-func{session}_'
-        'task-rest_space-fsLR_den-91k_bold.dtseries.nii'
-    )
 
 
 def map_into(X: Tensor, lim: Tuple[float, float]) -> Tensor:
