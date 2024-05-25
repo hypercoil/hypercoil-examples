@@ -18,10 +18,11 @@ import pyvista as pv
 
 from hypercoil.engine import _to_jax_array
 from hypercoil.functional import sample_overlapping_windows_existing_ax
-from hypercoil_examples.atlas.aligned_dccc import (
-    get_msc_dataset, _get_data
-)
+from hypercoil_examples.atlas.const import HCP_DATA_SPLIT_DEF_ROOT
 from hypercoil_examples.atlas.cross2subj import visualise
+from hypercoil_examples.atlas.data import (
+    get_hcp_dataset, get_msc_dataset, _get_data
+)
 from hypercoil_examples.atlas.model import (
     init_full_model,
     forward,
@@ -44,20 +45,30 @@ from hyve import (
 )
 
 LEARNING_RATE = 0.002
-MAX_EPOCH = 10000
+MAX_EPOCH = 19600
 ENCODER_ARCH = '64x64'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 SEED = 0
 
-REPORT_INTERVAL = 10
-CHECKPOINT_INTERVAL = 100
+REPORT_INTERVAL = 196
+CHECKPOINT_INTERVAL = 196
+MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+MSC_SUBJECTS = ('05', '06')
+MSC_TASKS = (
+    'rest', 'motor_run-01', 'motor_run-02',
+    'glasslexical_run-01', 'glasslexical_run-02',
+    'memoryfaces', 'memoryscenes', 'memorywords',
+)
+HCP_TASKS = (
+    'REST1', 'REST2', 'EMOTION', 'GAMBLING',
+    'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
+)
+DATASETS = ('HCP', 'MSC')
 VISPATH = 'full'
 VISUALISE_TEMPLATE = True
 VISUALISE_SINGLE = True
-
-SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
-SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 
 ELLGAT_DROPOUT = 0.1
 ENERGY_NU = 1.
@@ -77,12 +88,14 @@ VMF_SELECTIVITY_KAPPA = 20.
 # returns a temperature value
 # The third element is an integer that is folded into the epoch key to
 # determine the seed for the temperature sampler
-TEMPERATURE_SAMPLER = None
+TEMPERATURE_SEED = 3829
+NUM_TEMPERATURE_SAMPLES = 5
 TEMPERATURE_SAMPLER = (
-    5,
+    NUM_TEMPERATURE_SAMPLES,
     lambda s: jnp.exp(-2 * jax.random.uniform(s, shape=(1,))),
-    3829,
+    TEMPERATURE_SEED,
 )
+TEMPERATURE_SAMPLER = None
 # Window sampler takes the form of a tuple:
 # The first element is the number of samples to take
 # The second element is a callable that takes time series and seed arguments
@@ -90,16 +103,20 @@ TEMPERATURE_SAMPLER = (
 # The third element is an integer that is folded into the epoch key to
 # determine the seed for the window sampler
 WINDOW_SIZE = 500
-WINDOW_SAMPLER = None
+WINDOW_SEED = 2704
+NUM_WINDOW_SAMPLES = 3
 WINDOW_SAMPLER = (
-    3,
+    NUM_WINDOW_SAMPLES,
     lambda x, s: sample_overlapping_windows_existing_ax(
         x,
         WINDOW_SIZE,
         key=s,
     ),
-    2704,
+    WINDOW_SEED,
 )
+WINDOW_SAMPLER = None
+
+DATA_SAMPLER_KEY = 9902
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -307,11 +324,28 @@ def accumulate_metadata(
 
 
 def main(
-    num_parcels: int = 100,
+    num_parcels: int = 200,
     start_epoch: Optional[int] = None,
 ):
     key = jax.random.PRNGKey(SEED)
-    data_entities = tuple(product(SESSIONS, SUBJECTS))
+    data_entities = []
+    if 'MSC' in DATASETS:
+        data_entities = data_entities + [
+            {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
+            for ses, sub, task in product(
+                MSC_SESSIONS, MSC_SUBJECTS, MSC_TASKS
+            )
+        ]
+    if 'HCP' in DATASETS:
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_template.txt', 'r') as f:
+            hcp_subjects = f.read().splitlines()
+        data_entities = data_entities + [
+            {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
+            for run, sub, task in product(
+                ('LR', 'RL'), hcp_subjects, HCP_TASKS
+            )
+        ]
+    num_entities = len(data_entities)
     num_entities = len(data_entities)
     coor_L, coor_R = get_coors()
     plot_f = visdef()
@@ -368,21 +402,40 @@ def main(
     meta_acc = {}
     for i in range(start_epoch + 1, MAX_EPOCH + 1):
         key_e = jax.random.fold_in(key, i)
-        session, subject = data_entities[i % num_entities]
-        print(f'Epoch {i} (sub-{subject} ses-{session})')
+        entity = data_entities[i % num_entities]
+
         try:
+            ds = entity.get('ds')
             # The encoder will handle data normalisation and GSR
-            T = _get_data(
-                get_msc_dataset(subject, session),
-                normalise=False,
-                gsr=False,
-            )
+            if ds == 'MSC':
+                subject = entity.get('subject')
+                session = entity.get('session')
+                task = entity.get('task')
+                T = _get_data(
+                    *get_msc_dataset(subject, session, task, get_confounds=True,),
+                    normalise=False,
+                    gsr=False,
+                    pad_to_size=WINDOW_SIZE,
+                    key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
+                )
+            elif ds == 'HCP':
+                subject = entity.get('subject')
+                session = entity.get('run')
+                task = entity.get('task')
+                T = _get_data(
+                    *get_hcp_dataset(subject, session, task, get_confounds=True,),
+                    normalise=False,
+                    gsr=False,
+                    pad_to_size=WINDOW_SIZE,
+                    key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
+                )
         except FileNotFoundError:
             print(
-                f'Data entity sub-{subject} ses-{session} is absent. '
+                f'Data entity {entity} is absent. '
                 'Skipping'
             )
             continue
+        print(f'Epoch {i} (ds-{ds} sub-{subject} ses-{session} task-{task})')
         if jnp.any(jnp.isnan(T)):
             print(
                 f'Invalid data for entity sub-{subject} ses-{session}. '
