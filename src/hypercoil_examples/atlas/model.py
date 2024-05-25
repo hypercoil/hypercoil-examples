@@ -20,7 +20,12 @@ from numpyro.distributions import Distribution
 from scipy.special import softmax
 
 from hypercoil.engine import Tensor, _to_jax_array
-from hypercoil.functional import residualise, spherical_geodesic
+from hypercoil.functional import (
+    corr,
+    residualise,
+    spherical_geodesic,
+    sym2vec,
+)
 from hypercoil.init import VonMisesFisher
 from hypercoil.loss.functional import entropy
 
@@ -874,6 +879,9 @@ def forward(
     point_potentials_nu: float = 1.,
     doublet_potentials_nu: float = 1.,
     mass_potentials_nu: float = 1.,
+    classifier_nu: float = 0.,
+    classifier_target: Optional[Tensor] = None,
+    readout_name: Optional[str] = None,
     temperature: float = 1.,
     inference: bool = False,
     encoder_type: Literal['64x64', '3res'] = '64x64',
@@ -907,13 +915,13 @@ def forward(
         meta = {**meta, 'energy': energy}
     if recon_nu != 0:
         start, size = encoder.temporal.encoders[0].limits[compartment]
-        T = T[..., start:(start + size), :]
+        Tc = T[..., start:(start + size), :]
         parcel_ts = jnp.linalg.lstsq(
             P[compartment].swapaxes(-2, -1),
-            T,
+            Tc,
         )[0]
         recon_error = recon_nu * jnp.linalg.norm(
-            P[compartment].swapaxes(-2, -1) @ parcel_ts - T
+            P[compartment].swapaxes(-2, -1) @ parcel_ts - Tc
         )
         meta = {**meta, 'recon_error': recon_error}
     else:
@@ -953,7 +961,31 @@ def forward(
             model.approximator.meshes[compartment].icospheres[0],
         ).mean()
         meta = {**meta, 'template_energy': template_energy}
-    return energy + recon_error + tether + div, meta
+    else:
+        template_energy = 0
+    if classifier_nu != 0:
+        start, size = encoder.temporal.encoders[0].limits[compartment]
+        Tc = T[..., start:(start + size), :]
+        parcel_ts = jnp.linalg.lstsq(
+            P[compartment].swapaxes(-2, -1),
+            Tc,
+        )[0]
+        parcel_adjvec = sym2vec(corr(parcel_ts))
+        prediction = jax.nn.log_softmax(
+            model.readouts[readout_name] @ parcel_adjvec
+        )
+        pred_error = -(classifier_target * prediction).sum()
+        meta = {**meta, 'prediction_error': pred_error}
+    else:
+        pred_error = 0
+    return (
+        energy +
+        template_energy +
+        recon_error +
+        tether +
+        div +
+        pred_error
+    ), meta
 
 
 def logit_normal_divergence(

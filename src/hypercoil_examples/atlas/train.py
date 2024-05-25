@@ -8,7 +8,7 @@ Training loop for the parcellation model
 """
 import pickle
 from itertools import product
-from typing import Optional
+from typing import Any, Mapping, Optional, Tuple
 
 import equinox as eqx
 import jax
@@ -26,6 +26,7 @@ from hypercoil_examples.atlas.data import (
 from hypercoil_examples.atlas.model import (
     init_full_model,
     forward,
+    ForwardParcellationModel,
     Tensor,
 )
 from hypercoil_examples.atlas.positional import (
@@ -51,7 +52,7 @@ SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 SEED = 0
 
-REPORT_INTERVAL = 100
+REPORT_INTERVAL = 150
 CHECKPOINT_INTERVAL = 1723
 MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
@@ -71,13 +72,14 @@ VISUALISE_TEMPLATE = True
 VISUALISE_SINGLE = True
 
 ELLGAT_DROPOUT = 0.1
-ENERGY_NU = 10.
+ENERGY_NU = 1.
 RECON_NU = 1.
 TETHER_NU = 1.
 DIV_NU = 1e3
+CLASSIFIER_NU = 1.
 TEMPLATE_ENERGY_NU = 1.
 POINT_POTENTIALS_NU = 1.
-DOUBLET_POTENTIALS_NU = 2.
+DOUBLET_POTENTIALS_NU = 10.
 MASS_POTENTIALS_NU = 100.
 VMF_SPATIAL_KAPPA = 50.
 VMF_SELECTIVITY_KAPPA = 20.
@@ -118,6 +120,7 @@ WINDOW_SAMPLER = None
 
 DATA_SHUFFLE_KEY = 7834
 DATA_SAMPLER_KEY = 9902
+READOUT_INIT_KEY = 5310
 
 
 #jax.config.update('jax_debug_nans', True)
@@ -238,13 +241,20 @@ def update(
     encoder_result,
     epoch,
     pathway,
-    temperature,
-    key,
+    temperature: float = 1.,
+    classify: Optional[Tuple[str, Tensor]] = None,
+    key: 'jax.random.PRNGKey',
 ):
     #if compartment == 'cortex_R': jax.config.update('jax_debug_nans', True)
     template_energy_nu = (
         TEMPLATE_ENERGY_NU if pathway == 'regulariser' else 0.
     )
+    if classify is not None:
+        classifier_nu = CLASSIFIER_NU
+        readout_name, classifier_target = classify
+    else:
+        classifier_nu = 0
+        readout_name = classifier_target = None
     try:
         (loss, meta), grad = forward_backward(
         #forward(
@@ -262,6 +272,9 @@ def update(
             point_potentials_nu=POINT_POTENTIALS_NU,
             doublet_potentials_nu=DOUBLET_POTENTIALS_NU,
             mass_potentials_nu=MASS_POTENTIALS_NU,
+            classifier_nu=classifier_nu,
+            classifier_target=classifier_target,
+            readout_name=readout_name,
             encoder_type=ENCODER_ARCH,
             injection_points=SERIAL_INJECTION_SITES,
             temperature=temperature,
@@ -324,10 +337,34 @@ def accumulate_metadata(
     return meta_acc, epoch_complete, old_meta_acc, epoch_loss
 
 
+def add_readouts(
+    model: ForwardParcellationModel,
+    num_parcels: int,
+    key: 'jax.random.PRNGKey',
+):
+    in_dim = int(num_parcels * (num_parcels - 1) / 2)
+    keys = jax.random.split(key)
+    readouts = {
+        'HCP': jax.random.normal(keys[0], shape=(len(HCP_TASKS), in_dim)),
+        'MSC': jax.random.normal(keys[1], shape=(len(MSC_TASKS), in_dim)),
+    }
+
+    class ForwardParcellationModelWithReadouts(ForwardParcellationModel):
+        regulariser: Mapping[str, eqx.Module]
+        approximator: eqx.Module
+        readouts: Mapping[str, Tensor]
+
+    return ForwardParcellationModelWithReadouts(
+        regulariser=model.regulariser,
+        approximator=model.approximator,
+        readouts=readouts
+    )
+
+
 def main(
     num_parcels: int = 200,
     start_epoch: Optional[int] = None,
-    classify_task: bool = False,
+    classify_task: bool = True,
 ):
     key = jax.random.PRNGKey(SEED)
     data_entities = []
@@ -372,6 +409,12 @@ def main(
         selectivity_kappa=VMF_SELECTIVITY_KAPPA,
         dropout=ELLGAT_DROPOUT,
     )
+    if classify_task:
+        model = add_readouts(
+            model,
+            num_parcels=num_parcels,
+            key=jax.random.fold_in(key, READOUT_INIT_KEY),
+        )
     #encode = encoder
     encode = eqx.filter_jit(encoder)
     opt = optax.adamw(learning_rate=LEARNING_RATE)
@@ -483,6 +526,13 @@ def main(
                     f'ses-{session}. Skipping'
                 )
                 continue
+            if classify_task:
+                readout_name = ds
+                tasks = HCP_TASKS if ds =='HCP' else MSC_TASKS
+                classifier_target = jnp.zeros((len(tasks))).at[tasks.index(task)].set(1.)
+                classifier_args = (readout_name, classifier_target)
+            else:
+                classifier_args = None
             key_l, key_r = jax.random.split(key_e)
             temperatures = [
                 temperature_sampler(
@@ -505,6 +555,7 @@ def main(
                         encoder_result=encoder_result,
                         epoch=i,
                         pathway=pathway,
+                        classify=classifier_args if pathway == 'full' else None,
                         temperature=temperature,
                         key=key_l,
                     )
@@ -518,6 +569,7 @@ def main(
                         encoder_result=encoder_result,
                         epoch=i,
                         pathway=pathway,
+                        classify=classifier_args if pathway == 'full' else None,
                         temperature=temperature,
                         key=key_r,
                     )
