@@ -42,48 +42,51 @@ def empty_promises(
     Details of the original ProMises algorithm can be found in the paper:
     https://onlinelibrary.wiley.com/doi/full/10.1002/hbm.26170
     """
-    X, M = X.T, M.T
-    _, _, Q = jnp.linalg.svd(X, full_matrices=False)
-    _, _, P = jnp.linalg.svd(M, full_matrices=False)
-    Z = X @ Q.T
-    N = M @ P.T
-    spatial_prior_data = jnp.broadcast_to(
-        spatial_prior_data,
-        spatial_prior_loc.shape,
-    )
-    spatial_prior_data = jnp.where(
-        spatial_prior_loc == -1,
-        0.,
-        spatial_prior_data,
-    )
-    spatial_prior_loc = jnp.where(
-        spatial_prior_loc == -1,
-        0,
-        spatial_prior_loc,
-    )[..., None]
-    spatial_prior = sparse.BCOO(
-        (
+    if M is not None:
+        X, M = X.T, M.T
+        _, _, Q = jnp.linalg.svd(X, full_matrices=False)
+        _, _, P = jnp.linalg.svd(M, full_matrices=False)
+        Z = X @ Q.T
+        N = M @ P.T
+        spatial_prior_data = jnp.broadcast_to(
             spatial_prior_data,
+            spatial_prior_loc.shape,
+        )
+        spatial_prior_data = jnp.where(
+            spatial_prior_loc == -1,
+            0.,
+            spatial_prior_data,
+        )
+        spatial_prior_loc = jnp.where(
+            spatial_prior_loc == -1,
+            0,
             spatial_prior_loc,
-        ),
-        shape=2 * (spatial_prior_loc.shape[0],),
-    )
-    spatial_prior = (
-        Q @ spatial_prior @ P.T + (P @ spatial_prior @ Q.T).T
-    ) / 2
-    U, _, V = jnp.linalg.svd(
-        #N.T @ Z +
-        Z.T @ N +
-        spatial_prior_weight * spatial_prior,
-    )
-    R = U @ V
-    #assert 0
-    Z = Z @ R
-    X = Z @ P
-    if cotransport is not None:
-        cotransport = [P.T @ R.T @ (Q @ C) for C in cotransport]
-        # TODO: We must correct for the Jacobian of the transformation, since
-        #       we're mostly cotransporting probabilities.
+        )[..., None]
+        spatial_prior = sparse.BCOO(
+            (
+                spatial_prior_data,
+                spatial_prior_loc,
+            ),
+            shape=2 * (spatial_prior_loc.shape[0],),
+        )
+        spatial_prior = (
+            Q @ spatial_prior @ P.T + (P @ spatial_prior @ Q.T).T
+        ) / 2
+        U, _, V = jnp.linalg.svd(
+            #N.T @ Z +
+            Z.T @ N +
+            spatial_prior_weight * spatial_prior,
+        )
+        R = U @ V
+        #assert 0
+        Z = Z @ R
+        X = Z @ P
+        if cotransport is not None:
+            cotransport = [P.T @ R.T @ (Q @ C) for C in cotransport]
+            # TODO: We must correct for the Jacobian of the transformation,
+            #       since we're mostly cotransporting probabilities.
+    else:
+        M = X = X.T
     new_update_weight = update_weight + 1
     if new_M is None:
         new_M = jnp.zeros_like(M).T
