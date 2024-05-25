@@ -45,28 +45,34 @@ from hyve import (
     save_figure,
 )
 
-LEARNING_RATE = 0.002
+LEARNING_RATE = 0.0002
 MAX_EPOCH = 24000
 ENCODER_ARCH = '64x64'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 SEED = 0
 
-REPORT_INTERVAL = 240
-CHECKPOINT_INTERVAL = 240
+REPORT_INTERVAL = 200
+CHECKPOINT_INTERVAL = 200
+EPOCH_SIZE = {'HCP': 5, 'MSC': 5}
+VAL_SIZE = {'HCP': 5, 'MSC': 5}
 EPOCH_SIZE = {'HCP': 500, 'MSC': 100}
-MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+VAL_SIZE = {'HCP': 160, 'MSC': 160}
+#MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
-MSC_SUBJECTS = ('01', '02', '03', '08')
-MSC_TASKS = (
-    'rest', 'motor_run-01', 'motor_run-02',
-    'glasslexical_run-01', 'glasslexical_run-02',
-    'memoryfaces', 'memoryscenes', 'memorywords',
-)
-HCP_TASKS = (
-    'REST1', 'REST2', 'EMOTION', 'GAMBLING',
-    'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
-)
+MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
+MSC_SUBJECTS_VAL = ('04', '07')
+TASKS = {
+    'MSC': (
+        'rest', 'motor_run-01', 'motor_run-02',
+        'glasslexical_run-01', 'glasslexical_run-02',
+        'memoryfaces', 'memoryscenes', 'memorywords',
+    ),
+    'HCP': (
+        'REST1', 'REST2', 'EMOTION', 'GAMBLING',
+        'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
+    ),
+}
 DATASETS = ('HCP', 'MSC')
 VISPATH = 'full'
 VISUALISE_TEMPLATE = True
@@ -77,7 +83,7 @@ ENERGY_NU = 1.
 RECON_NU = 1.
 TETHER_NU = 1.
 DIV_NU = 1e3
-CLASSIFIER_NU = 1.
+CLASSIFIER_NU = 5.
 TEMPLATE_ENERGY_NU = 1.
 POINT_POTENTIALS_NU = 1.
 DOUBLET_POTENTIALS_NU = 10.
@@ -125,6 +131,7 @@ READOUT_INIT_KEY = 5310
 
 
 #jax.config.update('jax_debug_nans', True)
+forward_eval = eqx.filter_jit(forward)
 forward_backward = eqx.filter_value_and_grad(
     eqx.filter_jit(forward),
     #forward,
@@ -344,10 +351,10 @@ def add_readouts(
     key: 'jax.random.PRNGKey',
 ):
     in_dim = int(num_parcels * (num_parcels - 1) / 2)
-    keys = jax.random.split(key)
+    keys = jax.random.split(key, len(TASKS.keys()))
     readouts = {
-        'HCP': jax.random.normal(keys[0], shape=(len(HCP_TASKS), in_dim)),
-        'MSC': jax.random.normal(keys[1], shape=(len(MSC_TASKS), in_dim)),
+        ds: jax.random.normal(keys[i], shape=(len(tasks), in_dim))
+        for i, (ds, tasks) in enumerate(TASKS.items())
     }
 
     class ForwardParcellationModelWithReadouts(ForwardParcellationModel):
@@ -369,26 +376,46 @@ def main(
 ):
     key = jax.random.PRNGKey(SEED)
     data_entities = {}
+    val_entities = {}
     if 'MSC' in DATASETS:
         data_entities = {**data_entities, 'MSC': [
             {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
             for ses, sub, task in product(
-                MSC_SESSIONS, MSC_SUBJECTS, MSC_TASKS
+                MSC_SESSIONS, MSC_SUBJECTS_TRAIN, TASKS['MSC']
+            )
+        ]}
+        val_entities = {**val_entities, 'MSC': [
+            {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
+            for ses, sub, task in product(
+                MSC_SESSIONS, MSC_SUBJECTS_VAL, TASKS['MSC']
             )
         ]}
     if 'HCP' in DATASETS:
         with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_train.txt', 'r') as f:
-            hcp_subjects = f.read().splitlines()
+            hcp_subjects_train = f.read().splitlines()
         data_entities = {**data_entities, 'HCP': [
             {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
             for run, sub, task in product(
-                ('LR', 'RL'), hcp_subjects, HCP_TASKS
+                ('LR', 'RL'), hcp_subjects_train, TASKS['HCP']
+            )
+        ]}
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_val.txt', 'r') as f:
+            hcp_subjects_val = f.read().splitlines()
+        val_entities = {**val_entities, 'HCP': [
+            {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
+            for run, sub, task in product(
+                ('LR', 'RL'), hcp_subjects_val, TASKS['HCP']
             )
         ]}
     num_entities = {
         **{k: len(v) for k, v in data_entities.items()},
         'total': sum([len(v) for v in data_entities.values()]),
     }
+    # Crude. We should at least make sure our classes are appropriately
+    # represented.
+    val_entities = sum(
+        [val_entities[ds][:VAL_SIZE[ds]] for ds in DATASETS], []
+    )
     coor_L, coor_R = get_coors()
     plot_f = visdef()
     # The encoder will handle data normalisation and GSR
@@ -416,6 +443,7 @@ def main(
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
     losses = []
     epoch_history = []
+    epoch_history_val = []
     coor = {
         'cortex_L': coor_L,
         'cortex_R': coor_R,
@@ -445,9 +473,16 @@ def main(
                 epoch_history = pickle.load(f)
         except FileNotFoundError:
             print('No epoch history found--starting new record')
+        try:
+            with open('/tmp/epoch_history_val.pkl', 'rb') as f:
+                epoch_history_val = pickle.load(f)
+        except FileNotFoundError:
+            print('No evaluation history found--starting new record')
     else:
         start_epoch = -1
+    last_report = last_checkpoint = start_epoch
     meta_acc = {}
+    meta_acc_val = {}
     avail_entities = {k: [] for k in EPOCH_SIZE}
     for i in range(start_epoch + 1, MAX_EPOCH + 1):
         key_e = jax.random.fold_in(key, i)
@@ -555,7 +590,7 @@ def main(
                     continue
                 if classify_task:
                     readout_name = ds
-                    tasks = HCP_TASKS if ds =='HCP' else MSC_TASKS
+                    tasks = TASKS[ds]
                     classifier_target = jnp.zeros((len(tasks))).at[tasks.index(task)].set(1.)
                     classifier_args = (readout_name, classifier_target)
                 else:
@@ -629,12 +664,13 @@ def main(
             print('\n'.join([f'[]{q}: {z}' for q, z in meta.items()]))
             (
                 meta_acc, epoch_complete, old_meta_acc, epoch_loss
-            ) = accumulate_metadata(meta_acc, meta, k, total_epoch_size)
+            ) = accumulate_metadata(meta_acc, meta, k + 1, total_epoch_size)
             if epoch_complete:
                 epoch_history += [(epoch_loss, old_meta_acc)]
                 with open('/tmp/epoch_history.pkl', 'wb') as f:
                     pickle.dump(epoch_history, f)
-            if k % REPORT_INTERVAL == 0:
+            if (k - last_report) // REPORT_INTERVAL > 0:
+                last_report += REPORT_INTERVAL
                 if VISUALISE_TEMPLATE:
                     visualise(
                         name=f'MRF_pass-{k}',
@@ -680,16 +716,161 @@ def main(
                         log_prob_R=P['cortex_R'].T,
                         plot_f=plot_f,
                     )
-                if k % CHECKPOINT_INTERVAL == 0:
-                    print('Serialising model and optimiser state for checkpoint')
-                    eqx.tree_serialise_leaves(
-                        f'/tmp/parcellation_model_checkpoint{k}',
-                        model,
+            if (k - last_checkpoint) // CHECKPOINT_INTERVAL > 0:
+                last_checkpoint += CHECKPOINT_INTERVAL
+                print('Serialising model and optimiser state for checkpoint')
+                eqx.tree_serialise_leaves(
+                    f'/tmp/parcellation_model_checkpoint{k}',
+                    model,
+                )
+                eqx.tree_serialise_leaves(
+                    f'/tmp/parcellation_optim_checkpoint{k}',
+                    opt_state,
+                )
+
+        # EVALUATION
+        for j in range(len(val_entities)):
+            k = i * len(val_entities) + j
+            entity = val_entities[j]
+
+            try:
+                ds = entity.get('ds')
+                # The encoder will handle data normalisation and GSR
+                if ds == 'MSC':
+                    subject = entity.get('subject')
+                    session = entity.get('session')
+                    task = entity.get('task')
+                    T = _get_data(
+                        *get_msc_dataset(subject, session, task, get_confounds=True,),
+                        normalise=False,
+                        gsr=False,
+                        pad_to_size=WINDOW_SIZE,
+                        key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
                     )
-                    eqx.tree_serialise_leaves(
-                        f'/tmp/parcellation_optim_checkpoint{k}',
-                        opt_state,
+                elif ds == 'HCP':
+                    subject = entity.get('subject')
+                    session = entity.get('run')
+                    task = entity.get('task')
+                    T = _get_data(
+                        *get_hcp_dataset(subject, session, task, get_confounds=True,),
+                        normalise=False,
+                        gsr=False,
+                        pad_to_size=WINDOW_SIZE,
+                        key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
                     )
+            except FileNotFoundError:
+                print(
+                    f'Data entity {entity} is absent. '
+                    'Skipping'
+                )
+                continue
+            print(f'Evaluation {i} / Pass {k} (ds-{ds} sub-{subject} ses-{session} task-{task})')
+            if jnp.any(jnp.isnan(T)):
+                print(
+                    f'Invalid data for entity sub-{subject} ses-{session}. '
+                    'Skipping'
+                )
+                breakpoint()
+                continue
+            meta = {}
+            T = jnp.where(
+                jnp.isclose(T.std(-1), 0)[..., None],
+                jax.random.normal(jax.random.fold_in(key_e, 54), T.shape),
+                T,
+            )
+            encoder_result = encode(
+                T=T,
+                coor_L=coor_L,
+                coor_R=coor_R,
+                M=template,
+            )
+            if any([
+                jnp.any(jnp.isnan(encoder_result[0][m][compartment])).item()
+                for compartment in ('cortex_L', 'cortex_R')
+                for m in range(3)
+            ]):
+                print(
+                    f'Invalid encoding for entity sub-{subject} '
+                    f'ses-{session}. Skipping'
+                )
+                continue
+            if classify_task:
+                readout_name = ds
+                tasks = TASKS[ds]
+                classifier_target = jnp.zeros((len(tasks))).at[tasks.index(task)].set(1.)
+                classifier_args = (readout_name, classifier_target)
+            else:
+                classifier_args = None
+            key_l, key_r = jax.random.split(key_e)
+            temperatures = [
+                temperature_sampler(
+                    jax.random.fold_in(key_e, (s + 1) * temperature_seed),
+                )
+                for s in range(n_temperature_samples)
+            ]
+            for w, temperature in enumerate(temperatures):
+                meta_call = {'cortex_L': {}, 'cortex_R': {}}
+                val_loss = {}
+                #loss_ = 0
+                for pathway in PATHWAYS:
+                    for compartment in ('cortex_L', 'cortex_R'):
+                        val_loss[compartment], meta_call[compartment][pathway] = forward_eval(
+                            model,
+                            coor=coor,
+                            encoder_result=encoder_result,
+                            encoder=encoder,
+                            compartment=compartment,
+                            mode=pathway,
+                            energy_nu=ENERGY_NU,
+                            recon_nu=RECON_NU,
+                            tether_nu=TETHER_NU,
+                            div_nu=DIV_NU,
+                            template_energy_nu=TEMPLATE_ENERGY_NU,
+                            point_potentials_nu=POINT_POTENTIALS_NU,
+                            doublet_potentials_nu=DOUBLET_POTENTIALS_NU,
+                            mass_potentials_nu=MASS_POTENTIALS_NU,
+                            classifier_nu=CLASSIFIER_NU,
+                            classifier_target=classifier_target,
+                            readout_name=ds,
+                            encoder_type=ENCODER_ARCH,
+                            injection_points=SERIAL_INJECTION_SITES,
+                            temperature=temperature,
+                            inference=True,
+                            key=key,
+                        )
+                    #loss_ += (loss_L + loss_R)
+                meta_call = {
+                    compartment: {
+                        f'{z}_{p}': v
+                        for p, e in loss_meta.items()
+                        for z, v in e.items()
+                    }
+                    for compartment, loss_meta in meta_call.items()
+                }
+                meta_call = {
+                    c: meta_call['cortex_L'][c] + meta_call['cortex_R'][c]
+                    for c in meta_call['cortex_L']
+                }
+                (
+                    meta, _, new_meta, loss_
+                ) = accumulate_metadata(
+                    meta,
+                    meta_call,
+                    w + 1,
+                    n_temperature_samples,
+                    print_results=False,
+                )
+            meta = new_meta
+            losses += [loss_]
+            print('\n'.join([f'[]{q}: {z}' for q, z in meta.items()]))
+            (
+                meta_acc_val, epoch_complete, old_meta_acc, epoch_loss
+            ) = accumulate_metadata(meta_acc_val, meta, k + 1, len(val_entities))
+            if epoch_complete:
+                epoch_history_val += [(epoch_loss, old_meta_acc)]
+                with open('/tmp/epoch_history_val.pkl', 'wb') as f:
+                    pickle.dump(epoch_history_val, f)
+
     jnp.save('/tmp/cortexL.npy', P['cortex_L'], allow_pickle=False)
     jnp.save('/tmp/cortexR.npy', P['cortex_R'], allow_pickle=False)
     import matplotlib.pyplot as plt
