@@ -45,17 +45,17 @@ from hyve import (
 )
 
 LEARNING_RATE = 0.002
-MAX_EPOCH = 19600
+MAX_EPOCH = 27568
 ENCODER_ARCH = '64x64'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 SEED = 0
 
-REPORT_INTERVAL = 196
-CHECKPOINT_INTERVAL = 196
+REPORT_INTERVAL = 100
+CHECKPOINT_INTERVAL = 1723
 MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
-MSC_SUBJECTS = ('05', '06')
+MSC_SUBJECTS = ('01', '02', '03', '08')
 MSC_TASKS = (
     'rest', 'motor_run-01', 'motor_run-02',
     'glasslexical_run-01', 'glasslexical_run-02',
@@ -71,7 +71,7 @@ VISUALISE_TEMPLATE = True
 VISUALISE_SINGLE = True
 
 ELLGAT_DROPOUT = 0.1
-ENERGY_NU = 1.
+ENERGY_NU = 10.
 RECON_NU = 1.
 TETHER_NU = 1.
 DIV_NU = 1e3
@@ -116,6 +116,7 @@ WINDOW_SAMPLER = (
 )
 WINDOW_SAMPLER = None
 
+DATA_SHUFFLE_KEY = 7834
 DATA_SAMPLER_KEY = 9902
 
 
@@ -326,6 +327,7 @@ def accumulate_metadata(
 def main(
     num_parcels: int = 200,
     start_epoch: Optional[int] = None,
+    classify_task: bool = False,
 ):
     key = jax.random.PRNGKey(SEED)
     data_entities = []
@@ -337,7 +339,7 @@ def main(
             )
         ]
     if 'HCP' in DATASETS:
-        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_template.txt', 'r') as f:
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_train.txt', 'r') as f:
             hcp_subjects = f.read().splitlines()
         data_entities = data_entities + [
             {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
@@ -346,7 +348,15 @@ def main(
             )
         ]
     num_entities = len(data_entities)
-    num_entities = len(data_entities)
+    data_entities = [
+        data_entities[e]
+        for e in jax.random.choice(
+            jax.random.fold_in(key, DATA_SHUFFLE_KEY),
+            num_entities,
+            shape=(num_entities,),
+            replace=False,
+        )
+    ]
     coor_L, coor_R = get_coors()
     plot_f = visdef()
     # The encoder will handle data normalisation and GSR
