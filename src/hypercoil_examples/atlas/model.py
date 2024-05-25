@@ -490,7 +490,7 @@ class ForwardParcellationModel(eqx.Module):
                         else None
                     ),
                     (
-                        energy[compartment]
+                        -energy[compartment]
                         if 'residual' in injection_points
                         else None
                     ),
