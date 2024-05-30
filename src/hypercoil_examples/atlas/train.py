@@ -45,7 +45,7 @@ from hyve import (
     save_figure,
 )
 
-LEARNING_RATE = 0.0002
+LEARNING_RATE = 0.00002
 MAX_EPOCH = 24000
 ENCODER_ARCH = '64x64'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
@@ -130,7 +130,7 @@ DATA_SAMPLER_KEY = 9902
 READOUT_INIT_KEY = 5310
 
 
-#jax.config.update('jax_debug_nans', True)
+jax.config.update('jax_debug_nans', True)
 forward_eval = eqx.filter_jit(forward)
 forward_backward = eqx.filter_value_and_grad(
     eqx.filter_jit(forward),
@@ -141,6 +141,10 @@ forward_backward_bkp = eqx.filter_value_and_grad(
     forward,
     has_aux=True,
 )
+
+
+class InvalidValueException(FloatingPointError):
+    pass
 
 
 def visdef():
@@ -307,6 +311,7 @@ def update(
     if jnp.isnan(loss) or jnp.isinf(loss):
         print(f'NaN or infinite loss at epoch {epoch}. Skipping update')
         print(meta)
+        raise InvalidValueException
         return model, opt_state, None, {}
     updates, opt_state = opt.update(
         eqx.filter(grad, eqx.is_inexact_array),
@@ -371,7 +376,7 @@ def add_readouts(
 
 def main(
     num_parcels: int = 200,
-    start_epoch: Optional[int] = None,
+    start_epoch: Optional[int] = 16799,
     classify_task: bool = True,
 ):
     key = jax.random.PRNGKey(SEED)
@@ -416,6 +421,7 @@ def main(
     val_entities = sum(
         [val_entities[ds][:VAL_SIZE[ds]] for ds in DATASETS], []
     )
+    total_epoch_size = sum(EPOCH_SIZE.values())
     coor_L, coor_R = get_coors()
     plot_f = visdef()
     # The encoder will handle data normalisation and GSR
@@ -478,9 +484,10 @@ def main(
                 epoch_history_val = pickle.load(f)
         except FileNotFoundError:
             print('No evaluation history found--starting new record')
+        start_epoch = start_epoch // total_epoch_size
     else:
         start_epoch = -1
-    last_report = last_checkpoint = start_epoch
+    last_report = last_checkpoint = ((start_epoch + 1) * total_epoch_size)
     meta_acc = {}
     meta_acc_val = {}
     avail_entities = {k: [] for k in EPOCH_SIZE}
@@ -491,7 +498,7 @@ def main(
                 avail_entities[k] = avail_entities.get(k, []) + [
                     data_entities[k][e]
                     for e in jax.random.choice(
-                        jax.random.fold_in(key, j * DATA_SHUFFLE_KEY),
+                        jax.random.fold_in(key, i * j * DATA_SHUFFLE_KEY),
                         num_entities[k],
                         shape=(num_entities[k],),
                         replace=False,
@@ -501,7 +508,6 @@ def main(
             avail_entities[k][:v]
             for k, v in EPOCH_SIZE.items()
         ], [])
-        total_epoch_size = sum(EPOCH_SIZE.values())
         avail_entities = {
             k: avail_entities[k][v:]
             for k, v in EPOCH_SIZE.items()
@@ -607,34 +613,40 @@ def main(
                     meta_R_call = {}
                     #loss_ = 0
                     for pathway in PATHWAYS:
-                        model, opt_state, loss_L, meta_L_call[pathway] = update(
-                            model=model,
-                            opt_state=opt_state,
-                            opt=opt,
-                            compartment='cortex_L',
-                            coor=coor,
-                            encoder=encoder,
-                            encoder_result=encoder_result,
-                            epoch=k,
-                            pathway=pathway,
-                            classify=classifier_args if pathway == 'full' else None,
-                            temperature=temperature,
-                            key=key_l,
-                        )
-                        model, opt_state, loss_R, meta_R_call[pathway] = update(
-                            model=model,
-                            opt_state=opt_state,
-                            opt=opt,
-                            compartment='cortex_R',
-                            coor=coor,
-                            encoder=encoder,
-                            encoder_result=encoder_result,
-                            epoch=k,
-                            pathway=pathway,
-                            classify=classifier_args if pathway == 'full' else None,
-                            temperature=temperature,
-                            key=key_r,
-                        )
+                        try:
+                            model, opt_state, loss_L, meta_L_call[pathway] = update(
+                                model=model,
+                                opt_state=opt_state,
+                                opt=opt,
+                                compartment='cortex_L',
+                                coor=coor,
+                                encoder=encoder,
+                                encoder_result=encoder_result,
+                                epoch=k,
+                                pathway=pathway,
+                                classify=classifier_args if pathway == 'full' else None,
+                                temperature=temperature,
+                                key=key_l,
+                            )
+                        except InvalidValueException:
+                            continue
+                        try:
+                            model, opt_state, loss_R, meta_R_call[pathway] = update(
+                                model=model,
+                                opt_state=opt_state,
+                                opt=opt,
+                                compartment='cortex_R',
+                                coor=coor,
+                                encoder=encoder,
+                                encoder_result=encoder_result,
+                                epoch=k,
+                                pathway=pathway,
+                                classify=classifier_args if pathway == 'full' else None,
+                                temperature=temperature,
+                                key=key_r,
+                            )
+                        except InvalidValueException:
+                            continue
                         #loss_ += (loss_L + loss_R)
                     meta_L_call = {
                         f'{z}_{p}': v
