@@ -26,11 +26,11 @@ from hypercoil.functional import (
     spherical_geodesic,
     sym2vec,
 )
-from hypercoil.init import VonMisesFisher
 from hypercoil.loss.functional import entropy
 
 from hypercoil_examples.atlas.aligned_dccc import param_bimodal_beta
-from hypercoil_examples.atlas.ellgat import UnitSphereNorm
+from hypercoil_examples.atlas.beta import VMFCompat
+from hypercoil_examples.atlas.ellgat import UnitSphereNorm, ELLGATCompat, ELLGATBlock
 from hypercoil_examples.atlas.encoders import (
     create_icosphere_encoder,
     create_consensus_encoder,
@@ -48,6 +48,10 @@ from hypercoil_examples.atlas.selectransform import (
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
 VMF_BASE_KAPPA = 10
+BLOCK_ARCH = {
+    'ELLGAT': ELLGATCompat,
+    'ELLGATBlock': ELLGATBlock,
+}
 
 
 class EmptyPromises(eqx.Module):
@@ -537,8 +541,8 @@ def vmf_mle_mu_only(
     Q: Tensor,
     data: Tensor,
     norm_f: Optional[callable] = None,
-    src_distr: Optional[VonMisesFisher] = None,
-) -> VonMisesFisher:
+    src_distr: Optional[VMFCompat] = None,
+) -> VMFCompat:
     mu = Q.T @ data
     if norm_f is None:
         mu = mu / jnp.linalg.norm(mu, axis=-1, keepdims=True)
@@ -548,7 +552,7 @@ def vmf_mle_mu_only(
         kappa = src_distr.kappa
     else:
         kappa = VMF_BASE_KAPPA
-    return VonMisesFisher(mu=mu, kappa=kappa, parameterise=False)
+    return VMFCompat(mu=mu, kappa=kappa, parameterise=False)
 
 
 def init_encoder_model(
@@ -611,7 +615,7 @@ def refine_parcels(
     best_delta = float('inf')
     for i in range(num_iter):
         spatial_distribution = {
-            compartment: VonMisesFisher(
+            compartment: VMFCompat(
                 mu=spatial_coor_parcels[compartment],
                 kappa=spatial_kappa,
             )
@@ -652,7 +656,7 @@ def refine_parcels(
         ])
         selectivity_coor_parcels = selectivity_coor_parcels_new
         selectivity_distribution = {
-            compartment: VonMisesFisher(
+            compartment: VMFCompat(
                 mu=selectivity_coor_parcels[compartment],
                 kappa=selectivity_kappa,
             )
@@ -729,8 +733,10 @@ def init_full_model(
     num_parcels: int = 100,
     encoder_type: Literal['64x64', '3res'] = '64x64',
     injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
+    block_arch: Literal['ELLGAT', 'ELLGATBlock'] = 'ELLGATBlock',
     spatial_kappa: float = VMF_BASE_KAPPA,
     selectivity_kappa: float = VMF_BASE_KAPPA,
+    fixed_kappa: bool = True,
     disaffiliation_penalty: float = 1.,
     dropout: float = 0.1,
     key: Optional['jax.random.PRNGKey'] = None,
@@ -788,15 +794,18 @@ def init_full_model(
         selectivity_kappa=selectivity_kappa,
         num_iter=20,
     )
+    if not fixed_kappa:
+        selectivity_kappa = jnp.asarray(num_parcels * [selectivity_kappa], dtype=float)
+        spatial_kappa = jnp.asarray(num_parcels * [spatial_kappa], dtype=float)
     selectivity_distribution = {
-        compartment: VonMisesFisher(
+        compartment: VMFCompat(
             mu=selectivity_coor_parcels[compartment],
             kappa=selectivity_kappa,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
     spatial_distribution = {
-        compartment: VonMisesFisher(
+        compartment: VMFCompat(
             mu=spatial_coor_parcels[compartment],
             kappa=spatial_kappa,
         )
@@ -838,18 +847,26 @@ def init_full_model(
         base_in_dim += num_parcels
     if 'readout' in injection_points:
         readout_skip_dim = num_parcels
+    match block_arch:
+        case 'ELLGAT':
+            in_dim = (base_in_dim + encoder.spatial.default_encoding_dim, 64, 256)
+            hidden_dim = (16, 64, 256)
+        case 'ELLGATBlock':
+            in_dim = (base_in_dim + encoder.spatial.default_encoding_dim, 32, 64)
+            hidden_dim = (8, 16, 64)
+        case _:
+            raise ValueError(f'Unrecognised block architecture {block_arch}')
     approximator = IcoELLGATUNet(
         meshes={
             'cortex_L': mesh_L,
             'cortex_R': mesh_R,
         },
-        #in_dim=(14 + encoder.spatial.default_encoding_dim, 64, 512),
-        in_dim=(base_in_dim + encoder.spatial.default_encoding_dim, 32, 64),
-        #hidden_dim=(16, 64, 256),
-        hidden_dim=(8, 16, 64),
+        in_dim=in_dim,
+        hidden_dim=hidden_dim,
         hidden_readout_dim=num_parcels // 2,
         #attn_heads=(4, 4, 4),
         attn_heads=(4, 4, 4),
+        block_arch=BLOCK_ARCH[block_arch],
         readout_dim=num_parcels,
         #norm=UnitSphereNorm(),
         dropout=dropout,
@@ -880,6 +897,8 @@ def forward(
     point_potentials_nu: float = 1.,
     doublet_potentials_nu: float = 1.,
     mass_potentials_nu: float = 1.,
+    spatial_kappa_energy: Optional[Tuple[float, float, float]] = None,
+    selectivity_kappa_energy: Optional[Tuple[float, float, float]] = None,
     classifier_nu: float = 0.,
     classifier_target: Optional[Tensor] = None,
     readout_name: Optional[str] = None,
@@ -912,6 +931,26 @@ def forward(
     (_, (_, _, _, _, T)) = encoder_result
     P, energy, _ = result
     energy = energy_nu * energy
+    if spatial_kappa_energy is not None:
+        prior, err_large, err_small = spatial_kappa_energy
+        kappa = model.regulariser[compartment].spatial_distribution.kappa
+        kappa_err = kappa - prior
+        energy = energy + jax.lax.cond(
+            kappa_err < 0,
+            lambda err: -err_small * err,
+            lambda err: err_large * err,
+            kappa_err,
+        ).mean()
+    if selectivity_kappa_energy is not None:
+        prior, err_large, err_small = selectivity_kappa_energy
+        kappa = model.regulariser[compartment].selectivity_distribution.kappa
+        kappa_err = kappa - prior
+        energy = energy + jax.lax.cond(
+            kappa_err < 0,
+            lambda err: -err_small * err,
+            lambda err: err_large * err,
+            kappa_err ** 2,
+        ).mean()
     if energy_nu != 0:
         meta = {**meta, 'energy': energy}
     if recon_nu != 0:

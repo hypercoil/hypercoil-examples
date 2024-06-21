@@ -155,6 +155,66 @@ class UnitSphereNorm(eqx.Module):
         return jnp.where(mask, X / norm, 0)
 
 
+class ELLGATCompat(eqx.Module):
+    layers: Tuple[ELLGAT,]
+    nlin: callable = jax.nn.leaky_relu
+    norm: Optional[eqx.Module] = None
+
+    def __init__(
+        self,
+        query_features: int,
+        out_features: int,
+        attn_heads: int = 1,
+        nlin: callable = jax.nn.leaky_relu,
+        norm: Optional[eqx.Module] = None,
+        dropout: Optional[float] = None,
+        dropout_inference: bool = False,
+        key_features: Optional[Union[int, Tuple[int, int]]] = None,
+        *,
+        key: 'jax.random.PRNGKey',
+    ):
+        if not isinstance(key_features, tuple):
+            key_features = (key_features, key_features)
+        self.layers = (
+            ELLGAT(
+                query_features=query_features,
+                key_features=key_features[0],
+                out_features=out_features,
+                attn_heads=attn_heads,
+                nlin=nlin,
+                dropout=dropout,
+                dropout_inference=dropout_inference,
+                key=key,
+            ),
+        )
+        self.nlin = nlin
+        self.norm = norm
+
+    def __call__(
+        self,
+        adj: Tensor,
+        Q: Tensor,
+        K: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        *,
+        inference: Optional[bool] = None,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
+        if isinstance(K, tuple):
+            K1, K2 = K
+        else:
+            K1 = K2 = K
+        Q = self.layers[0](adj, Q, K1, inference=inference, key=key)
+        # Collapse the head and feature dimensions
+        Q = self.nlin(Q).reshape(
+            *Q.shape[:-3],
+            Q.shape[-3] * Q.shape[-2],
+            Q.shape[-1],
+        )
+        if self.norm is not None:
+            Q = self.norm(Q)
+        return Q
+
+
 class ELLGATBlock(eqx.Module):
     layers: Tuple[ELLGAT, ELLGAT]
     nlin: callable = jax.nn.leaky_relu

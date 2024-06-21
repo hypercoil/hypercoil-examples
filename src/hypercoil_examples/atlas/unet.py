@@ -10,14 +10,14 @@ this model is available at
 https://github.com/IndiLab/SUGAR/blob/main/models/gatunet_model.py
 """
 from collections import defaultdict
-from typing import Literal, Mapping, Optional, Tuple
+from typing import Literal, Mapping, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 
 from hypercoil.engine import Tensor
-from hypercoil_examples.atlas.ellgat import ELLGAT, ELLGATBlock
+from hypercoil_examples.atlas.ellgat import ELLGAT, ELLGATBlock, ELLGATCompat
 from hypercoil_examples.atlas.icosphere import (
     connectivity_matrix, icosphere
 )
@@ -204,8 +204,8 @@ class ELLMesh(eqx.Module):
 
 
 class IcoELLGATUNet(eqx.Module):
-    contractive: Tuple[ELLGATBlock]
-    expansive: Tuple[ELLGATBlock]
+    contractive: Tuple[Union[ELLGATCompat, ELLGATBlock]]
+    expansive: Tuple[Union[ELLGATCompat, ELLGATBlock]]
     resample: Mapping[Tuple[int, int], ELLGAT]
     ingress: Mapping[Tuple[int, int], ELLGAT]
     readout: ELLGAT
@@ -226,6 +226,7 @@ class IcoELLGATUNet(eqx.Module):
         dropout: Optional[float] = None,
         dropout_inference: bool = False,
         readout_skip_dim: int = 0,
+        block_arch: Union[ELLGATCompat, ELLGATBlock] = ELLGATBlock,
         *,
         key: 'jax.random.PRNGKey',
     ):
@@ -283,7 +284,7 @@ class IcoELLGATUNet(eqx.Module):
                     key=key_r,
                 )
             contractive.append(
-                ELLGATBlock(
+                block_arch(
                     query_features=contractive_in_dim,
                     out_features=hidden_dim[i],
                     attn_heads=attn_heads[i],
@@ -295,7 +296,7 @@ class IcoELLGATUNet(eqx.Module):
                 )
             )
             expansive.append(
-                ELLGATBlock(
+                block_arch(
                     query_features=(
                         hidden_dim[i] * attn_heads[i] + expansive_in_extra
                     ),

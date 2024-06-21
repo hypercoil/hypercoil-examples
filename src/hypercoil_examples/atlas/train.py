@@ -45,9 +45,10 @@ from hyve import (
     save_figure,
 )
 
-LEARNING_RATE = 0.00002
+LEARNING_RATE = 0.002
 MAX_EPOCH = 24000
 ENCODER_ARCH = '64x64'
+BLOCK_ARCH = 'ELLGAT'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 SEED = 0
@@ -64,15 +65,29 @@ MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
 MSC_SUBJECTS_VAL = ('04', '07')
 TASKS = {
     'MSC': (
-        'rest', 'motor_run-01', 'motor_run-02',
-        'glasslexical_run-01', 'glasslexical_run-02',
-        'memoryfaces', 'memoryscenes', 'memorywords',
+        ('rest', 'rest'),
+        ('motor_run-01', 'motor'),
+        ('motor_run-02', 'motor'),
+        ('glasslexical_run-01', 'glasslexical'),
+        ('glasslexical_run-02', 'glasslexical'),
+        ('memoryfaces', 'memoryfaces'),
+        ('memoryscenes', 'memoryscenes'),
+        ('memorywords', 'memorywords'),
     ),
     'HCP': (
-        'REST1', 'REST2', 'EMOTION', 'GAMBLING',
-        'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
+        ('REST1', 'REST'),
+        ('REST2', 'REST'),
+        ('EMOTION', 'EMOTION'),
+        ('GAMBLING', 'GAMBLING'),
+        ('LANGUAGE', 'LANGUAGE'),
+        ('MOTOR', 'MOTOR'),
+        ('RELATIONAL', 'RELATIONAL'),
+        ('SOCIAL', 'SOCIAL'),
+        ('WM', 'WM'),
     ),
 }
+TASKS_FILES = {k: tuple(v[0] for v in vs) for k, vs in TASKS.items()}
+TASKS_TARGETS = {k: tuple(sorted(set(v[1] for v in vs))) for k, vs in TASKS.items()}
 DATASETS = ('HCP', 'MSC')
 VISPATH = 'full'
 VISUALISE_TEMPLATE = True
@@ -90,6 +105,9 @@ DOUBLET_POTENTIALS_NU = 10.
 MASS_POTENTIALS_NU = 100.
 VMF_SPATIAL_KAPPA = 50.
 VMF_SELECTIVITY_KAPPA = 20.
+FIXED_KAPPA = False
+BIG_KAPPA_NU = 1e-5
+SMALL_KAPPA_NU = 1e0
 
 # Temperature sampler takes the form of a tuple:
 # The first element is the number of samples to take
@@ -267,6 +285,12 @@ def update(
     else:
         classifier_nu = 0
         readout_name = classifier_target = None
+    if FIXED_KAPPA:
+        spatial_kappa_energy = None
+        selectivity_kappa_energy = None
+    else:
+        spatial_kappa_energy = (VMF_SPATIAL_KAPPA, BIG_KAPPA_NU, SMALL_KAPPA_NU)
+        selectivity_kappa_energy = (VMF_SELECTIVITY_KAPPA, BIG_KAPPA_NU, SMALL_KAPPA_NU)
     try:
         (loss, meta), grad = forward_backward(
         #forward(
@@ -356,10 +380,10 @@ def add_readouts(
     key: 'jax.random.PRNGKey',
 ):
     in_dim = int(num_parcels * (num_parcels - 1) / 2)
-    keys = jax.random.split(key, len(TASKS.keys()))
+    keys = jax.random.split(key, len(TASKS_TARGETS.keys()))
     readouts = {
         ds: jax.random.normal(keys[i], shape=(len(tasks), in_dim))
-        for i, (ds, tasks) in enumerate(TASKS.items())
+        for i, (ds, tasks) in enumerate(TASKS_TARGETS.items())
     }
 
     class ForwardParcellationModelWithReadouts(ForwardParcellationModel):
@@ -376,7 +400,7 @@ def add_readouts(
 
 def main(
     num_parcels: int = 200,
-    start_epoch: Optional[int] = 16799,
+    start_epoch: Optional[int] = None,
     classify_task: bool = True,
 ):
     key = jax.random.PRNGKey(SEED)
@@ -386,13 +410,13 @@ def main(
         data_entities = {**data_entities, 'MSC': [
             {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
             for ses, sub, task in product(
-                MSC_SESSIONS, MSC_SUBJECTS_TRAIN, TASKS['MSC']
+                MSC_SESSIONS, MSC_SUBJECTS_TRAIN, TASKS_FILES['MSC']
             )
         ]}
         val_entities = {**val_entities, 'MSC': [
             {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
             for ses, sub, task in product(
-                MSC_SESSIONS, MSC_SUBJECTS_VAL, TASKS['MSC']
+                MSC_SESSIONS, MSC_SUBJECTS_VAL, TASKS_FILES['MSC']
             )
         ]}
     if 'HCP' in DATASETS:
@@ -401,7 +425,7 @@ def main(
         data_entities = {**data_entities, 'HCP': [
             {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
             for run, sub, task in product(
-                ('LR', 'RL'), hcp_subjects_train, TASKS['HCP']
+                ('LR', 'RL'), hcp_subjects_train, TASKS_FILES['HCP']
             )
         ]}
         with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_val.txt', 'r') as f:
@@ -409,7 +433,7 @@ def main(
         val_entities = {**val_entities, 'HCP': [
             {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
             for run, sub, task in product(
-                ('LR', 'RL'), hcp_subjects_val, TASKS['HCP']
+                ('LR', 'RL'), hcp_subjects_val, TASKS_FILES['HCP']
             )
         ]}
     num_entities = {
@@ -432,9 +456,11 @@ def main(
         coor_R=coor_R,
         num_parcels=num_parcels,
         encoder_type=ENCODER_ARCH,
+        block_arch=BLOCK_ARCH,
         injection_points=SERIAL_INJECTION_SITES,
         spatial_kappa=VMF_SPATIAL_KAPPA,
         selectivity_kappa=VMF_SELECTIVITY_KAPPA,
+        fixed_kappa=FIXED_KAPPA,
         dropout=ELLGAT_DROPOUT,
     )
     if classify_task:
@@ -487,7 +513,7 @@ def main(
         start_epoch = start_epoch // total_epoch_size
     else:
         start_epoch = -1
-    last_report = last_checkpoint = ((start_epoch + 1) * total_epoch_size)
+    last_report = last_checkpoint = ((start_epoch + 1) * total_epoch_size - max(REPORT_INTERVAL, CHECKPOINT_INTERVAL) - 1)
     meta_acc = {}
     meta_acc_val = {}
     avail_entities = {k: [] for k in EPOCH_SIZE}
@@ -596,8 +622,9 @@ def main(
                     continue
                 if classify_task:
                     readout_name = ds
-                    tasks = TASKS[ds]
-                    classifier_target = jnp.zeros((len(tasks))).at[tasks.index(task)].set(1.)
+                    tasks = dict(TASKS[ds])
+                    tasks_targets = TASKS_TARGETS[ds]
+                    classifier_target = jnp.zeros((len(tasks_targets))).at[tasks_targets.index(tasks[task])].set(1.)
                     classifier_args = (readout_name, classifier_target)
                 else:
                     classifier_args = None
@@ -808,8 +835,9 @@ def main(
                 continue
             if classify_task:
                 readout_name = ds
-                tasks = TASKS[ds]
-                classifier_target = jnp.zeros((len(tasks))).at[tasks.index(task)].set(1.)
+                tasks = dict(TASKS[ds])
+                tasks_targets = TASKS_TARGETS[ds]
+                classifier_target = jnp.zeros((len(tasks_targets))).at[tasks_targets.index(tasks[task])].set(1.)
                 classifier_args = (readout_name, classifier_target)
             else:
                 classifier_args = None
