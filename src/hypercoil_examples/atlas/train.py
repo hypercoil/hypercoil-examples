@@ -445,7 +445,9 @@ def main(
     val_entities = sum(
         [val_entities[ds][:VAL_SIZE[ds]] for ds in DATASETS], []
     )
-    total_epoch_size = sum(EPOCH_SIZE.values())
+    total_epoch_size = sum(
+        v for k, v in EPOCH_SIZE.items() if k in DATASETS
+    )
     coor_L, coor_R = get_coors()
     plot_f = visdef()
     # The encoder will handle data normalisation and GSR
@@ -516,7 +518,7 @@ def main(
     last_report = last_checkpoint = ((start_epoch + 1) * total_epoch_size - max(REPORT_INTERVAL, CHECKPOINT_INTERVAL) - 1)
     meta_acc = {}
     meta_acc_val = {}
-    avail_entities = {k: [] for k in EPOCH_SIZE}
+    avail_entities = {k: [] for k in EPOCH_SIZE if k in DATASETS}
     for i in range(start_epoch + 1, MAX_EPOCH + 1):
         key_e = jax.random.fold_in(key, i)
         for j, (k, v) in enumerate(avail_entities.items()):
@@ -533,10 +535,12 @@ def main(
         epoch_entities = sum([
             avail_entities[k][:v]
             for k, v in EPOCH_SIZE.items()
+            if k in DATASETS
         ], [])
         avail_entities = {
             k: avail_entities[k][v:]
             for k, v in EPOCH_SIZE.items()
+            if k in DATASETS
         }
         epoch_entities = [
             epoch_entities[e] for e in jax.random.choice(
