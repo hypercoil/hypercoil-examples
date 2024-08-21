@@ -23,6 +23,18 @@ from hypercoil_examples.atlas.icosphere import (
 )
 
 
+def scatter_mean_ell(Q: Tensor, adj: Tensor, argadj: Tensor) -> Tensor:
+    Qr = jnp.zeros(
+        (Q.shape[0], adj.shape[0])
+    ).at[..., argadj].add(Q)
+    count = jnp.zeros(
+        (adj.shape[0],)
+    ).at[argadj].add(jnp.ones(Q.shape[1]))
+    Qr = jnp.where(count == 0, 0, Qr) # shouldn't happen
+    count = jnp.where(count == 0, 1, count)
+    return Qr / count
+
+
 def scatter_mean_bipartite(
     module: ELLGAT,
     Q: Tensor,
@@ -33,20 +45,13 @@ def scatter_mean_bipartite(
     inference: Optional[bool] = None,
     key: 'jax.random.PRNGKey',
 ) -> Tensor:
-    # Prepare scatter-mean as query, and the original Q as key
+    # Prepare the original Q as key, and scatter-mean as query
     # on a bipartite graph
-    Qr = jnp.zeros(
-        (Q.shape[0], bipartite.shape[0])
-    ).at[..., argadj].add(Q)
-    count = jnp.zeros(
-        (bipartite.shape[0],)
-    ).at[argadj].add(jnp.ones(Q.shape[1]))
-    Qr = jnp.where(count == 0, 0, Qr)
-    count = jnp.where(count == 0, 1, count)
+    Qm = scatter_mean_ell(Q, bipartite, argadj)
     Q = module(
         adj=bipartite,
-        Q=Qr / count,
-        K=Q,
+        Q=Q,
+        K=Qm,
         inference=inference,
         key=key,
     )
@@ -67,8 +72,79 @@ class ELLMesh(eqx.Module):
     argadj: Mapping[Tuple[int, int], Tensor]
     ingress_level: Tuple[Optional[int], ...]
 
-    def __init__(
-        self,
+    def get_params_for_empty_init(self):
+        nodes_per_level = tuple(ico.shape[0] for ico in self.icospheres)
+        neighbours_per_level = {
+            k: v.shape[1] for k, v in
+            {
+                **dict(enumerate(self.icospheres)),
+                **self.bipartite,
+            }.items()
+        }
+        return {
+            'nodes_per_level': nodes_per_level,
+            'neighbours_per_level': {
+                (
+                    '__x__'.join(str(m) for m in k)
+                    if isinstance(k, tuple)
+                    else k
+                ): v
+                for k, v in neighbours_per_level.items()
+            },
+            'ingress_level': self.ingress_level,
+            'resolution': self.resolution,
+        }
+
+    @classmethod
+    def empty(
+        cls,
+        nodes_per_level: Tuple[int, ...],
+        neighbours_per_level: Mapping[int | Tuple[int, int] | str, int],
+        ingress_level: Tuple[Optional[int], ...],
+        resolution: Optional[Tuple[int, ...]] = None,
+    ) -> 'ELLMesh':
+        """For (de)serialisation purposes"""
+        neighbours_per_level = {
+            (
+                tuple(int(m) for m in k.split('__x__'))
+                if '__x__' in k
+                else int(k)
+            ): v
+            for k, v in neighbours_per_level.items()
+        }
+        icospheres = tuple(
+            jnp.empty(
+                (nnodes, neighbours_per_level[i]),
+                dtype=int,
+            )
+            for i, nnodes in enumerate(nodes_per_level)
+        )
+        multiscale = [
+            e for e in neighbours_per_level.keys() if isinstance(e, tuple)
+        ]
+        bipartite = {}
+        argadj = {}
+        for i, j in multiscale:
+            bipartite[(i, j)] = jnp.empty(
+                (nodes_per_level[j], neighbours_per_level[(i, j)]),
+                dtype=int,
+            )
+            argadj[(i, j)] = jnp.empty(
+                (nodes_per_level[i]),
+                dtype=int,
+            )
+        resolution = resolution or tuple(None for _ in nodes_per_level)
+        return cls(
+            resolution=resolution,
+            icospheres=icospheres,
+            bipartite=bipartite,
+            argadj=argadj,
+            ingress_level=ingress_level,
+        )
+
+    @classmethod
+    def from_icospheres(
+        cls,
         base_coor: Tensor,
         base_adj: Tensor,
         resolution: Tuple[int, ...],
@@ -196,11 +272,13 @@ class ELLMesh(eqx.Module):
         # if len(argadj[(1, 2)]) != len(bipartite[(0, 1)]):
         #     assert 0
 
-        self.resolution = resolution
-        self.icospheres = icospheres
-        self.bipartite = bipartite
-        self.argadj = argadj
-        self.ingress_level = ingress_level
+        return cls(
+            resolution=resolution,
+            icospheres=icospheres,
+            bipartite=bipartite,
+            argadj=argadj,
+            ingress_level=ingress_level,
+        )
 
 
 class IcoELLGATUNet(eqx.Module):
@@ -407,10 +485,10 @@ class IcoELLGATUNet(eqx.Module):
             )
             Q = self.nlin(Q)
             Q = self.norm(Q)
-            adjarg = mesh.argadj.get((idx - 1, idx), None)
-            if adjarg is not None:
+            argadj = mesh.argadj.get((idx - 1, idx), None)
+            if argadj is not None:
                 # Gather the Q to the original size
-                Q = Q[..., adjarg]
+                Q = Q[..., argadj]
             # if (
             #     (Q is not None and jnp.any(jnp.isnan(Q))) or
             #     (Qi is not None and jnp.any(jnp.isnan(Qi)))
@@ -459,6 +537,23 @@ def get_meshes(
     model: Literal['test', 'full'] = 'test',
     positional_dim: Optional[int] = None,
 ) -> Tuple[ELLMesh, ELLMesh]:
+    import json
+    try:
+        mesh_L = ELLMesh.empty(**json.load(open('/tmp/mesh_L_params.json')))
+        mesh_L = eqx.tree_deserialise_leaves(
+            '/tmp/mesh_L.eqx',
+            like=mesh_L,
+        )
+        mesh_R = ELLMesh.empty(**json.load(open('/tmp/mesh_R_params.json')))
+        mesh_R = eqx.tree_deserialise_leaves(
+            '/tmp/mesh_R.eqx',
+            like=mesh_R,
+        )
+        print('Loaded meshes from cache')
+        return mesh_L, mesh_R
+    except (FileNotFoundError, json.decoder.JSONDecodeError):
+        print('Generating meshes...')
+        pass
 
     def get_mesh(hemi: str) -> ELLMesh:
         base_coor, base_mask, base_adj = get_base_coor_mask_adj(hemi)
@@ -471,7 +566,7 @@ def get_meshes(
                 i + positional_dim if i is not None else i
                 for i in ingress_level
             )
-        return ELLMesh(
+        return ELLMesh.from_icospheres(
             base_coor=base_coor,
             base_adj=base_adj,
             resolution=(None, 25, 9),
@@ -486,39 +581,111 @@ def get_meshes(
         )
 
     mesh_L = get_mesh('L')
+    with open('/tmp/mesh_L_params.json', 'w') as fp:
+        json.dump(mesh_L.get_params_for_empty_init(), fp)
+    eqx.tree_serialise_leaves(
+        f'/tmp/mesh_L.eqx',
+        mesh_L,
+    )
     mesh_R = get_mesh('R')
+    with open('/tmp/mesh_R_params.json', 'w') as fp:
+        json.dump(mesh_R.get_params_for_empty_init(), fp)
+    eqx.tree_serialise_leaves(
+        f'/tmp/mesh_R.eqx',
+        mesh_R,
+    )
     return mesh_L, mesh_R
 
 
 def main(visualise: bool = False):
     mesh_L, mesh_R = get_meshes()
 
+    # Regression test against reference implementation of scatter mean
+    import torch, numpy as np
+    from torch_scatter import scatter_mean as scatter_mean_ref
+    Q = jax.random.normal(jax.random.PRNGKey(0), shape=(29696, 10))
+    out = scatter_mean_ell(Q.T, mesh_L.bipartite[(0, 2)], mesh_L.argadj[(0, 2)])
+    ref = scatter_mean_ref(
+        torch.tensor(np.asarray(Q)).t(),
+        torch.tensor(
+            np.asarray(mesh_L.argadj[(0, 2)], np.int64)[..., None]
+        ).t(),
+        out=torch.zeros((10, 761))
+    ).numpy()
+    assert np.allclose(out, ref, atol=1e-6)
+
+    Q = jax.random.normal(jax.random.PRNGKey(0), shape=(5762, 10))
+    out = scatter_mean_ell(Q.T, mesh_R.bipartite[(1, 2)], mesh_R.argadj[(1, 2)])
+    ref = scatter_mean_ref(
+        torch.tensor(np.asarray(Q)).t(),
+        torch.tensor(
+            np.asarray(mesh_R.argadj[(1, 2)], np.int64)[..., None]
+        ).t(),
+        out=torch.zeros((10, 760))
+    ).numpy()
+    assert np.allclose(out, ref, atol=1e-6)
+
     if visualise:
+        import pyvista as pv
         from hyve import (
             plotdef,
             surf_from_archive,
             surf_scalars_from_array,
             plot_to_image,
-            save_grid,
+            save_figure,
+            text_element,
+            Cell,
         )
+        layout = Cell() / Cell() << (1 / 2)
+        layout = layout | Cell() | layout << (1 / 3)
+        layout = Cell() / layout << (1 / 14)
+        annotations = {
+            0: dict(elements=['title']),
+            1: dict(
+                hemisphere='left',
+                view='lateral',
+            ),
+            2: dict(
+                hemisphere='left',
+                view='medial',
+            ),
+            3: dict(view='dorsal'),
+            4: dict(
+                hemisphere='right',
+                view='lateral',
+            ),
+            5: dict(
+                hemisphere='right',
+                view='medial',
+            ),
+        }
+        layout = layout.annotate(annotations)
         plot_f = plotdef(
             surf_from_archive(),
             surf_scalars_from_array('pools', is_masked=True),
+            text_element(
+                name='title',
+                content=f'Model',
+                bounding_box_height=128,
+                font_size_multiplier=0.8,
+                font_color='#cccccc',
+                priority=-1,
+            ),
             plot_to_image(),
-            save_grid(
-                n_cols=8,
-                n_rows=1,
-                padding=10,
-                canvas_size=(3200, 300),
+            save_figure(
+                layout_kernel=layout,
+                padding=0,
+                canvas_size=(1200, 440),
                 canvas_color=(0, 0, 0),
                 fname_spec='ellgatunet_{hemi}_{surfscalars}.png',
-                sort_by=['surfscalars'],
                 scalar_bar_action='collect',
             ),
         )
         for k in mesh_L.argadj:
             array_L = mesh_L.argadj[k]
             array_R = mesh_R.argadj[k]
+            large = array_L.shape[0] + array_R.shape[0]
+            small = int(array_L.max() + array_R.max() + 2)
             k_orig = k
             while k[0] != 0:
                 array_L = array_L[mesh_L.argadj[k[0] - 1, k[0]]]
@@ -537,7 +704,9 @@ def main(visualise: bool = False):
                     'right': ('medial', 'lateral'),
                     'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
                 },
+                theme=pv.themes.DarkTheme(),
                 output_dir='/tmp',
+                title_element_content=f'{large} x {small} bipartite adjacency',
                 fname_spec=f'scalars-{k_orig[0]}x{k_orig[1]}',
                 window_size=(800, 600),
             )
@@ -553,6 +722,24 @@ def main(visualise: bool = False):
         attn_heads=(4, 4, 4),
         readout_dim=200,
         dropout=0.6,
+        key=jax.random.PRNGKey(0),
+    )
+    Q = jax.random.normal(jax.random.PRNGKey(0), shape=(5762, 256))
+    scatter_mean_bipartite(
+        model.resample[(1, 2)],
+        Q.T,
+        mesh_R.argadj[(1, 2)],
+        mesh_R.bipartite[(1, 2)],
+        lambda x: x,
+        key=jax.random.PRNGKey(0),
+    )[..., 121]
+    def zz(*pparams, **params): return scatter_mean_bipartite(*pparams, **params).sum()
+    eqx.filter_grad(zz)(
+        model.resample[(1, 2)],
+        Q.T,
+        mesh_R.argadj[(1, 2)],
+        mesh_R.bipartite[(1, 2)],
+        lambda x: x,
         key=jax.random.PRNGKey(0),
     )
     selected_mesh = ('cortex_R', mesh_R)
