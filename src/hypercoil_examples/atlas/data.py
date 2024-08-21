@@ -6,7 +6,7 @@ Load and transform data
 ~~~~~~~~~~~~~~~~~~~~~~~
 Load and transform CIfTI-formatted neuroimaging data.
 """
-from typing import Optional
+from typing import Literal, Optional
 
 import jax
 import jax.numpy as jnp
@@ -76,6 +76,7 @@ def _get_data(
     filter_rps: bool = True,
     censor_thresh: float = 0.15,
     pad_to_size: Optional[int] = None,
+    censor_method: Literal['drop', 'zero'] = 'drop',
     key: Optional['jax.random.PRNGKey'] = None,
 ):
     key = jax.random.PRNGKey(0) if key is None else key
@@ -129,7 +130,10 @@ def _get_data(
                 ))
         else:
             index = jnp.where(tmask)[0]
-        data = data[..., index]
+        if censor_method == 'drop':
+            data = data[..., index]
+        else:
+            data = jnp.where(tmask[None, ...], data, 0)
     # Plug zero-variance vertices with ramp (for no NaNs in log prob)
     data = jnp.where(
         jnp.isclose(data.std(-1), 0)[..., None],
