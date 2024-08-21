@@ -105,20 +105,22 @@ class ELLGAT(eqx.Module):
     ) -> Tensor:
         if K is None:
             K = Q
-        Ko = jnp.einsum('...hoi,...in->...hon', self.key_weight, K)[..., adj]
+        Qo = jnp.einsum('...hoi,...in->...hon', self.query_weight, Q)[..., adj]
         # X = self.nlin(
         #     jnp.einsum(
         #         '...hoi,...in,...honk->...honk',
         #         self.query_weight, Q, K[..., adj],
         #     )
         # )
-        Qo = jnp.einsum('...hoi,...in->...hon', self.query_weight, Q)
-        X = self.nlin(Qo[..., None] + Ko)
+        Ko = jnp.einsum('...hoi,...in->...hon', self.key_weight, K)
+        #print((Qo + Ko[..., None]).reshape(2, 4, -1))
+        X = self.nlin(Qo + Ko[..., None])
         X = jnp.einsum('...hwnk,...hw->...hnk', X, self.attn_weight)
         X = jnp.where(adj == -1, -jnp.inf, X)
         # The following line is required to avoid NaNs in the edge case
         X = jnp.where((adj != -1).sum(-1, keepdims=True) == 0, 0, X)
         attn = jax.nn.softmax(X, axis=-1)
+        #print(attn.reshape(2, -1))
         attn = self.dropout(attn, inference=inference, key=key)
         # attn = jnp.where(jnp.isnan(attn), 0, attn)
         # attn = jnp.einsum(
@@ -134,7 +136,7 @@ class ELLGAT(eqx.Module):
         return jnp.einsum(
             '...hnk,...honk->...hon',
             jnp.where(adj == -1, 0, attn),
-            Ko,
+            Qo,
         )
 
 
@@ -298,11 +300,48 @@ class ELLGATBlock(eqx.Module):
 
 def main():
     # Test the ELLGAT module
+    import torch
+    import numpy as np
     from hypercoil_examples.atlas.icosphere import (
         icosphere, connectivity_matrix
     )
+    from hypercoil_examples.atlas.gatrefpyg import GATv2Conv
     vertices, faces = icosphere(60)
     edges = connectivity_matrix(vertices, faces)
+    edges = jnp.concatenate((jnp.arange(len(edges))[..., None], edges), -1)
+    # Regression test for the ELLGAT module against the PyTorch GATv2Conv
+    model = ELLGAT(3, 4, 2, dropout=None, key=jax.random.PRNGKey(0))
+    ref = GATv2Conv(
+        3, 4, heads=2,
+        negative_slope=0.01,
+        add_self_loops=False,
+        bias=False,
+        dropout=0,
+    )
+    ref.lin_l.weight = torch.nn.Parameter(
+        torch.tensor(np.asarray(model.query_weight)).view(-1, 3)
+    )
+    ref.lin_r.weight = torch.nn.Parameter(
+        torch.tensor(np.asarray(model.key_weight)).view(-1, 3)
+    )
+    ref.att = torch.nn.Parameter(
+        torch.tensor(np.asarray(model.attn_weight)).view(1, *model.attn_weight.shape)
+    )
+    edge_index = torch.stack((
+        torch.arange(len(edges)).view(-1, 1).tile(1, 7),
+        torch.tensor(np.asarray(edges)),
+    )).view(2, -1)
+    # Drop the negative indices that are stand-ins for non-edges
+    edge_index = edge_index[..., ~torch.any(edge_index < 0, axis=0)]
+    Q = jax.random.normal(
+        jax.random.PRNGKey(17),
+        (model.key_features, vertices.shape[0]),
+    )
+    refout = ref(torch.tensor(np.asarray(Q)).t(), edge_index).t().view(2, 4, -1)
+    modelout = model(edges, Q)
+    assert jnp.allclose(modelout, refout.detach().numpy(), atol=1e-6)
+
+    # Forward pass
     model = ELLGAT(3, 4, 2, dropout=0.6, key=jax.random.PRNGKey(0))
     Q = jax.random.normal(
         jax.random.PRNGKey(17),
