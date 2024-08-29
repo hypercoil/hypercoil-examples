@@ -47,16 +47,16 @@ from hyve import (
     save_figure,
 )
 
-LEARNING_RATE = 0.01
+LEARNING_RATE = 0.002
 MAX_EPOCH = 24000
 MAX_EPOCH = 40
 ENCODER_ARCH = '64x64'
 BLOCK_ARCH = 'ELLGAT'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
-PATHWAYS = ('full',) #  ('regulariser', 'full') #('regulariser',) #
+PATHWAYS = ('regulariser', 'full') # ('full',) # ('regulariser',) #
 SEED = 47
 
-REPORT_INTERVAL = 10 # 1 #
+REPORT_INTERVAL = 100 # 1 #
 CHECKPOINT_INTERVAL = 100 # 1 #
 EPOCH_SIZE = {'HCP': 5, 'MSC': 5}
 VAL_SIZE = {'HCP': 5, 'MSC': 5}
@@ -162,7 +162,7 @@ forward_backward_bkp = eqx.filter_value_and_grad(
     forward,
     has_aux=True,
 )
-forward_backward = forward
+# forward_backward = forward
 
 
 class InvalidValueException(FloatingPointError):

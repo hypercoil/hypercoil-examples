@@ -742,7 +742,7 @@ def init_full_model(
     key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
     import numpy as np
-    key = key or jax.random.PRNGKey(0)
+    if key is None: key = jax.random.PRNGKey(0)
     key_r, key_a = jax.random.split(key)
     encoder, template = init_encoder_model(coor_L, encoder_type=encoder_type)
     result = encoder(
@@ -792,7 +792,7 @@ def init_full_model(
         selectivity_coor=template,
         spatial_kappa=spatial_kappa,
         selectivity_kappa=selectivity_kappa,
-        num_iter=20,
+        num_iter=10, #100, #
     )
     if not fixed_kappa:
         selectivity_kappa = jnp.asarray(num_parcels * [selectivity_kappa], dtype=float)

@@ -120,6 +120,7 @@ def generalised_whitening(
     # cmax = jnp.maximum.accumulate(L) # Does not work in JAX!
     # cmax = (jnp.tril(jnp.ones((L.size, L.size))) * L).max(-1) # Slow
     # cmax = jax.lax.cummax(L, axis=0) # Using this for now
+    L = jnp.where(L <= 0, 1e-16, L)
     llim = jnp.sqrt(jax.lax.cummax(LW ** 2 * L, axis=0) / L)
     # Note that this approach will also zero the derivatives wrt any
     # eigenvalues that would be switched. It's important that we only impose
