@@ -14,7 +14,6 @@ from typing import Literal, Mapping, Optional, Sequence, Tuple, Union
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-import numpyro
 from jax.scipy.special import logit
 from numpyro.distributions import Distribution
 from scipy.special import softmax
@@ -26,32 +25,37 @@ from hypercoil.functional import (
     spherical_geodesic,
     sym2vec,
 )
-from hypercoil.loss.functional import entropy
 
-from hypercoil_examples.atlas.aligned_dccc import param_bimodal_beta
 from hypercoil_examples.atlas.beta import VMFCompat
-from hypercoil_examples.atlas.ellgat import UnitSphereNorm, ELLGATCompat, ELLGATBlock
-from hypercoil_examples.atlas.encoders import (
-    create_icosphere_encoder,
-    create_consensus_encoder,
-    create_7net_encoder,
-)
+from hypercoil_examples.atlas.ellgat import ELLGATCompat, ELLGATBlock
 from hypercoil_examples.atlas.multiencoder import configure_multiencoder
 from hypercoil_examples.atlas.positional import (
     configure_geometric_encoder, get_coors
 )
 from hypercoil_examples.atlas.promises import empty_promises
-from hypercoil_examples.atlas.selectransform import (
-    incomplete_mahalanobis_transform,
-    logistic_mixture_threshold,
-)
 from hypercoil_examples.atlas.unet import get_meshes, IcoELLGATUNet
 
 VMF_BASE_KAPPA = 10
+ATTN_HEADS_ARCH = (4, 4, 4)
 BLOCK_ARCH = {
     'ELLGAT': ELLGATCompat,
     'ELLGATBlock': ELLGATBlock,
 }
+ENCODER_IN_DIM_ARCH = {
+    '64x64': 64,
+    '3res': 14,
+}
+FORWARD_IN_DIM_ARCH = {
+    'ELLGAT': (64, 256),
+    'ELLGATBlock': (32, 64),
+}
+HIDDEN_DIM_ARCH = {
+    'ELLGAT': (16, 64, 256),
+    'ELLGATBlock': (8, 16, 64),
+}
+CONTRALATERAL_JITTER = 1e-4
+NUM_ITER_VMFMM_INIT = 10
+TEMPLATE_PATH = '/tmp/mean_init.npy'
 
 
 class EmptyPromises(eqx.Module):
@@ -360,17 +364,22 @@ class ForwardParcellationModel(eqx.Module):
         point_nu: float = 1.,
         doublet_nu: float = 1.,
         mass_nu: float = 1.,
-        key: Optional['jax.random.PRNGKey'] = None,
+        temperature: float = 1.,
         # The below arguments are here only for uniformity of the interface.
         # They do nothing.
         encoder_type: Literal['64x64', '3res'] = '64x64',
         injection_points: Sequence[
             Literal['input', 'readout', 'residual']
         ] = (),
-        temperature: float = 1.,
+        additional_data: Sequence[
+            Literal['geometric', 'parametric']
+        ] = ('geometric',),
         inference: Optional[bool] = None,
+        key: Optional['jax.random.PRNGKey'] = None,
     ):
-        regulariser, X, S, compartments, (M, new_M, new_update_weight) = (
+        # The third argument is the "positional" / geometric encoding, which
+        # only the approximator (U-Net) uses.
+        regulariser, X, _, compartments, (M, new_M, new_update_weight) = (
             self._common_path(
                 coor=coor,
                 T=T,
@@ -431,6 +440,12 @@ class ForwardParcellationModel(eqx.Module):
         injection_points: Sequence[
             Literal['input', 'readout', 'residual']
         ] = (),
+        # DO NOT set both 'parametric' here and 'input' in injection_points.
+        # Otherwise, the results of the parametric model (regulariser) will be
+        # duplicated in the input to the approximator.
+        additional_data: Sequence[
+            Literal['geometric', 'parametric']
+        ] = ('geometric',),
         temperature: float = 1.,
         inference: Optional[bool] = None,
         key: Optional['jax.random.PRNGKey'] = None,
@@ -448,24 +463,8 @@ class ForwardParcellationModel(eqx.Module):
                 temperature=temperature,
             )
         )
-        masks = encoder.temporal.reduced_slices[::-1]
-        inputs = {
-            compartment: tuple(
-                jnp.concatenate((
-                    jax.lax.dynamic_slice(
-                        X[compartment],
-                        (0,) * (X[compartment].ndim - 1) + (s[0],),
-                        X[compartment].shape[:-1] + (s[1],),
-                    ),
-                    S[compartment]
-                ), axis=-1).swapaxes(-1, -2)
-                for s in masks
-            )
-            for compartment in compartments
-        }
-        if encoder_type == '64x64':
-            inputs = {k: (v[0], v[0], v[1]) for k, v in inputs.items()}
-        if len(injection_points) > 0:
+
+        if len(injection_points) > 0 or 'parametric' in additional_data:
             energy = {
                 compartment: regulariser[compartment].point_energy(
                     Z=X[compartment],
@@ -480,6 +479,39 @@ class ForwardParcellationModel(eqx.Module):
                 )
                 for compartment in compartments
             }
+        if additional_data:
+            agg_fn = lambda x, y: jnp.concatenate((x, *y), axis=-1)
+        else:
+            agg_fn = lambda x, y: x
+        additional_data = {
+            compartment: tuple(
+                e for e in (
+                    S[compartment] if 'geometric' in additional_data else None,
+                    P[compartment] if 'parametric' in additional_data else None,
+                )
+                if e is not None
+            )
+            for compartment in compartments
+        }
+
+        masks = encoder.temporal.reduced_slices[::-1]
+        inputs = {
+            compartment: tuple(
+                agg_fn(
+                    jax.lax.dynamic_slice(
+                        X[compartment],
+                        (0,) * (X[compartment].ndim - 1) + (s[0],),
+                        X[compartment].shape[:-1] + (s[1],),
+                    ),
+                    additional_data[compartment],
+                ).swapaxes(-1, -2)
+                for s in masks
+            )
+            for compartment in compartments
+        }
+        if encoder_type == '64x64':
+            inputs = {k: (v[0], v[0], v[1]) for k, v in inputs.items()}
+        if len(injection_points) > 0:
             if 'input' in injection_points:
                 inputs = {
                     compartment: (
@@ -528,12 +560,16 @@ class ForwardParcellationModel(eqx.Module):
             )
             for compartment in compartments
         }
-        energy = jnp.stack(
-            tuple(
-                jnp.mean(energy[compartment])
-                for compartment in compartments
-            )
-        ).mean()
+        energy = {
+            compartment: jnp.mean(energy[compartment])
+            for compartment in compartments
+        }
+        # energy = jnp.stack(
+        #     tuple(
+        #         jnp.mean(energy[compartment])
+        #         for compartment in compartments
+        #     )
+        # ).mean()
         return P, energy, (M, new_M, new_update_weight)
 
 
@@ -553,6 +589,138 @@ def vmf_mle_mu_only(
     else:
         kappa = VMF_BASE_KAPPA
     return VMFCompat(mu=mu, kappa=kappa, parameterise=False)
+
+
+def marginal_entropy(counts: Tensor) -> Tensor:
+    P = counts / counts.sum(-1, keepdims=True)
+    P = jnp.clip(P, 1e-6, 1 - 1e-6)
+    return -jnp.sum(P * jnp.log(P), axis=-1)
+
+
+def logit_normal_divergence(
+    P: Tensor,
+    Q: Tensor,
+    scale: Tensor = 1.,
+) -> Tensor:
+    return jnp.exp(
+        -(
+            (
+                logit(jnp.clip(P, 1e-6, 1 - 1e-6)) -
+                logit(jnp.clip(Q, 1e-6, 1 - 1e-6))
+            ) / scale
+        ) ** 2
+    )
+
+
+def logit_normal_maxent_divergence(P: Tensor, scale: Tensor = 1.) -> Tensor:
+    maxent = 1 / P.shape[-2]
+    return logit_normal_divergence(P, maxent, scale=scale)
+
+
+def _apply_over_compartments(
+    fn: callable,
+    compartments: Tuple[str],
+    *data: Mapping[str, Tensor],
+    **params,
+) -> Mapping[str, Tensor]:
+    return {
+        compartment: fn(
+            data[0][compartment],
+            *[e[compartment] for e in data[1:]],
+            **params,
+        )
+        for compartment in compartments
+    }
+
+
+def kappa_energy(
+    parametric: SpatialSelectiveMRF,
+    /,
+    *,
+    spatial_energy: float,
+    selectivity_energy: float,
+) -> Tensor:
+    energy = 0
+    for kappa, kappa_energy in (
+        (
+            parametric.spatial_distribution.kappa,
+            spatial_energy,
+        ),
+        (
+            parametric.selectivity_distribution.kappa,
+            selectivity_energy,
+        ),
+    ):
+        if kappa_energy is not None:
+            prior, err_large, err_small = kappa_energy
+            kappa_err = kappa - prior
+            energy = energy + jax.lax.cond(
+                kappa_err < 0,
+                lambda err: -err_small * err,
+                lambda err: err_large * err,
+                kappa_err,
+            ).mean()
+    return energy
+
+
+def reconstruction_error(
+    P: Tensor,
+    limits: Tuple[int, int],
+    /,
+    *,
+    T: Tensor,
+    recon_nu: float,
+) -> Tensor:
+    start, size = limits
+    Tc = T[..., start:(start + size), :]
+    parcel_ts = jnp.linalg.lstsq(
+        P.swapaxes(-2, -1),
+        Tc,
+    )[0]
+    return recon_nu * jnp.linalg.norm(
+        P.swapaxes(-2, -1) @ parcel_ts - Tc
+    )
+
+
+def tether_energy(
+    ipsilateral_model: SpatialSelectiveMRF,
+    contralateral_model: SpatialSelectiveMRF,
+    key: 'jax.random.PRNGKey',
+    /,
+    *,
+    tether_nu: float,
+) -> Tensor:
+    contralateral = _to_jax_array(
+        contralateral_model.spatial_distribution.mu
+    )
+    #TODO: We can get NaN if the two are aligned exactly. Here we add noise
+    #      to avoid this edge case, but we should work out why this occurs.
+    contralateral = contralateral + CONTRALATERAL_JITTER * jax.random.normal(
+        key, contralateral.shape
+    )
+    contralateral = contralateral / jnp.linalg.norm(
+        contralateral, axis=-1, keepdims=True
+    )
+    return tether_nu * spherical_geodesic(
+        _to_jax_array(
+            ipsilateral_model.spatial_distribution.mu
+        )[..., None, :],
+        contralateral.at[..., 0].set(-contralateral[..., 0])[..., None, :],
+    ).sum()
+
+
+def parcellate(
+    P: Tensor,
+    limits: Tuple[int, int],
+    *,
+    T: Tensor,
+) -> Tensor:
+    start, size = limits
+    Tc = T[..., start:(start + size), :]
+    return jnp.linalg.lstsq(
+        P.swapaxes(-2, -1),
+        Tc,
+    )[0]
 
 
 def init_encoder_model(
@@ -580,7 +748,7 @@ def init_encoder_model(
         alignment=alignment,
     )
     size_left = coor_L.shape[0]
-    template = np.load('/tmp/mean_init.npy')
+    template = np.load(TEMPLATE_PATH)
     template = encoder.temporal.rescale(template)
     # template = template / jnp.linalg.norm(template, axis=-1, keepdims=True)
     template = {
@@ -590,25 +758,21 @@ def init_encoder_model(
     return encoder, template
 
 
-def marginal_entropy(counts: Tensor) -> Tensor:
-    P = counts / counts.sum(-1, keepdims=True)
-    P = jnp.clip(P, 1e-6, 1 - 1e-6)
-    return -jnp.sum(P * jnp.log(P), axis=-1)
-
-
 def refine_parcels(
     spatial_coor_parcels: Mapping[str, Tensor],
     spatial_coor: Mapping[str, Tensor],
     selectivity_coor_parcels: Mapping[str, Tensor],
     selectivity_coor: Mapping[str, Tensor],
     *,
-    # There's absolutely no convergence guarantee here.
-    # We should at least do this jointly, but I guess this alternating method
-    # is probably better than nothing.
-    num_iter: int = 20,
+    num_iter: int = NUM_ITER_VMFMM_INIT,
     spatial_kappa: float = VMF_BASE_KAPPA,
     selectivity_kappa: float = VMF_BASE_KAPPA,
 ) -> Tuple[Tensor, Tensor]:
+    # There's absolutely no convergence guarantee here.
+    # (Nor do we need it, really. We're only using this to initialise the
+    # model. We just let it explore a bit and then take the best result.)
+    # We should at least do this jointly, but I guess this alternating method
+    # is probably better than nothing.
     compartments = spatial_coor.keys()
     spatial_coor_parcels_best = None
     selectivity_coor_parcels_best = None
@@ -733,6 +897,9 @@ def init_full_model(
     num_parcels: int = 100,
     encoder_type: Literal['64x64', '3res'] = '64x64',
     injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
+    additional_data: Sequence[
+        Literal['geometric', 'parametric']
+    ] = ('geometric',),
     block_arch: Literal['ELLGAT', 'ELLGATBlock'] = 'ELLGATBlock',
     spatial_kappa: float = VMF_BASE_KAPPA,
     selectivity_kappa: float = VMF_BASE_KAPPA,
@@ -742,7 +909,8 @@ def init_full_model(
     key: Optional['jax.random.PRNGKey'] = None,
 ) -> Tuple[eqx.Module, eqx.Module]:
     import numpy as np
-    if key is None: key = jax.random.PRNGKey(0)
+    if key is None:
+        key = jax.random.PRNGKey(0)
     key_r, key_a = jax.random.split(key)
     encoder, template = init_encoder_model(coor_L, encoder_type=encoder_type)
     result = encoder(
@@ -792,7 +960,7 @@ def init_full_model(
         selectivity_coor=template,
         spatial_kappa=spatial_kappa,
         selectivity_kappa=selectivity_kappa,
-        num_iter=10, #100, #
+        num_iter=NUM_ITER_VMFMM_INIT,
     )
     if not fixed_kappa:
         selectivity_kappa = jnp.asarray(num_parcels * [selectivity_kappa], dtype=float)
@@ -811,51 +979,39 @@ def init_full_model(
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
-    doublet_distribution = param_bimodal_beta(jnp.sqrt(num_parcels).item())
     regulariser = {
         compartment: SpatialSelectiveMRF(
             spatial_distribution=spatial_distribution[compartment],
             selectivity_distribution=selectivity_distribution[compartment],
-            # doublet_distribution=doublet_distribution,
-            # mass_distribution=numpyro.distributions.DirichletMultinomial(
-            #     jnp.ones(num_parcels).astype(int) * 10,
-            #     total_count=template[compartment].shape[0],
-            # ),
             doublet_potential=lambda x: logit_normal_divergence(
-                x.swapaxes(-1, -2),
+                x,
                 1 / num_parcels,
                 scale=5.,
-            ).swapaxes(-1, -2) - x * disaffiliation_penalty,
+            ) - x * disaffiliation_penalty,
             mass_potential=lambda x: -marginal_entropy(x),
             spatial_mle=vmf_mle_mu_only,
             selectivity_mle=vmf_mle_mu_only,
         )
         for compartment in ('cortex_L', 'cortex_R')
     }
-    mesh_L, mesh_R = get_meshes(
-        model='full',
-        positional_dim=encoder.spatial.default_encoding_dim,
-    )
-    base_in_dim = 0
     readout_skip_dim = 0
-    match encoder_type:
-        case '64x64':
-            base_in_dim = 64
-        case '3res':
-            base_in_dim = 14
+    positional_dim = None
+    base_in_dim = ENCODER_IN_DIM_ARCH[encoder_type]
     if 'input' in injection_points:
         base_in_dim += num_parcels
     if 'readout' in injection_points:
         readout_skip_dim = num_parcels
-    match block_arch:
-        case 'ELLGAT':
-            in_dim = (base_in_dim + encoder.spatial.default_encoding_dim, 64, 256)
-            hidden_dim = (16, 64, 256)
-        case 'ELLGATBlock':
-            in_dim = (base_in_dim + encoder.spatial.default_encoding_dim, 32, 64)
-            hidden_dim = (8, 16, 64)
-        case _:
-            raise ValueError(f'Unrecognised block architecture {block_arch}')
+    if 'geometric' in additional_data:
+        positional_dim = encoder.spatial.default_encoding_dim
+        base_in_dim += positional_dim
+    if 'parametric' in additional_data:
+        base_in_dim += num_parcels
+    mesh_L, mesh_R = get_meshes(
+        model='full',
+        positional_dim=positional_dim,
+    )
+    in_dim = (base_in_dim,) + FORWARD_IN_DIM_ARCH[block_arch]
+    hidden_dim = HIDDEN_DIM_ARCH[block_arch]
     approximator = IcoELLGATUNet(
         meshes={
             'cortex_L': mesh_L,
@@ -864,11 +1020,9 @@ def init_full_model(
         in_dim=in_dim,
         hidden_dim=hidden_dim,
         hidden_readout_dim=num_parcels // 2,
-        #attn_heads=(4, 4, 4),
-        attn_heads=(4, 4, 4),
+        attn_heads=ATTN_HEADS_ARCH,
         block_arch=BLOCK_ARCH[block_arch],
         readout_dim=num_parcels,
-        #norm=UnitSphereNorm(),
         dropout=dropout,
         dropout_inference=False,
         readout_skip_dim=readout_skip_dim,
@@ -887,7 +1041,7 @@ def forward(
     coor: Mapping[str, Tensor],
     encoder: StaticEncoder,
     encoder_result: Tuple,
-    compartment: str,
+    compartments: Sequence[str],
     mode: Literal['full', 'regulariser'] = 'full',
     energy_nu: float = 1.,
     recon_nu: float = 1.,
@@ -899,16 +1053,19 @@ def forward(
     mass_potentials_nu: float = 1.,
     spatial_kappa_energy: Optional[Tuple[float, float, float]] = None,
     selectivity_kappa_energy: Optional[Tuple[float, float, float]] = None,
-    classifier_nu: float = 0.,
-    classifier_target: Optional[Tensor] = None,
+    linear_classifier_nu: float = 0.,
+    linear_classifier_target: Optional[Tensor] = None,
     readout_name: Optional[str] = None,
     temperature: float = 1.,
     inference: bool = False,
     encoder_type: Literal['64x64', '3res'] = '64x64',
     injection_points: Sequence[Literal['input', 'readout', 'residual']] = (),
+    additional_data: Sequence[
+        Literal['geometric', 'parametric']
+    ] = ('geometric',),
     key: 'jax.random.PRNGKey',
 ):
-    meta = {}
+    meta = {compartment: {} for compartment in compartments}
     key_m, key_n = jax.random.split(key, 2)
     if mode == 'full':
         fwd = model
@@ -918,7 +1075,7 @@ def forward(
         coor=coor,
         encoder=encoder,
         encoder_result=encoder_result,
-        compartments=(compartment,),
+        compartments=compartments,
         inference=inference,
         point_nu=point_potentials_nu,
         doublet_nu=doublet_potentials_nu,
@@ -926,126 +1083,111 @@ def forward(
         encoder_type=encoder_type,
         temperature=temperature,
         injection_points=injection_points,
+        additional_data=additional_data,
         key=key_m,
     )
     (_, (_, _, _, _, T)) = encoder_result
     P, energy, _ = result
-    energy = energy_nu * energy
-    if spatial_kappa_energy is not None:
-        prior, err_large, err_small = spatial_kappa_energy
-        kappa = model.regulariser[compartment].spatial_distribution.kappa
-        kappa_err = kappa - prior
-        energy = energy + jax.lax.cond(
-            kappa_err < 0,
-            lambda err: -err_small * err,
-            lambda err: err_large * err,
-            kappa_err,
-        ).mean()
-    if selectivity_kappa_energy is not None:
-        prior, err_large, err_small = selectivity_kappa_energy
-        kappa = model.regulariser[compartment].selectivity_distribution.kappa
-        kappa_err = kappa - prior
-        energy = energy + jax.lax.cond(
-            kappa_err < 0,
-            lambda err: -err_small * err,
-            lambda err: err_large * err,
-            kappa_err ** 2,
-        ).mean()
+    energy = _apply_over_compartments(
+        lambda x: energy_nu * x, compartments, energy,
+    )
+    kappa_energies = _apply_over_compartments(
+        kappa_energy,
+        compartments,
+        model.regulariser,
+        spatial_energy=spatial_kappa_energy,
+        selectivity_energy=selectivity_kappa_energy,
+    )
     if energy_nu != 0:
-        meta = {**meta, 'energy': energy}
+        for compartment in compartments:
+            meta[compartment]['energy'] = energy[compartment]
+    if spatial_kappa_energy is not None:
+        for compartment in compartments:
+            meta[compartment]['spatial_kappa_energy'] = (
+                kappa_energies[compartment]
+            )
     if recon_nu != 0:
-        start, size = encoder.temporal.encoders[0].limits[compartment]
-        Tc = T[..., start:(start + size), :]
-        parcel_ts = jnp.linalg.lstsq(
-            P[compartment].swapaxes(-2, -1),
-            Tc,
-        )[0]
-        recon_error = recon_nu * jnp.linalg.norm(
-            P[compartment].swapaxes(-2, -1) @ parcel_ts - Tc
+        recon_error = _apply_over_compartments(
+            reconstruction_error,
+            compartments,
+            P,
+            encoder.temporal.encoders[0].limits,
+            T=T,
+            recon_nu=recon_nu,
         )
-        meta = {**meta, 'recon_error': recon_error}
+        for compartment in compartments:
+            meta[compartment]['recon_error'] = recon_error[compartment]
     else:
-        recon_error = 0
+        recon_error = {k: 0 for k in compartments}
     if tether_nu != 0:
-        other_hemi = 'cortex_R' if compartment == 'cortex_L' else 'cortex_L'
-        other_coor = _to_jax_array(
-            model.regulariser[other_hemi].spatial_distribution.mu
+        key_n = jax.random.split(key_n, len(compartments))
+        key_n = {k: key_n[i] for i, k in enumerate(compartments)}
+        tether_loss = _apply_over_compartments(
+            tether_energy,
+            compartments,
+            model.regulariser,
+            {
+                'cortex_L': model.regulariser['cortex_R'],
+                'cortex_R': model.regulariser['cortex_L'],
+            },
+            key_n,
+            tether_nu=tether_nu,
         )
-        #TODO: We can get NaN if the two are aligned exactly. Here we add noise
-        #      to avoid this edge case, but we should work out why this occurs.
-        other_coor = other_coor + 1e-4 * jax.random.normal(
-            key_n, other_coor.shape
-        )
-        other_coor = other_coor / jnp.linalg.norm(
-            other_coor, axis=-1, keepdims=True
-        )
-        tether = tether_nu * spherical_geodesic(
-            _to_jax_array(
-                model.regulariser[compartment].spatial_distribution.mu
-            )[..., None, :],
-            other_coor.at[..., 0].set(-other_coor[..., 0])[..., None, :],
-        ).sum()
-        meta = {**meta, 'hemisphere_tether': tether}
+        for compartment in compartments:
+            meta[compartment]['tether_loss'] = tether_loss[compartment]
     else:
-        tether = 0
+        tether_loss = {k: 0 for k in compartments}
     if div_nu != 0:
-        div = div_nu * logit_normal_maxent_divergence(P[compartment]).mean()
-        meta = {**meta, 'div': div}
+        div = _apply_over_compartments(
+            lambda x: div_nu * logit_normal_maxent_divergence(x).mean(),
+            compartments,
+            P,
+        )
+        for compartment in compartments:
+            meta[compartment]['div'] = div[compartment]
     else:
-        div = 0
+        div = {k: 0 for k in compartments}
     if template_energy_nu != 0:
         M = encoder_result[1][0]
-        template_energy = template_energy_nu * model.regulariser[compartment](
-            M[compartment],
-            coor[compartment],
-            model.approximator.meshes[compartment].icospheres[0],
-        ).mean()
-        meta = {**meta, 'template_energy': template_energy}
+        template_energy = {
+            compartment: template_energy_nu * model.regulariser[compartment](
+                M[compartment],
+                coor[compartment],
+                model.approximator.meshes[compartment].icospheres[0],
+            ).mean()
+            for compartment in compartments
+        }
+        for compartment in compartments:
+            meta[compartment]['template_energy'] = (
+                template_energy[compartment]
+            )
     else:
-        template_energy = 0
-    if classifier_nu != 0:
-        start, size = encoder.temporal.encoders[0].limits[compartment]
-        Tc = T[..., start:(start + size), :]
-        parcel_ts = jnp.linalg.lstsq(
-            P[compartment].swapaxes(-2, -1),
-            Tc,
-        )[0]
+        template_energy = {k: 0 for k in compartments}
+    if linear_classifier_nu != 0:
+        parcel_ts = _apply_over_compartments(
+            parcellate,
+            compartments,
+            P,
+            encoder.temporal.encoders[0].limits,
+            T=T,
+        )
+        parcel_ts = jnp.concatenate(
+            tuple(parcel_ts[compartment] for compartment in compartments),
+            axis=-2,
+        )
         parcel_adjvec = sym2vec(corr(parcel_ts))
         prediction = jax.nn.log_softmax(
             model.readouts[readout_name] @ parcel_adjvec
         )
-        pred_error = -(classifier_target * prediction).sum()
-        meta = {**meta, 'prediction_error': pred_error}
+        pred_error = -(linear_classifier_target * prediction).sum()
+        for compartment in compartments:
+            meta[compartment]['prediction_error'] = pred_error
     else:
-        pred_error = 0
-    return (
-        energy +
-        template_energy +
-        recon_error +
-        tether +
-        div +
-        pred_error
+        pred_error = {k: 0 for k in compartments}
+    return sum(
+        sum(meta[compartment].values())
+        for compartment in compartments
     ), meta
-
-
-def logit_normal_divergence(
-    P: Tensor,
-    Q: Tensor,
-    scale: Tensor = 1.,
-) -> Tensor:
-    return jnp.exp(
-        -(
-            (
-                logit(jnp.clip(P, 1e-6, 1 - 1e-6)) -
-                logit(jnp.clip(Q, 1e-6, 1 - 1e-6))
-            ) / scale
-        ) ** 2
-    )
-
-
-def logit_normal_maxent_divergence(P: Tensor, scale: Tensor = 1.) -> Tensor:
-    maxent = 1 / P.shape[-2]
-    return logit_normal_divergence(P, maxent, scale=scale)
 
 
 def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
@@ -1084,7 +1226,7 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         },
         encoder_result=encoder_result,
         encoder=encoder,
-        compartment='cortex_L',
+        compartments=('cortex_L', 'cortex_R'),
         key=jax.random.PRNGKey(0),
     )
     assert 0

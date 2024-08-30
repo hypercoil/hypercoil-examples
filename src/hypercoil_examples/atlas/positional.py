@@ -26,6 +26,7 @@ from hypercoil.engine import Tensor
 
 from hypercoil_examples.atlas.const import EIGENMODES_ROOT
 
+DEFAULT_MAX_EIGENMODE = 25
 EIGENMODES_PATH = {
     'cortex_L': (
         f'{EIGENMODES_ROOT}'
@@ -124,7 +125,7 @@ class GeometricEncoding(eqx.Module):
         )
 
 
-def configure_geometric_encoder():
+def configure_geometric_encoder(max_eigenmode: int = DEFAULT_MAX_EIGENMODE):
     import templateflow.api as tflow
     mask_path = {
         k: str(
@@ -136,7 +137,7 @@ def configure_geometric_encoder():
         eigenmodes_path=EIGENMODES_PATH,
         mask_path=mask_path,
         default_eigenmodes={
-            k: range(1, 25) for k in ('cortex_L', 'cortex_R')
+            k: range(1, max_eigenmode) for k in ('cortex_L', 'cortex_R')
         },
     )
     return ge
