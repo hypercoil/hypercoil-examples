@@ -350,7 +350,7 @@ class ForwardParcellationModel(eqx.Module):
         }
         return regulariser, X, S, compartments, (M, new_M, new_update_weight)
 
-    def regulariser_path(
+    def parametric_path(
         self,
         coor: Mapping[str, Tensor],
         T: Optional[Tensor] = None,
@@ -1042,7 +1042,7 @@ def forward(
     encoder: StaticEncoder,
     encoder_result: Tuple,
     compartments: Sequence[str],
-    mode: Literal['full', 'regulariser'] = 'full',
+    mode: Literal['full', 'parametric'] = 'full',
     energy_nu: float = 1.,
     recon_nu: float = 1.,
     tether_nu: float = 1.,
@@ -1070,7 +1070,7 @@ def forward(
     if mode == 'full':
         fwd = model
     else:
-        fwd = model.regulariser_path
+        fwd = model.parametric_path
     result = fwd(
         coor=coor,
         encoder=encoder,

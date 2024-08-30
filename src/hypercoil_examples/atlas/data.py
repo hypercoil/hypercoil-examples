@@ -21,6 +21,19 @@ from hypercoil_examples.atlas.const import (
 )
 
 
+def inject_noise_to_zero_variance(
+    data: jnp.ndarray,
+    sampler: callable = jax.random.normal,
+    *,
+    key: 'jax.random.PRNGKey',
+) -> jnp.ndarray:
+    return jnp.where(
+        jnp.isclose(data.std(-1), 0)[..., None],
+        sampler(key, data.shape),
+        data,
+    )
+
+
 def get_msc_dataset(
     subject: str,
     session: str,
@@ -103,42 +116,41 @@ def _get_data(
         rps[0] = rps[1]
         if filter_rps:
             t_rep = cifti.header.matrix._mims[0].series_step
+            breakpoint()
+            if t_rep > 100: # Convert to seconds
+                t_rep /= 1000
             fs = 1 / t_rep
             fc = 0.1 # Cut-off frequency of the filter (6 bpm)
             filt = butter(N=1, Wn=fc, btype='low', fs=fs)
             rps = filtfilt(*filt, rps, axis=0)
         fd = jnp.abs(rps).sum(-1)
         tmask = fd <= censor_thresh
+        surviving_frames = jnp.where(tmask)[0]
         if pad_to_size is not None:
             base_size = tmask.sum()
             if pad_to_size <= base_size:
                 index = jax.random.choice(
                     key,
-                    jnp.where(tmask)[0],
+                    surviving_frames,
                     shape=(pad_to_size,),
                     replace=False,
                 )
             else:
                 index = jnp.concatenate((
-                    jnp.where(tmask)[0],
+                    surviving_frames,
                     jax.random.choice(
                         jax.random.PRNGKey(0),
-                        jnp.where(tmask)[0],
+                        surviving_frames,
                         shape=(pad_to_size - base_size,),
                         replace=True,
                     ),
                 ))
         else:
-            index = jnp.where(tmask)[0]
+            index = surviving_frames
         if censor_method == 'drop':
             data = data[..., index]
         else:
             data = jnp.where(tmask[None, ...], data, 0)
     # Plug zero-variance vertices with ramp (for no NaNs in log prob)
-    data = jnp.where(
-        jnp.isclose(data.std(-1), 0)[..., None],
-        jax.random.normal(key, data.shape),
-        data,
-    )
+    data = inject_noise_to_zero_variance(data, key=key)
     return data
-
