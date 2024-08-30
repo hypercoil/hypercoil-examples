@@ -116,7 +116,6 @@ def _get_data(
         rps[0] = rps[1]
         if filter_rps:
             t_rep = cifti.header.matrix._mims[0].series_step
-            breakpoint()
             if t_rep > 100: # Convert to seconds
                 t_rep /= 1000
             fs = 1 / t_rep

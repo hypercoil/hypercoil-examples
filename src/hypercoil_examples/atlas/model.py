@@ -9,6 +9,7 @@ The complete parcellation model, including the indirect (approximator) network
 energy function that combines the two, and the selectivity-space encoder that
 constructs the inputs to both the U-Net and MRF models.
 """
+import logging
 from typing import Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import jax
@@ -414,12 +415,16 @@ class ForwardParcellationModel(eqx.Module):
             )
             for compartment in compartments
         }
-        energy = jnp.stack(
-            tuple(
-                jnp.mean(energy[compartment])
-                for compartment in compartments
-            )
-        ).mean()
+        energy = {
+            compartment: jnp.mean(energy[compartment])
+            for compartment in compartments
+        }
+        # energy = jnp.stack(
+        #     tuple(
+        #         jnp.mean(energy[compartment])
+        #         for compartment in compartments
+        #     )
+        # ).mean()
         return P, energy, (M, new_M, new_update_weight)
 
     def __call__(
@@ -654,11 +659,10 @@ def kappa_energy(
         if kappa_energy is not None:
             prior, err_large, err_small = kappa_energy
             kappa_err = kappa - prior
-            energy = energy + jax.lax.cond(
+            energy = energy + jnp.where(
                 kappa_err < 0,
-                lambda err: -err_small * err,
-                lambda err: err_large * err,
-                kappa_err,
+                -err_small * kappa_err,
+                err_large * kappa_err,
             ).mean()
     return energy
 
@@ -768,6 +772,7 @@ def refine_parcels(
     spatial_kappa: float = VMF_BASE_KAPPA,
     selectivity_kappa: float = VMF_BASE_KAPPA,
 ) -> Tuple[Tensor, Tensor]:
+    logging.info(f'Initialising vMFMM parcels')
     # There's absolutely no convergence guarantee here.
     # (Nor do we need it, really. We're only using this to initialise the
     # model. We just let it explore a bit and then take the best result.)
@@ -883,7 +888,7 @@ def refine_parcels(
         if delta < best_delta:
             spatial_coor_parcels_best = spatial_coor_parcels
             selectivity_coor_parcels_best = selectivity_coor_parcels
-        print(f'Iteration {i}: delta {delta}')
+        logging.info(f'Iteration {i}: delta {delta}')
     return (
         spatial_coor_parcels_best,
         selectivity_coor_parcels_best,
@@ -1206,7 +1211,7 @@ def main(subject: str = '01', session: str = '01', num_parcels: int = 100):
         coor_R=coor_R,
         num_parcels=num_parcels,
     )
-    print('Model initialised!')
+    logging.info('Model initialised!')
     encoder_result = encoder(
         T=T,
         coor_L=coor_L,

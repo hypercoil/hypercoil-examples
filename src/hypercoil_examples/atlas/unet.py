@@ -9,6 +9,7 @@ SUGAR, a GAT-based u-net model for brain surface registration. The code for
 this model is available at
 https://github.com/IndiLab/SUGAR/blob/main/models/gatunet_model.py
 """
+import logging
 from collections import defaultdict
 from typing import Literal, Mapping, Optional, Tuple, Union
 
@@ -549,10 +550,10 @@ def get_meshes(
             '/tmp/mesh_R.eqx',
             like=mesh_R,
         )
-        print('Loaded meshes from cache')
+        logging.info('Loaded meshes from cache')
         return mesh_L, mesh_R
     except (FileNotFoundError, json.decoder.JSONDecodeError):
-        print('Generating meshes...')
+        logging.info('Generating meshes...')
         pass
 
     def get_mesh(hemi: str) -> ELLMesh:

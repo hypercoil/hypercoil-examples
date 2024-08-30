@@ -64,8 +64,8 @@ DATA_COMPARTMENTS = ('cortex_L', 'cortex_R')
 FORWARD_COMPARTMENTS = 'bilateral' # 'separate' #
 EPOCH_SIZE = {'HCP': 5, 'MSC': 5}
 VAL_SIZE = {'HCP': 5, 'MSC': 5}
-EPOCH_SIZE = {'HCP': 500, 'MSC': 100}
-VAL_SIZE = {'HCP': 160, 'MSC': 160}
+#EPOCH_SIZE = {'HCP': 500, 'MSC': 100}
+#VAL_SIZE = {'HCP': 160, 'MSC': 160}
 #MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
@@ -108,7 +108,7 @@ ENERGY_NU = 1. # 0. #
 RECON_NU = 1. # 0. #
 TETHER_NU = 1. # 0. #
 DIV_NU = 1e3 # 0. #
-CLASSIFIER_NU = 5. # 0. #
+CLASSIFIER_NU = 0. # 5. #
 TEMPLATE_ENERGY_NU = 1. # 0. #
 POINT_POTENTIALS_NU = 1. # 0. #
 DOUBLET_POTENTIALS_NU = 2.5 # 0. #
@@ -299,7 +299,7 @@ def update(
     opt_state,
     *,
     opt,
-    compartment,
+    compartments,
     coor,
     encoder,
     encoder_result,
@@ -333,7 +333,7 @@ def update(
             coor=coor,
             encoder_result=encoder_result,
             encoder=encoder,
-            compartment=compartment,
+            compartments=compartments,
             mode=pathway,
             energy_nu=ENERGY_NU,
             recon_nu=RECON_NU,
@@ -408,7 +408,7 @@ def update(
         model,
         opt_state,
         loss.item(),
-        {k: v.item() for k, v in meta.items()},
+        {k: {j: w.item() for j, w in v.items()} for k, v in meta.items()},
         (grad_info, updates_info),
     )
 
@@ -849,6 +849,7 @@ def main(
         model = extend_model_with_linear_readouts(
             model,
             num_parcels=num_parcels,
+            bilateral=(FORWARD_COMPARTMENTS == 'bilateral'),
             key=jax.random.fold_in(key_m, READOUT_INIT_KEY),
         )
     encode = eqx.filter_jit(encoder)
@@ -922,7 +923,8 @@ def main(
                 breakpoint()
                 continue
             logging.info(
-                f'\n[EPOCH {i} / {MAX_EPOCH}] [STEP {j} / {total_epoch_size}]'
+                f'\n\n[EPOCH {i} / {MAX_EPOCH}] '
+                f'[STEP {j} / {total_epoch_size}]'
                 f'(Overall index {k} / {MAX_EPOCH * total_epoch_size})\n'
                 f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
             )
@@ -945,10 +947,10 @@ def main(
                 )
                 if any([
                     jnp.any(jnp.isnan(
-                        encoder_result[0][m][compartment]
+                        e[compartment]
                     )).item()
                     for compartment in DATA_COMPARTMENTS
-                    for m in range(len(encoder.encoders))
+                    for e in encoder_result[0]
                 ]):
                     logging.warning(
                         f'Invalid encoding for entity sub-{subject} '
@@ -995,7 +997,7 @@ def main(
                                     model=model,
                                     opt_state=opt_state,
                                     **static_args,
-                                    compartment=DATA_COMPARTMENTS,
+                                    compartments=DATA_COMPARTMENTS,
                                     key=key_w,
                                 )
                                 meta_L_call[pathway] = meta_new['cortex_L']
@@ -1023,7 +1025,7 @@ def main(
                                     model=model,
                                     opt_state=opt_state,
                                     **static_args,
-                                    compartment='cortex_L',
+                                    compartments=('cortex_L',),
                                     key=key_l,
                                 )
                                 meta_L_call[pathway] = meta_L_new['cortex_L']
@@ -1037,7 +1039,7 @@ def main(
                                     model=model,
                                     opt_state=opt_state,
                                     **static_args,
-                                    compartment='cortex_R',
+                                    compartments=('cortex_R',),
                                     key=key_r,
                                 )
                                 meta_R_call[pathway] = meta_R_new['cortex_R']
@@ -1077,7 +1079,9 @@ def main(
                     )
             meta = new_meta
             losses += [loss_]
-            logging.info('\n'.join([f'[]{q}: {z}' for q, z in meta.items()]))
+            logging.info(
+                '\n' + '\n'.join([f'[]{q}: {z}' for q, z in meta.items()])
+            )
             (
                 meta_acc, epoch_complete, old_meta_acc, epoch_loss
             ) = accumulate_metadata(meta_acc, meta, k + 1, total_epoch_size)
@@ -1173,8 +1177,8 @@ def main(
             val_entities[ds][int(idx)]
             for ds, idx in instance_index_iter_val[i]
         ]
-        for j in range(len(val_entities)):
-            k = i * len(val_entities) + j
+        for j in range(total_val_size):
+            k = i * total_val_size + j
             entity = epoch_entities_val[j]
 
             try:
@@ -1207,7 +1211,8 @@ def main(
                 breakpoint()
                 continue
             logging.info(
-                f'\n[EPOCH {i} / {MAX_EPOCH}] [STEP {j} / {total_epoch_size}]'
+                f'\n\n[EVAL {i} / {MAX_EPOCH}] '
+                f'[STEP {j} / {total_epoch_size}]'
                 f'(Overall index {k} / {MAX_EPOCH * total_epoch_size})\n'
                 f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
             )
@@ -1318,7 +1323,7 @@ def main(
             logging.info('\n'.join([f'[]{q}: {z}' for q, z in meta.items()]))
             (
                 meta_acc_val, epoch_complete, old_meta_acc, epoch_loss
-            ) = accumulate_metadata(meta_acc_val, meta, k + 1, len(val_entities))
+            ) = accumulate_metadata(meta_acc_val, meta, k + 1, total_val_size)
             if epoch_complete:
                 epoch_history_val += [(epoch_loss, old_meta_acc)]
                 with open('/tmp/epoch_history_val.pkl', 'wb') as f:
