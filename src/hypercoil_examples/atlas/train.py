@@ -303,7 +303,6 @@ def update(
     coor,
     encoder,
     encoder_result,
-    epoch,
     pathway,
     temperature: float = 1.,
     classify_linear: Optional[Tuple[str, Tensor]] = None,
@@ -360,7 +359,7 @@ def update(
             coor=coor,
             encoder_result=encoder_result,
             encoder=encoder,
-            compartment=compartment,
+            compartments=compartments,
             mode=pathway,
             energy_nu=ENERGY_NU,
             recon_nu=RECON_NU,
@@ -383,7 +382,7 @@ def update(
         )
     #return model, opt_state, 0, {}
     if jnp.isnan(loss) or jnp.isinf(loss):
-        logging.error(f'NaN or infinite loss at epoch {epoch}. Terminating.')
+        logging.error(f'NaN or infinite loss. Terminating.')
         logging.info(meta)
         raise InvalidValueException
     updates, opt_state = opt.update(
@@ -727,6 +726,57 @@ def init_data_iterator(
     return instance_index_iter, total_epoch_size
 
 
+def load_data(
+    epoch_entities: list,
+    current_epoch: int,
+    current_step: int,
+    total_epoch_size: int,
+    msg: str = 'EPOCH',
+    *,
+    key: 'jax.random.PRNGKey',
+) -> Tuple[Tensor, 'jax.random.PRNGKey']:
+    overall_index = current_epoch * total_epoch_size + current_step
+    entity = epoch_entities[current_step]
+    key_e = jax.random.fold_in(key, overall_index)
+
+    try:
+        ds = entity.get('ds')
+        # The encoder will handle data normalisation and GSR
+        if ds == 'MSC':
+            get_dataset = get_msc_dataset
+            get_session = lambda e: e.get('session')
+        elif ds == 'HCP':
+            get_dataset = get_hcp_dataset
+            get_session = lambda e: e.get('run')
+        subject = entity.get('subject')
+        session = get_session(entity)
+        task = entity.get('task')
+        T = _get_data(
+            *get_dataset(subject, session, task, get_confounds=True,),
+            normalise=False,
+            gsr=False,
+            pad_to_size=WINDOW_SIZE,
+            key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
+        )
+    except FileNotFoundError:
+        logging.warning(f'Data entity {entity} is absent. Skipping')
+        return None, key_e
+    if jnp.any(jnp.isnan(T)):
+        logging.warning(
+            f'Invalid data for entity sub-{subject} ses-{session}. '
+            'Skipping'
+        )
+        breakpoint()
+        return None, key_e
+    logging.info(
+        f'\n\n[{msg} {current_epoch} / {MAX_EPOCH}] '
+        f'[STEP {current_step} / {total_epoch_size}]'
+        f'(Overall index {overall_index} / {MAX_EPOCH * total_epoch_size})\n'
+        f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
+    )
+    return T, key_e, (ds, subject, session, task), overall_index
+
+
 def configure_optimiser(model: ForwardParcellationModel):
     opt = optax.adamw(learning_rate=LEARNING_RATE)
     opt = optax.chain(rotate_to_clipped_norm(0.1), opt)
@@ -889,44 +939,13 @@ def main(
             for ds, idx in instance_index_iter[i]
         ]
         for j in range(start_step, total_epoch_size):
-            k = i * total_epoch_size + j
-            key_e = jax.random.fold_in(key_t, k)
-            entity = epoch_entities[j]
-
-            try:
-                ds = entity.get('ds')
-                # The encoder will handle data normalisation and GSR
-                if ds == 'MSC':
-                    get_dataset = get_msc_dataset
-                    get_session = lambda e: e.get('session')
-                elif ds == 'HCP':
-                    get_dataset = get_hcp_dataset
-                    get_session = lambda e: e.get('run')
-                subject = entity.get('subject')
-                session = get_session(entity)
-                task = entity.get('task')
-                T = _get_data(
-                    *get_dataset(subject, session, task, get_confounds=True,),
-                    normalise=False,
-                    gsr=False,
-                    pad_to_size=WINDOW_SIZE,
-                    key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
-                )
-            except FileNotFoundError:
-                logging.warning(f'Data entity {entity} is absent. Skipping')
-                continue
-            if jnp.any(jnp.isnan(T)):
-                logging.warning(
-                    f'Invalid data for entity sub-{subject} ses-{session}. '
-                    'Skipping'
-                )
-                breakpoint()
-                continue
-            logging.info(
-                f'\n\n[EPOCH {i} / {MAX_EPOCH}] '
-                f'[STEP {j} / {total_epoch_size}]'
-                f'(Overall index {k} / {MAX_EPOCH * total_epoch_size})\n'
-                f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
+            T, key_e, (ds, subject, session, task), k = load_data(
+                epoch_entities=epoch_entities,
+                current_epoch=i,
+                current_step=j,
+                total_epoch_size=total_epoch_size,
+                msg='EPOCH',
+                key=key_t,
             )
             if WINDOW_SAMPLER is not None:
                 Ts = sample_window(data=T, key=key_e)
@@ -975,7 +994,6 @@ def main(
                             'coor': coor,
                             'encoder': encoder,
                             'encoder_result': encoder_result,
-                            'epoch': k,
                             'pathway': pathway,
                             'classify_linear': (
                                 linear_classifier_args
@@ -1178,49 +1196,15 @@ def main(
             for ds, idx in instance_index_iter_val[i]
         ]
         for j in range(total_val_size):
-            k = i * total_val_size + j
-            entity = epoch_entities_val[j]
-
-            try:
-                ds = entity.get('ds')
-                # The encoder will handle data normalisation and GSR
-                if ds == 'MSC':
-                    get_dataset = get_msc_dataset
-                    get_session = lambda e: e.get('session')
-                elif ds == 'HCP':
-                    get_dataset = get_hcp_dataset
-                    get_session = lambda e: e.get('run')
-                subject = entity.get('subject')
-                session = get_session(entity)
-                task = entity.get('task')
-                T = _get_data(
-                    *get_dataset(subject, session, task, get_confounds=True,),
-                    normalise=False,
-                    gsr=False,
-                    pad_to_size=WINDOW_SIZE,
-                    key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
-                )
-            except FileNotFoundError:
-                logging.warning(f'Data entity {entity} is absent. Skipping')
-                continue
-            if jnp.any(jnp.isnan(T)):
-                logging.warning(
-                    f'Invalid data for entity sub-{subject} ses-{session}. '
-                    'Skipping'
-                )
-                breakpoint()
-                continue
-            logging.info(
-                f'\n\n[EVAL {i} / {MAX_EPOCH}] '
-                f'[STEP {j} / {total_epoch_size}]'
-                f'(Overall index {k} / {MAX_EPOCH * total_epoch_size})\n'
-                f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
+            T, key_e, (ds, subject, session, task), k = load_data(
+                epoch_entities=epoch_entities_val,
+                current_epoch=i,
+                current_step=j,
+                total_epoch_size=total_val_size,
+                msg='EVAL',
+                key=key_t,
             )
             meta = {}
-            T = inject_noise_to_zero_variance(
-                T,
-                key=jax.random.fold_in(key_e, ZERO_VAR_NOISE_KEY),
-            )
             encoder_result = encode(
                 T=T,
                 coor_L=coor_L,

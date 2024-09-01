@@ -1111,6 +1111,7 @@ def forward(
             meta[compartment]['spatial_kappa_energy'] = (
                 kappa_energies[compartment]
             )
+    del energy, kappa_energies
     if recon_nu != 0:
         recon_error = _apply_over_compartments(
             reconstruction_error,
@@ -1122,8 +1123,7 @@ def forward(
         )
         for compartment in compartments:
             meta[compartment]['recon_error'] = recon_error[compartment]
-    else:
-        recon_error = {k: 0 for k in compartments}
+        del recon_error
     if tether_nu != 0:
         key_n = jax.random.split(key_n, len(compartments))
         key_n = {k: key_n[i] for i, k in enumerate(compartments)}
@@ -1140,8 +1140,7 @@ def forward(
         )
         for compartment in compartments:
             meta[compartment]['tether_loss'] = tether_loss[compartment]
-    else:
-        tether_loss = {k: 0 for k in compartments}
+        del tether_loss
     if div_nu != 0:
         div = _apply_over_compartments(
             lambda x: div_nu * logit_normal_maxent_divergence(x).mean(),
@@ -1150,8 +1149,7 @@ def forward(
         )
         for compartment in compartments:
             meta[compartment]['div'] = div[compartment]
-    else:
-        div = {k: 0 for k in compartments}
+        del div
     if template_energy_nu != 0:
         M = encoder_result[1][0]
         template_energy = {
@@ -1166,8 +1164,7 @@ def forward(
             meta[compartment]['template_energy'] = (
                 template_energy[compartment]
             )
-    else:
-        template_energy = {k: 0 for k in compartments}
+        del template_energy
     if linear_classifier_nu != 0:
         parcel_ts = _apply_over_compartments(
             parcellate,
@@ -1187,8 +1184,7 @@ def forward(
         pred_error = -(linear_classifier_target * prediction).sum()
         for compartment in compartments:
             meta[compartment]['prediction_error'] = pred_error
-    else:
-        pred_error = {k: 0 for k in compartments}
+        del pred_error
     return sum(
         sum(meta[compartment].values())
         for compartment in compartments
