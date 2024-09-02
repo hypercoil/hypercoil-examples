@@ -108,7 +108,7 @@ ENERGY_NU = 1. # 0. #
 RECON_NU = 1. # 0. #
 TETHER_NU = 1. # 0. #
 DIV_NU = 1e3 # 0. #
-CLASSIFIER_NU = 0. # 5. #
+CLASSIFIER_NU = 5. # 0. #
 TEMPLATE_ENERGY_NU = 1. # 0. #
 POINT_POTENTIALS_NU = 1. # 0. #
 DOUBLET_POTENTIALS_NU = 2.5 # 0. #
@@ -380,6 +380,7 @@ def update(
             inference=False,
             key=key,
         )
+    jax.block_until_ready(grad)
     #return model, opt_state, 0, {}
     if jnp.isnan(loss) or jnp.isinf(loss):
         logging.error(f'NaN or infinite loss. Terminating.')
@@ -402,6 +403,7 @@ def update(
     else:
         grad_info = updates_info = {}
     model = eqx.apply_updates(model, updates)
+    jax.block_until_ready(model)
     del updates, grad
     return (
         model,
@@ -760,14 +762,14 @@ def load_data(
         )
     except FileNotFoundError:
         logging.warning(f'Data entity {entity} is absent. Skipping')
-        return None, key_e
+        return None, key_e, (None, None, None, None), None
     if jnp.any(jnp.isnan(T)):
         logging.warning(
             f'Invalid data for entity sub-{subject} ses-{session}. '
             'Skipping'
         )
         breakpoint()
-        return None, key_e
+        return None, key_e, (None, None, None, None), None
     logging.info(
         f'\n\n[{msg} {current_epoch} / {MAX_EPOCH}] '
         f'[STEP {current_step} / {total_epoch_size}]'
@@ -947,6 +949,8 @@ def main(
                 msg='EPOCH',
                 key=key_t,
             )
+            if T is None:
+                continue
             if WINDOW_SAMPLER is not None:
                 Ts = sample_window(data=T, key=key_e)
             else:
@@ -988,6 +992,7 @@ def main(
                     temperatures = [1.]
                 for w, temperature in enumerate(temperatures):
                     key_w = jax.random.fold_in(key_u, w)
+                    meta_L_call, meta_R_call = {}, {}
                     for pathway in PATHWAYS:
                         static_args = {
                             'opt': opt,
@@ -1002,7 +1007,6 @@ def main(
                             ),
                             'temperature': temperature,
                         }
-                        meta_L_call, meta_R_call = {}, {}
                         if FORWARD_COMPARTMENTS == 'bilateral':
                             try:
                                 (
@@ -1204,6 +1208,8 @@ def main(
                 msg='EVAL',
                 key=key_t,
             )
+            if T is None:
+                continue
             meta = {}
             encoder_result = encode(
                 T=T,
@@ -1322,4 +1328,10 @@ def main(
 
 
 if __name__ == '__main__':
+    import os
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
+    os.environ['TF_CPP_VMODULE'] = 'bfc_allocator=1'
+    #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    # This is slow, but jax's allocator consistently OOMs when it shouldn't
+    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     main()
