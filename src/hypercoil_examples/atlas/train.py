@@ -9,7 +9,7 @@ Training loop for the parcellation model
 import logging
 import pickle
 from itertools import product
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Literal, Mapping, Optional, Tuple
 
 import equinox as eqx
 import jax
@@ -19,16 +19,24 @@ import optax
 import numpy as np
 import pyvista as pv
 
-from hypercoil.engine import _to_jax_array
-from hypercoil.functional import sample_overlapping_windows_existing_ax
+from hypercoil.functional import (
+    sample_overlapping_windows_existing_ax,
+    sym2vec,
+)
 from hypercoil_examples.atlas.const import HCP_DATA_SPLIT_DEF_ROOT
-#from hypercoil_examples.atlas.cross2subj import visualise
 from hypercoil_examples.atlas.data import (
     get_hcp_dataset, get_msc_dataset, _get_data, inject_noise_to_zero_variance
 )
+from hypercoil_examples.atlas.krlst import (
+    CorrelationKernel,
+    KRLST,
+    observe,
+)
 from hypercoil_examples.atlas.model import (
+    _apply_over_compartments,
     init_full_model,
     forward,
+    parcellate,
     ForwardParcellationModel,
     Tensor,
 )
@@ -98,7 +106,7 @@ TASKS_TARGETS = {
     k: tuple(sorted(set(v[1] for v in vs)))
     for k, vs in TASKS.items()
 }
-DATASETS = ('HCP', 'MSC')
+DATASETS = ('MSC',) # ('HCP', 'MSC') #
 VISPATH = 'full' # 'parametric'
 VISUALISE_TEMPLATE = True
 VISUALISE_SINGLE = True
@@ -118,6 +126,11 @@ VMF_SELECTIVITY_KAPPA = 20.
 FIXED_KAPPA = False
 BIG_KAPPA_NU = 1e-5 # 0. #
 SMALL_KAPPA_NU = 1e0 # 0. #
+
+KRLST_KERNEL = CorrelationKernel()
+KRLST_FORGETTING_FACTOR = 0.999
+KRLST_REGULARISATION = 1e-2
+KRLST_DICTIONARY_SIZE = 256
 
 # Temperature sampler takes the form of a tuple:
 # The first element is the number of samples to take
@@ -305,6 +318,7 @@ def update(
     encoder_result,
     pathway,
     temperature: float = 1.,
+    classify_kernel: Optional[Tuple[KRLST, Tensor]] = None,
     classify_linear: Optional[Tuple[str, Tensor]] = None,
     key: 'jax.random.PRNGKey',
 ):
@@ -313,11 +327,20 @@ def update(
     )
     div_nu = DIV_NU
     if classify_linear is not None:
-        classifier_nu = CLASSIFIER_NU
+        linear_classifier_nu = CLASSIFIER_NU
+        kernel_model_nu = 0
+        kernel_model, kernel_target = classify_kernel
         readout_name, classifier_target = classify_linear
+    elif classify_kernel is not None:
+        linear_classifier_nu = 0
+        kernel_model_nu = CLASSIFIER_NU
+        kernel_model, kernel_target = classify_kernel
+        readout_name, classifier_target = None, None
     else:
-        classifier_nu = 0
-        readout_name = classifier_target = None
+        linear_classifier_nu = 0
+        kernel_model_nu = 0
+        kernel_model, kernel_target = None, None
+        readout_name, classifier_target = None, None
     if FIXED_KAPPA:
         spatial_kappa_energy = None
         selectivity_kappa_energy = None
@@ -344,9 +367,12 @@ def update(
             mass_potentials_nu=MASS_POTENTIALS_NU,
             spatial_kappa_energy=spatial_kappa_energy,
             selectivity_kappa_energy=selectivity_kappa_energy,
-            linear_classifier_nu=classifier_nu,
-            linear_classifier_target=classifier_target,
+            kernel_model_nu=kernel_model_nu,
+            kernel_model=kernel_model,
+            kernel_target=kernel_target,
+            linear_classifier_nu=linear_classifier_nu,
             readout_name=readout_name,
+            linear_classifier_target=classifier_target,
             encoder_type=ENCODER_ARCH,
             injection_points=SERIAL_INJECTION_SITES,
             temperature=temperature,
@@ -371,9 +397,12 @@ def update(
             mass_potentials_nu=MASS_POTENTIALS_NU,
             spatial_kappa_energy=spatial_kappa_energy,
             selectivity_kappa_energy=selectivity_kappa_energy,
-            classifier_nu=classifier_nu,
-            classifier_target=classifier_target,
+            kernel_model_nu=kernel_model_nu,
+            kernel_model=kernel_model,
+            kernel_target=kernel_target,
+            linear_classifier_nu=linear_classifier_nu,
             readout_name=readout_name,
+            linear_classifier_target=classifier_target,
             encoder_type=ENCODER_ARCH,
             injection_points=SERIAL_INJECTION_SITES,
             temperature=temperature,
@@ -672,6 +701,10 @@ def init_data_iterator(
     *,
     key: 'jax.random.PRNGKey',
 ):
+    entities_per_epoch = {
+        k: v for k, v in entities_per_epoch.items()
+        if k in DATASETS
+    }
     num_entities = {
         **{k: len(v) for k, v in data_entities.items()},
         'total': sum([len(v) for v in data_entities.values()]),
@@ -728,17 +761,33 @@ def init_data_iterator(
     return instance_index_iter, total_epoch_size
 
 
+def _get_exemplar_msc():
+    return get_msc_dataset('01', '01')
+
+
+def _get_exemplar_hcp():
+    return get_hcp_dataset('100307', 'LR')
+
+
+def get_exemplar(dataset: str):
+    EXEMPLAR_QUERY = {
+        'MSC': _get_exemplar_msc,
+        'HCP': _get_exemplar_hcp,
+    }
+    return _get_data(EXEMPLAR_QUERY[dataset](), normalise=False, gsr=False)
+
+
 def load_data(
-    epoch_entities: list,
+    entity: list,
     current_epoch: int,
     current_step: int,
     total_epoch_size: int,
     msg: str = 'EPOCH',
     *,
+    suppress_logging: bool = False,
     key: 'jax.random.PRNGKey',
 ) -> Tuple[Tensor, 'jax.random.PRNGKey']:
     overall_index = current_epoch * total_epoch_size + current_step
-    entity = epoch_entities[current_step]
     key_e = jax.random.fold_in(key, overall_index)
 
     try:
@@ -770,12 +819,14 @@ def load_data(
         )
         breakpoint()
         return None, key_e, (None, None, None, None), None
-    logging.info(
-        f'\n\n[{msg} {current_epoch} / {MAX_EPOCH}] '
-        f'[STEP {current_step} / {total_epoch_size}]'
-        f'(Overall index {overall_index} / {MAX_EPOCH * total_epoch_size})\n'
-        f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
-    )
+    if not suppress_logging:
+        logging.info(
+            f'\n\n[{msg} {current_epoch} / {MAX_EPOCH}] '
+            f'[STEP {current_step} / {total_epoch_size}]'
+            f'(Overall index {overall_index} / '
+            f'{MAX_EPOCH * total_epoch_size})\n'
+            f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
+        )
     return T, key_e, (ds, subject, session, task), overall_index
 
 
@@ -792,9 +843,11 @@ def deserialise_if_exists(
     *,
     start_step: Optional[int] = None,
     total_epoch_size: int,
+    classify: Literal['linear', 'kernel'] | None,
 ):
     losses, epoch_history, epoch_history_val = [], [], []
     meta_acc, meta_acc_val = {}, {}
+    krlst_stash = None
     if FORWARD_COMPARTMENTS == 'bilateral':
         grad_info, updates_info = {}, {}
     else:
@@ -842,6 +895,8 @@ def deserialise_if_exists(
         start_epoch = start_step // total_epoch_size
         # add 1 because saving is at step end
         start_step = start_step % total_epoch_size + 1
+        if classify == 'kernel':
+            krlst_stash = {ds: start_step for ds in DATASETS}
     else:
         start_epoch = 0
         start_step = 0
@@ -852,13 +907,98 @@ def deserialise_if_exists(
     ), (meta_acc, meta_acc_val), (
         grad_info,
         updates_info,
+    ), (krlst_stash,)
+
+
+def estimate_connectome(
+    model: ForwardParcellationModel,
+    T: Tensor,
+    template: Tensor,
+    encoder: eqx.Module,
+    coor_L: Tensor,
+    coor_R: Tensor,
+    encoder_result: Optional[Any] = None,
+    temperature: float = 1.,
+    *,
+    key: 'jax.random.PRNGKey',
+):
+    parcellation = model(
+        T=T,
+        M=template,
+        coor={'cortex_L': coor_L, 'cortex_R': coor_R},
+        encoder=encoder,
+        encoder_result=encoder_result,
+        compartments=DATA_COMPARTMENTS,
+        encoder_type=ENCODER_ARCH,
+        injection_points=SERIAL_INJECTION_SITES,
+        inference=True,
+        temperature=temperature,
+        key=key,
+    )[0]
+    parcel_ts = _apply_over_compartments(
+        parcellate,
+        DATA_COMPARTMENTS,
+        parcellation,
+        encoder.temporal.encoders[0].limits,
+        T=T,
     )
+    parcel_ts = jnp.concatenate(
+        tuple(parcel_ts[c] for c in DATA_COMPARTMENTS),
+        axis=-2,
+    )
+    return sym2vec(jnp.corrcoef(parcel_ts))
+
+
+def initialise_kernel_model(
+    model: ForwardParcellationModel,
+    T: Tensor,
+    template: Tensor,
+    encoder: eqx.Module,
+    coor_L: Tensor,
+    coor_R: Tensor,
+    target: Tensor,
+    *,
+    key: 'jax.random.PRNGKey',
+):
+    assert FORWARD_COMPARTMENTS == 'bilateral', (
+        'Kernel model only supports bilateral forward mode'
+    )
+    key_c, key_o = jax.random.split(key)
+    krlst = KRLST(
+        kernel=KRLST_KERNEL,
+        forgetting_factor=KRLST_FORGETTING_FACTOR,
+        regularisation=KRLST_REGULARISATION,
+        dictionary_size=KRLST_DICTIONARY_SIZE,
+        nlin=jax.nn.softmax,
+    )
+    connectome = estimate_connectome(
+        model=model,
+        T=T,
+        template=template,
+        encoder=encoder,
+        coor_L=coor_L,
+        coor_R=coor_R,
+        key=key_c,
+    )
+    return krlst.observe(x=connectome, y=target, t=0, key=key_o)
+
+
+def form_kernel_model_target(
+    ds: str,
+    task: str,
+):
+    tasks = dict(TASKS[ds])
+    tasks_targets = TASKS_TARGETS[ds]
+    model_target = jnp.zeros((len(tasks_targets))).at[
+        tasks_targets.index(tasks[task])
+    ].set(1.)
+    return model_target
 
 
 def main(
     num_parcels: int = 200,
     start_step: Optional[int] = None, # 235, #
-    classify_task_linear: bool = True,
+    classify: Literal['linear', 'kernel'] | None = 'kernel',
 ):
     key = jax.random.PRNGKey(SEED)
     key_d, key_v, key_m, key_t = jax.random.split(key, 4)
@@ -882,7 +1022,7 @@ def main(
         'cortex_R': coor_R,
     }
     # The encoder will handle data normalisation and GSR
-    T = _get_data(get_msc_dataset('01', '01'), normalise=False, gsr=False)
+    T = get_exemplar(DATASETS[0])
     model, encoder, template = init_full_model(
         T=T,
         coor_L=coor_L,
@@ -897,13 +1037,48 @@ def main(
         dropout=ELLGAT_DROPOUT,
         key=key_m,
     )
-    if classify_task_linear:
+    linear_classifier_target = readout_name = kernel_model_target = None
+    if classify == 'linear':
         model = extend_model_with_linear_readouts(
             model,
             num_parcels=num_parcels,
             bilateral=(FORWARD_COMPARTMENTS == 'bilateral'),
             key=jax.random.fold_in(key_m, READOUT_INIT_KEY),
         )
+    elif classify == 'kernel':
+        krlst_stash = {}
+        for i, ds in enumerate(DATASETS):
+            T, j = None, 0
+            while T is None:
+                T, _, (ds, subject, session, task), _ = load_data(
+                    entity=data_entities[ds][j],
+                    current_epoch=0,
+                    current_step=0,
+                    total_epoch_size=total_epoch_size,
+                    msg='EPOCH',
+                    suppress_logging=True,
+                    key=jax.random.fold_in(key_d, (i + 1) * READOUT_INIT_KEY),
+                )
+                j += 1
+            target = form_kernel_model_target(ds=ds, task=task)
+            krlst = initialise_kernel_model(
+                model=model,
+                T=T,
+                template=template,
+                encoder=encoder,
+                coor_L=coor_L,
+                coor_R=coor_R,
+                target=target,
+                key=jax.random.fold_in(key_m, (i + 1) * READOUT_INIT_KEY),
+            )
+            krlst_ds = ds
+            krlst_stash[ds] = 0
+            eqx.tree_serialise_leaves(
+                f'/tmp/ds-{krlst_ds}_KRLST_checkpoint0',
+                krlst,
+            )
+        _observe = eqx.filter_jit(observe)
+        _observe = observe
     encode = eqx.filter_jit(encoder)
     opt, opt_state = configure_optimiser(model)
 
@@ -915,12 +1090,16 @@ def main(
     ), (meta_acc, meta_acc_val), (
         grad_info,
         updates_info,
-    ) = deserialise_if_exists(
+    ), (krlst_stash_,) = deserialise_if_exists(
         model,
         opt_state,
         start_step=start_step,
         total_epoch_size=total_epoch_size,
+        classify=classify,
     )
+    if krlst_stash_ is not None:
+        krlst_stash = krlst_stash_
+        krlst_ds = None
 
     # Configure monitoring and diagnostics
     visualise, visualise_confidence = visdef()
@@ -942,7 +1121,7 @@ def main(
         ]
         for j in range(start_step, total_epoch_size):
             T, key_e, (ds, subject, session, task), k = load_data(
-                epoch_entities=epoch_entities,
+                entity=epoch_entities[j],
                 current_epoch=i,
                 current_step=j,
                 total_epoch_size=total_epoch_size,
@@ -951,6 +1130,22 @@ def main(
             )
             if T is None:
                 continue
+            if classify == 'kernel' and ds != krlst_ds:
+                logging.info(
+                    f'KRLS-T: Changing dataset from {krlst_ds} to {ds}. '
+                    'Stashing current parameters and loading from '
+                    f'checkpoint {krlst_stash[ds]}'
+                )
+                eqx.tree_serialise_leaves(
+                    f'/tmp/ds-{krlst_ds}_KRLST_checkpoint{k}',
+                    krlst,
+                )
+                krlst_stash[krlst_ds] = k
+                krlst = eqx.tree_deserialise_leaves(
+                    f'/tmp/ds-{ds}_KRLST_checkpoint{krlst_stash[ds]}',
+                    like=krlst,
+                )
+                krlst_ds = ds
             if WINDOW_SAMPLER is not None:
                 Ts = sample_window(data=T, key=key_e)
             else:
@@ -980,12 +1175,20 @@ def main(
                         f'ses-{session}. Skipping'
                     )
                     continue
-                if classify_task_linear:
+                if classify == 'linear':
                     linear_classifier_args = form_linear_classifier_args(
                         ds=ds, task=task
                     )
+                    kernel_model_args = None
+                elif classify == 'kernel':
+                    linear_classifier_args = None
+                    kernel_model_args = (
+                        krlst,
+                        form_kernel_model_target(ds=ds, task=task),
+                    )
                 else:
                     linear_classifier_args = None
+                    kernel_model_args = None
                 if TEMPERATURE_SAMPLER is not None:
                     temperatures = sample_temperature(key_u)
                 else:
@@ -1002,6 +1205,11 @@ def main(
                             'pathway': pathway,
                             'classify_linear': (
                                 linear_classifier_args
+                                if pathway == 'full'
+                                else None
+                            ),
+                            'classify_kernel': (
+                                kernel_model_args
                                 if pathway == 'full'
                                 else None
                             ),
@@ -1099,6 +1307,27 @@ def main(
                         len(temperatures) * len(Ts),
                         print_results=False,
                     )
+                    if classify == 'kernel':
+                        key_c, key_o = jax.random.split(key_w)
+                        connectome = estimate_connectome(
+                            model=model,
+                            T=T,
+                            template=template,
+                            encoder=encoder,
+                            coor_L=coor_L,
+                            coor_R=coor_R,
+                            encoder_result=encoder_result,
+                            temperature=temperature,
+                            key=key_c,
+                        )
+                        krlst = _observe(
+                            krlst=krlst,
+                            x=connectome,
+                            y=kernel_model_args[1],
+                            t=jnp.asarray(k, dtype=float),
+                            key=key_o,
+                        )
+                        kernel_model_args = (krlst, kernel_model_args[1])
             meta = new_meta
             losses += [loss_]
             logging.info(
@@ -1178,6 +1407,22 @@ def main(
                     f'/tmp/parcellation_optim_checkpoint{k}',
                     opt_state,
                 )
+                if classify == 'kernel':
+                    eqx.tree_serialise_leaves(
+                        f'/tmp/ds-{krlst_ds}_KRLST_checkpoint{k}',
+                        krlst,
+                    )
+                    krlst_stash[krlst_ds] = k
+                    krlst = eqx.tree_deserialise_leaves(
+                        f'/tmp/ds-{ds}_KRLST_checkpoint{krlst_stash[ds]}',
+                        like=krlst,
+                    )
+                    eqx.tree_serialise_leaves(
+                        f'/tmp/ds-{ds}_KRLST_checkpoint{k}',
+                        krlst,
+                    )
+                    krlst_stash[ds] = k
+                    krlst_ds = ds
                 if FORWARD_COMPARTMENTS == 'bilateral':
                     with open('/tmp/grad_info.pkl', 'wb') as f:
                         pickle.dump(flatten_gradinfo(grad_info), f)
@@ -1201,7 +1446,7 @@ def main(
         ]
         for j in range(total_val_size):
             T, key_e, (ds, subject, session, task), k = load_data(
-                epoch_entities=epoch_entities_val,
+                entity=epoch_entities_val[j],
                 current_epoch=i,
                 current_step=j,
                 total_epoch_size=total_val_size,
@@ -1227,15 +1472,24 @@ def main(
                     f'ses-{session}. Skipping'
                 )
                 continue
-            if classify_task_linear:
+            #TODO: Lift whatever is possible out of the loop! There's a lot of
+            #      repeated computation here.
+            if classify == 'linear':
                 (
                     readout_name,
                     linear_classifier_target,
                 ) = form_linear_classifier_args(
                     ds=ds, task=task
                 )
+                linear_classifier_nu = CLASSIFIER_NU
+                kernel_model_nu = 0
+            elif classify == 'kernel':
+                kernel_model_target = form_kernel_model_target(ds=ds, task=task)
+                linear_classifier_nu = 0
+                kernel_model_nu = CLASSIFIER_NU
             else:
-                linear_classifier_args = None
+                linear_classifier_nu = kernel_model_nu = 0
+                kernel_model_target = linear_classifier_target = None
             if TEMPERATURE_SAMPLER is not None:
                 temperatures = sample_temperature(key_u)
             else:
@@ -1256,7 +1510,10 @@ def main(
                         'point_potentials_nu': POINT_POTENTIALS_NU,
                         'doublet_potentials_nu': DOUBLET_POTENTIALS_NU,
                         'mass_potentials_nu': MASS_POTENTIALS_NU,
-                        'linear_classifier_nu': CLASSIFIER_NU,
+                        'kernel_model_nu': kernel_model_nu,
+                        'kernel_target': kernel_model_target,
+                        'kernel_model': krlst,
+                        'linear_classifier_nu': linear_classifier_nu,
                         'linear_classifier_target': linear_classifier_target,
                         'readout_name': readout_name,
                         'encoder_type': ENCODER_ARCH,

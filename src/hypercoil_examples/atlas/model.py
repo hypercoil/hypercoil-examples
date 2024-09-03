@@ -308,19 +308,30 @@ class ForwardParcellationModel(eqx.Module):
         if isinstance(compartments, str):
             compartments = (compartments,)
         if encoder_result is None:
-            encoder_result = jax.lax.stop_gradient(
-                encoder(
-                    T=T,
-                    coor_L=coor['cortex_L'],
-                    coor_R=coor['cortex_R'],
-                    M=M,
-                    new_M=new_M,
-                    update_weight=update_weight,
-                )
+            (
+                (X, X_aligned, S),
+                (M, new_M, new_update_weight, rescale, _),
+            ) = encoder(
+                T=T,
+                coor_L=coor['cortex_L'],
+                coor_R=coor['cortex_R'],
+                M=M,
+                new_M=new_M,
+                update_weight=update_weight,
             )
-        if encoder_result is None:
-            raise ValueError(
-                'Either encoder or encoder_result must be provided.'
+            encoder_result = (
+                (
+                    jax.lax.stop_gradient(X),
+                    jax.lax.stop_gradient(X_aligned),
+                    jax.lax.stop_gradient(S),
+                ),
+                (
+                    jax.lax.stop_gradient(M),
+                    jax.lax.stop_gradient(new_M),
+                    new_update_weight,
+                    rescale,
+                    None,
+                )
             )
         (
             (X, X_aligned, S),
@@ -1058,6 +1069,9 @@ def forward(
     mass_potentials_nu: float = 1.,
     spatial_kappa_energy: Optional[Tuple[float, float, float]] = None,
     selectivity_kappa_energy: Optional[Tuple[float, float, float]] = None,
+    kernel_model_nu: float = 0.,
+    kernel_model: Optional[eqx.Module] = None,
+    kernel_target: Optional[Tensor] = None,
     linear_classifier_nu: float = 0.,
     linear_classifier_target: Optional[Tensor] = None,
     readout_name: Optional[str] = None,
@@ -1071,7 +1085,7 @@ def forward(
     key: 'jax.random.PRNGKey',
 ):
     meta = {compartment: {} for compartment in compartments}
-    key_m, key_n = jax.random.split(key, 2)
+    key_m, key_n, key_k = jax.random.split(key, 3)
     if mode == 'full':
         fwd = model
     else:
@@ -1165,7 +1179,7 @@ def forward(
                 template_energy[compartment]
             )
         del template_energy
-    if linear_classifier_nu != 0:
+    if linear_classifier_nu != 0 or kernel_model_nu != 0:
         parcel_ts = _apply_over_compartments(
             parcellate,
             compartments,
@@ -1178,10 +1192,18 @@ def forward(
             axis=-2,
         )
         parcel_adjvec = sym2vec(corr(parcel_ts))
-        prediction = jax.nn.log_softmax(
-            model.readouts[readout_name] @ parcel_adjvec
-        )
-        pred_error = -(linear_classifier_target * prediction).sum()
+        if linear_classifier_nu != 0:
+            prediction = jax.nn.log_softmax(
+                model.readouts[readout_name] @ parcel_adjvec
+            )
+            pred_error = linear_classifier_nu * -(
+                linear_classifier_target * prediction
+            ).sum()
+        if kernel_model_nu != 0:
+            prediction, _ = kernel_model(parcel_adjvec, key=key_k)
+            pred_error = kernel_model_nu * -(
+                kernel_target * prediction.squeeze()
+            ).sum()
         for compartment in compartments:
             meta[compartment]['prediction_error'] = pred_error
         del pred_error
