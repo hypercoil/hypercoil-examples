@@ -30,13 +30,50 @@ Openness (NEO)
 Other:
 Delay discounting
 """
+from typing import Any, Sequence, Tuple
 import pandas as pd
 
 
 INPUT_FRAME = '/Users/rastkociric/Downloads/HCPtabular.csv'
+OUTPUT_FRAME = '/tmp/HCPtabularfiltered.tsv'
 
 
-def main():
+def fetch_subject(
+    ref: str | pd.DataFrame,
+    subject: str | int,
+    categoricals: Sequence[str] = (),
+    subject_key = 'Subject',
+) -> Tuple[Any, Sequence[int]]:
+    import jax.numpy as jnp
+    subject = int(subject)
+    if isinstance(ref, str):
+        ref = pd.read_csv(ref, sep='\t').set_index(subject_key)
+    ref = ref.loc[subject]
+    categoricals = {
+        e: [
+            k
+            for k in ref.to_dict()
+            if e in k
+        ]
+        for e in categoricals
+    }
+    all_categoricals = sum([e for e in categoricals.values()], [])
+    continuous = [e for e in ref.to_dict() if e not in all_categoricals]
+    continuous = ref[continuous].values.astype(float)
+    categoricals = {
+        k: ref[v].values.astype(float)
+        for k, v in categoricals.items()
+    }
+    return (
+        jnp.concatenate((continuous, *[e for e in categoricals.values()])),
+        (len(continuous), *[len(e) for e in categoricals.values()][:-1]),
+    )
+
+
+def filter_df_vars(
+    remove_mean_continuous: bool = True,
+    remove_mean_categorical: bool = False,
+):
     df = pd.read_csv(INPUT_FRAME)
     # From the LUT in Kong et al. (2021) supplement (Table S1), we select the
     # following columns that correspond to the above variables.
@@ -61,7 +98,28 @@ def main():
     # There are not enough 36+ subjects to warrant a separate category.
     df['Age_30+'] = df['Age_31-35'] | df['Age_36+']
     df = df.drop(columns=['Age_31-35', 'Age_36+'])
-    df.to_csv('/tmp/HCPtabularfiltered.tsv', sep='\t', index=False)
+    if remove_mean_continuous or remove_mean_categorical:
+        dff = df.set_index('Subject').select_dtypes(float)
+        dfc = df.set_index('Subject').select_dtypes(bool)
+        if remove_mean_continuous:
+            dff = dff - dff.mean()
+        if remove_mean_categorical:
+            dfc = dfc.astype(float) * 2 - 1
+        df = pd.concat([dff, dfc], axis=1).reset_index()
+    df.to_csv(OUTPUT_FRAME, sep='\t', index=False)
+
+
+def main():
+    filter_df_vars(
+        remove_mean_continuous=True,
+        remove_mean_categorical=False,
+    )
+    ref = fetch_subject(
+        ref=OUTPUT_FRAME,
+        subject=100307,
+        categoricals=['Age'],
+    )
+    breakpoint()
 
 
 if __name__ == '__main__':
