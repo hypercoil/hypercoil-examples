@@ -28,7 +28,7 @@ changes. Accordingly, because we initialise arrays at their full final size,
 this implementation is not as space-efficient as the original, but it should
 be faster (at least when the dictionary fills up) and GPU-compatible.
 """
-from typing import Literal, Protocol, Tuple
+from typing import Literal, Optional, Protocol, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -38,14 +38,26 @@ from hypercoil.engine import Tensor
 
 
 class Kernel(Protocol):
-    def __call__(self, x: Tensor, y: Tensor | None) -> Tensor:
+    def __call__(
+        self,
+        x: Tensor,
+        y: Tensor | None,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
         ...
 
 
 class RBFKernel(eqx.Module):
     length_scale: float
 
-    def __call__(self, x: Tensor, y: Tensor | None = None) -> Tensor:
+    def __call__(
+        self,
+        x: Tensor,
+        y: Tensor | None = None,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
         if y is None:
             y = x
         x = jnp.atleast_2d(x)
@@ -61,10 +73,21 @@ class RBFKernel(eqx.Module):
 
 
 class CorrelationKernel(eqx.Module):
-    def __call__(self, x: Tensor, y: Tensor | None = None) -> Tensor:
+    def __call__(
+        self,
+        x: Tensor,
+        y: Tensor | None = None,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tensor:
+        if key is not None:
+            key_x, key_y = jax.random.split(key)
+            x = x + jax.random.normal(key_x, x.shape) * 1e-10
         x = jnp.atleast_2d(x)
         if y is None:
             return jnp.corrcoef(x)
+        elif key is not None:
+            y = y + jax.random.normal(key_y, y.shape) * 1e-10
         y = jnp.atleast_2d(y)
         return jnp.corrcoef(x, y)[:x.shape[-2], -y.shape[-2]:]
 
@@ -77,6 +100,7 @@ class KRLST(eqx.Module):
     dictionary: Tensor | None = None
     time_index: Tensor | None = None
     forget_mode: Literal['B2P', 'UI'] = 'B2P'
+    nlin: Optional[callable] = None
     _mu: Tensor | None = None
     _sigma: Tensor | None = None
     _Q: Tensor | None = None
@@ -98,10 +122,17 @@ class KRLST(eqx.Module):
             'Forget mode must be either "B2P" or "UI".'
         )
 
-    def _initialise(self, x: Tensor, y: Tensor, t: Tensor = 0.) -> 'KRLST':
+    def _initialise(
+        self,
+        x: Tensor,
+        y: Tensor,
+        t: Tensor = 0.,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> 'KRLST':
         y_dim = y.shape[-1] if y.ndim > 0 else 1
         y = y[..., None, None]
-        K = self.kernel(x) + self._jitter
+        K = self.kernel(x, key=key) + self._jitter
         Q = 1 / K # inverse of the kernel matrix K
         mu = (y * K) / (K + self.regularisation)
         sigma = K - ((K ** 2) / (K + self.regularisation))
@@ -136,6 +167,7 @@ class KRLST(eqx.Module):
             _noise_power_numerator=_noise_power_numerator,
             _noise_power_denominator=_noise_power_denominator,
             _jitter=self._jitter,
+            nlin=self.nlin,
         )
 
     @property
@@ -181,8 +213,15 @@ class KRLST(eqx.Module):
     def noise_power_maximum_likelihood(self) -> Tensor:
         return self._noise_power_numerator / self._noise_power_denominator
 
-    def _forget_B2P(self) -> Tuple[Tensor, Tensor]:
-        K = self.kernel(self.dictionary) * self._dictionary_alloc_outer
+    def _forget_B2P(
+        self,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        K = self.kernel(
+            self.dictionary,
+            key=key,
+        ) * self._dictionary_alloc_outer
         sigma = (
             self.forgetting_factor * self._sigma +
             (1 - self.forgetting_factor) * K
@@ -194,14 +233,25 @@ class KRLST(eqx.Module):
         sigma = self._sigma / self.forgetting_factor
         return sigma, self._mu
 
-    def observe(self, x: Tensor, y: Tensor, t: Tensor) -> 'KRLST':
+    def observe(
+        self,
+        x: Tensor,
+        y: Tensor,
+        t: Tensor,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> 'KRLST':
         if self.dictionary is None:
-            return self._initialise(x, y, t)
+            return self._initialise(x, y, t, key=key)
         y = y[..., None, None]
+        if key is not None:
+            key_f, key_dx, key_xx = jax.random.split(key, 3)
+        else:
+            key_f, key_dx, key_xx = None, None, None
         if self.forgetting_factor < 1:
             match self.forget_mode:
                 case 'B2P':
-                    sigma, mu = self._forget_B2P()
+                    sigma, mu = self._forget_B2P(key=key_f)
                 case 'UI':
                     sigma, mu = self._forget_UI()
         else:
@@ -210,10 +260,10 @@ class KRLST(eqx.Module):
 
         # Predict new sample
         K_dx = (
-            self.kernel(self.dictionary, jnp.atleast_2d(x)) *
+            self.kernel(self.dictionary, jnp.atleast_2d(x), key=key_dx) *
             self._dictionary_alloc[:, None]
         )
-        K_xx = self.kernel(x) + self._jitter
+        K_xx = self.kernel(x, key=key_xx) + self._jitter
 
         _q = self._Q @ K_dx
         projection_uncertainty = K_xx - K_dx.T @ _q
@@ -332,6 +382,7 @@ class KRLST(eqx.Module):
             _noise_power_numerator=_noise_power_numerator,
             _noise_power_denominator=_noise_power_denominator,
             _jitter=self._jitter,
+            nlin=self.nlin,
         )
 
     def _criterion_low_jitter(
@@ -355,8 +406,13 @@ class KRLST(eqx.Module):
         #       criterion for vectorised kernel machines
         return jnp.abs(errors).sum(-3)
 
-    def predict(self, X: Tensor) -> Tuple[Tensor, Tensor]:
-        K_dx = self.kernel(self.dictionary, jnp.atleast_2d(X))
+    def predict(
+        self,
+        X: Tensor,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        K_dx = self.kernel(self.dictionary, jnp.atleast_2d(X), key=key)
         mean_est = K_dx.T @ self._Q @ self._mu
         noiseless_var_est = (
             1
@@ -378,11 +434,29 @@ class KRLST(eqx.Module):
 
         return mean_est, var_est
 
+    def __call__(
+        self,
+        X: Tensor,
+        *,
+        key: Optional['jax.random.PRNGKey'] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        mean_est, var_est = self.predict(X, key=key)
+        if self.nlin is not None:
+            mean_est = self.nlin(mean_est)
+        return mean_est, var_est
+
 
 # We should double-check the size of the compilation cache. If it's growing,
 # we should refactor to a "state"-based formulation.
-def observe(krlst: KRLST, x: Tensor, y: Tensor, t: Tensor):
-    return krlst.observe(x=x, y=y, t=t)
+def observe(
+    krlst: KRLST,
+    x: Tensor,
+    y: Tensor,
+    t: Tensor,
+    *,
+    key: Optional['jax.random.PRNGKey'] = None,
+) -> KRLST:
+    return krlst.observe(x=x, y=y, t=t, key=key)
 
 
 def main():
