@@ -99,18 +99,21 @@ class KRLST(eqx.Module):
         )
 
     def _initialise(self, x: Tensor, y: Tensor, t: Tensor = 0.) -> 'KRLST':
-        y_dim = y.shape[-1]if y.ndim > 1 else 1
+        y_dim = y.shape[-1] if y.ndim > 0 else 1
+        y = y[..., None, None]
         K = self.kernel(x) + self._jitter
         Q = 1 / K # inverse of the kernel matrix K
         mu = (y * K) / (K + self.regularisation)
         sigma = K - ((K ** 2) / (K + self.regularisation))
         Q = jnp.zeros(
             (self.dictionary_size, self.dictionary_size)
-        ).at[0, 0].set(Q.squeeze())
-        mu = jnp.zeros((self.dictionary_size, y_dim)).at[0].set(mu.squeeze())
+        ).at[..., 0, 0].set(Q.squeeze())
+        mu = jnp.zeros(
+            (y_dim, self.dictionary_size, 1)
+        ).at[..., 0, 0].set(mu.squeeze())
         sigma = jnp.zeros(
             (self.dictionary_size, self.dictionary_size)
-        ).at[0, 0].set(sigma.squeeze())
+        ).at[..., 0, 0].set(sigma.squeeze())
 
         time_index = jnp.full((self.dictionary_size), -1.).at[0].set(t)
         dictionary = jnp.zeros((self.dictionary_size, x.shape[-1]))
@@ -194,6 +197,7 @@ class KRLST(eqx.Module):
     def observe(self, x: Tensor, y: Tensor, t: Tensor) -> 'KRLST':
         if self.dictionary is None:
             return self._initialise(x, y, t)
+        y = y[..., None, None]
         if self.forgetting_factor < 1:
             match self.forget_mode:
                 case 'B2P':
@@ -231,10 +235,11 @@ class KRLST(eqx.Module):
 
         # Update distribution parameters
         _p = jnp.concatenate(
-            (_h, jnp.atleast_2d(noiseless_predictive_var))
+            (_h, jnp.atleast_2d(noiseless_predictive_var)),
+            axis=-2,
         )
         mu = (
-            jnp.concatenate((mu, predictive_mean)) +
+            jnp.concatenate((mu, predictive_mean), axis=-2) +
             ((y - predictive_mean) / predictive_var) * _p
         )
         sigma = jnp.block([
@@ -296,7 +301,9 @@ class KRLST(eqx.Module):
         Q = Q - (Qs.reshape(-1, 1) * Qs.reshape(1, -1)) / denom
 
         # Align the parameter indices correctly
-        mu = mu.at[(prune, -1)].set(mu[(-1, prune)])[:-1]
+        mu = mu.at[..., (prune, -1), :].set(
+            mu[..., (-1, prune), :]
+        )[..., :-1, :]
         _sigma = sigma.at[(prune, -1), :].set(sigma[(-1, prune), :])
         sigma = _sigma.at[:, (prune, -1)].set(
             _sigma[:, (-1, prune)]
@@ -343,8 +350,10 @@ class KRLST(eqx.Module):
     ):
         denom = jnp.diag(Q)
         denom = jnp.where(~self._x_dictionary_alloc, jnp.inf, denom)
-        errors = (Q @ mu).reshape(-1,) / denom
-        return jnp.abs(errors).reshape(-1, 1)
+        errors = (Q @ mu) / denom[..., None]
+        # TODO: We might want reductions other than the sum when determining a
+        #       criterion for vectorised kernel machines
+        return jnp.abs(errors).sum(-3)
 
     def predict(self, X: Tensor) -> Tuple[Tensor, Tensor]:
         K_dx = self.kernel(self.dictionary, jnp.atleast_2d(X))
@@ -391,9 +400,14 @@ def main():
         """The function to predict."""
         return x * jnp.sin(x)
 
+    def g(x):
+        """Another function to predict."""
+        return x * jnp.cos(x)
+
     # Observations
     X = jnp.atleast_2d([1.0, 3.0, 5.0, 6.0, 7.0, 8.0]).T
-    y = f(X).ravel()
+    #y = f(X).ravel()
+    y = jnp.stack((f(X).ravel(), g(X).ravel()), axis=-1)
 
     x = jnp.atleast_2d(jnp.linspace(0, 10, 1000)).T
 
@@ -416,12 +430,14 @@ def main():
 
     # Predict for unknown data
     y_pred, y_std = krlst.predict(x)
+    y_pred, y_std = y_pred.squeeze().T, y_std.squeeze().T
 
     plt.figure(figsize=(10,5))
     plt.plot(x, f(x), 'r:', label=r'$f(x) = x\,\sin(x)$')
+    plt.plot(x, g(x), 'g:', label=r'$f(x) = x\,\cos(x)$')
     plt.plot(
-        krlst.dictionary,
-        krlst.mu,
+        krlst.dictionary.squeeze(),
+        krlst.mu.T.squeeze(),
         'k.',
         markersize=20,
         marker="*",
@@ -437,7 +453,7 @@ def main():
     plt.ylabel('$f(x)$')
     plt.ylim(-10, 20)
     plt.legend(loc='upper left')
-    plt.show()
+    plt.savefig('/tmp/krlst_result.png')
     breakpoint()
 
 
