@@ -437,13 +437,16 @@ class KRLST(eqx.Module):
     def __call__(
         self,
         X: Tensor,
+        y: Tensor | None = None,
         *,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
         mean_est, var_est = self.predict(X, key=key)
         if self.nlin is not None:
-            mean_est = self.nlin(mean_est)
-        return mean_est, var_est
+            #TODO:
+            # We're basically assuming this is an error function for now
+            mean_est = self.nlin(mean_est.squeeze(), y)
+        return mean_est, var_est.squeeze()
 
 
 # We should double-check the size of the compilation cache. If it's growing,

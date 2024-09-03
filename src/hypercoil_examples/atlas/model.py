@@ -1200,10 +1200,12 @@ def forward(
                 linear_classifier_target * prediction
             ).sum()
         if kernel_model_nu != 0:
-            prediction, _ = kernel_model(parcel_adjvec, key=key_k)
-            pred_error = kernel_model_nu * -(
-                kernel_target * prediction.squeeze()
-            ).sum()
+            pred_error, _ = kernel_model(
+                parcel_adjvec,
+                kernel_target,
+                key=key_k,
+            )
+            pred_error = kernel_model_nu * pred_error.sum()
         for compartment in compartments:
             meta[compartment]['prediction_error'] = pred_error
         del pred_error

@@ -28,7 +28,9 @@ def simple_error(
     split_indices: Sequence[int],
     shard_categorical: Sequence[bool],
     split_axis: int = -1,
-    categorical_predictions_multiplier: float = 1.,
+    confidence_multiplier: float = 1.,
+    categorical_multiplier: float = 1.,
+    continuous_multiplier: float = 1.,
 ) -> Tensor:
     """
     Compute the error between predictions and targets, where the predictions
@@ -47,8 +49,6 @@ def simple_error(
         Whether each shard is categorical.
     split_axis : int, default=-1
         The axis along which to split the predictions.
-    categorical_predictions_multiplier : float, default=1.
-        The multiplier to apply to categorical predictions.
 
     Returns
     -------
@@ -62,13 +62,13 @@ def simple_error(
     # Compute the error for each shard.
     errors = jnp.concatenate(
         [
-            softmax_cross_entropy(
-                categorical_predictions_multiplier * p.swapaxes(split_axis, -1),
+            categorical_multiplier * softmax_cross_entropy(
+                confidence_multiplier * p.swapaxes(split_axis, -1),
                 t.swapaxes(split_axis, -1),
             )[..., None].swapaxes(split_axis, -1)
             if c
             # else squared_error(p, t).mean(axis=split_axis, keepdims=True)
-            else squared_error(p, t)
+            else continuous_multiplier * squared_error(p, t)
             for p, t, c in zip(predictions, targets, shard_categorical)
         ],
         axis=split_axis,
@@ -79,8 +79,10 @@ def simple_error(
 class SimpleError(eqx.Module):
     split_indices: Sequence[int]
     shard_categorical: Sequence[bool]
-    split_axis: int
-    categorical_predictions_multiplier: float
+    split_axis: int = -1
+    confidence_multiplier: float = 1.
+    categorical_multiplier: float = 1.
+    continuous_multiplier: float = 1.
 
     def __call__(
         self,
@@ -90,10 +92,12 @@ class SimpleError(eqx.Module):
         return simple_error(
             predictions,
             targets,
-            self.split_indices,
-            self.shard_categorical,
-            self.split_axis,
-            self.categorical_predictions_multiplier,
+            split_indices=self.split_indices,
+            shard_categorical=self.shard_categorical,
+            split_axis=self.split_axis,
+            confidence_multiplier=self.confidence_multiplier,
+            categorical_multiplier=self.categorical_multiplier,
+            continuous_multiplier=self.continuous_multiplier,
         )
 
 
@@ -102,7 +106,7 @@ def main():
         split_indices=(5,),
         shard_categorical=(False, True),
         split_axis=-2,
-        categorical_predictions_multiplier=1.,
+        confidence_multiplier=1.,
     )
     X = jnp.concatenate(
         (

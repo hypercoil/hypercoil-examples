@@ -9,7 +9,7 @@ Training loop for the parcellation model
 import logging
 import pickle
 from itertools import product
-from typing import Any, Literal, Mapping, Optional, Tuple
+from typing import Any, Literal, Mapping, Optional, Sequence, Tuple
 
 import equinox as eqx
 import jax
@@ -23,6 +23,7 @@ from hypercoil.functional import (
     sample_overlapping_windows_existing_ax,
     sym2vec,
 )
+from hypercoil_examples.atlas.behavioural import fetch_subject
 from hypercoil_examples.atlas.const import HCP_DATA_SPLIT_DEF_ROOT
 from hypercoil_examples.atlas.data import (
     get_hcp_dataset, get_msc_dataset, _get_data, inject_noise_to_zero_variance
@@ -42,6 +43,9 @@ from hypercoil_examples.atlas.model import (
 )
 from hypercoil_examples.atlas.positional import (
     get_coors
+)
+from hypercoil_examples.atlas.simpleerror import (
+    SimpleError,
 )
 from hyve import (
     Cell,
@@ -107,6 +111,21 @@ TASKS_TARGETS = {
     for k, vs in TASKS.items()
 }
 DATASETS = ('MSC',) # ('HCP', 'MSC') #
+HCP_EXTRA_SUBJECT_MEASURES = '/tmp/HCPtabularfiltered.tsv'
+KERNEL_MODEL_TARGETS = {
+    'MSC': ('__task__',),
+    'HCP': (
+        '__task__',
+        {
+            HCP_EXTRA_SUBJECT_MEASURES: {
+                'categoricals': ('Age',),
+            }
+        },
+    )
+}
+KERNEL_ERR_CONFIDENCE_FACTOR = 1.
+KERNEL_ERR_CATEGORICAL_FACTOR = 1.
+KERNEL_ERR_CONTINUOUS_FACTOR = 1.
 VISPATH = 'full' # 'parametric'
 VISUALISE_TEMPLATE = True
 VISUALISE_SINGLE = True
@@ -620,13 +639,21 @@ def extend_model_with_linear_readouts(
     )
 
 
-def form_linear_classifier_args(ds: str, task: str):
-    readout_name = ds
+def form_task_target(
+    ds: str,
+    task: str,
+) -> Tensor:
     tasks = dict(TASKS[ds])
     tasks_targets = TASKS_TARGETS[ds]
-    classifier_target = jnp.zeros((len(tasks_targets))).at[
+    task_target = jnp.zeros((len(tasks_targets))).at[
         tasks_targets.index(tasks[task])
     ].set(1.)
+    return task_target
+
+
+def form_linear_classifier_args(ds: str, task: str) -> Tensor:
+    readout_name = ds
+    classifier_target = form_task_target(ds, task)
     return (readout_name, classifier_target)
 
 
@@ -634,7 +661,7 @@ def sample_window(
     data: Tensor,
     *,
     key: 'jax.random.PRNGKey',
-):
+) -> Sequence[Tensor]:
     n_window_samples, window_sampler, window_seed = WINDOW_SAMPLER
     return [
         window_sampler(
@@ -949,6 +976,61 @@ def estimate_connectome(
     return sym2vec(jnp.corrcoef(parcel_ts))
 
 
+def init_kernel_model_target(
+    ds: str,
+    subject: str,
+    task: str,
+) -> Tuple[Tensor, Sequence[bool], Sequence[int]]:
+    target_spec = KERNEL_MODEL_TARGETS[ds]
+    targets = ()
+    shard_categorical = ()
+    split_index = ()
+    total_size = 0
+    for spec in target_spec:
+        if spec == '__task__':
+            new_target = form_task_target(ds, task)
+            targets += (new_target,)
+            shard_categorical += (True,)
+            total_size += len(new_target)
+            split_index += (total_size,)
+        else:
+            path = list(spec.keys())[0]
+            spec_params = spec[path]
+            new_target, new_indices = fetch_subject(
+                ref=path,
+                subject=subject,
+                **spec_params,
+            )
+            new_indices = tuple(e + total_size for e in new_indices)
+            total_size += len(new_target)
+            shard_categorical += (False,) + (True,) * (len(new_indices))
+            targets += (new_target,)
+            split_index += (new_indices + (total_size,))
+    return jnp.concatenate(targets), shard_categorical, split_index[:-1]
+
+
+def form_kernel_model_target(
+    ds: str,
+    subject: str,
+    task: str,
+) -> Tensor:
+    target_spec = KERNEL_MODEL_TARGETS[ds]
+    targets = ()
+    for spec in target_spec:
+        if spec == '__task__':
+            targets += (form_task_target(ds, task),)
+        else:
+            path = list(spec.keys())[0]
+            spec_params = spec[path]
+            new_target, _ = fetch_subject(
+                ref=path,
+                subject=subject,
+                **spec_params,
+            )
+            targets += (new_target,)
+    return jnp.concatenate(targets)
+
+
 def initialise_kernel_model(
     model: ForwardParcellationModel,
     T: Tensor,
@@ -957,9 +1039,11 @@ def initialise_kernel_model(
     coor_L: Tensor,
     coor_R: Tensor,
     target: Tensor,
+    err: SimpleError,
     *,
     key: 'jax.random.PRNGKey',
-):
+) -> KRLST:
+    logging.info('Initialising kernel model (KRLST) (requires forward pass)')
     assert FORWARD_COMPARTMENTS == 'bilateral', (
         'Kernel model only supports bilateral forward mode'
     )
@@ -969,7 +1053,7 @@ def initialise_kernel_model(
         forgetting_factor=KRLST_FORGETTING_FACTOR,
         regularisation=KRLST_REGULARISATION,
         dictionary_size=KRLST_DICTIONARY_SIZE,
-        nlin=jax.nn.softmax,
+        nlin=err,
     )
     connectome = estimate_connectome(
         model=model,
@@ -983,18 +1067,6 @@ def initialise_kernel_model(
     return krlst.observe(x=connectome, y=target, t=0, key=key_o)
 
 
-def form_kernel_model_target(
-    ds: str,
-    task: str,
-):
-    tasks = dict(TASKS[ds])
-    tasks_targets = TASKS_TARGETS[ds]
-    model_target = jnp.zeros((len(tasks_targets))).at[
-        tasks_targets.index(tasks[task])
-    ].set(1.)
-    return model_target
-
-
 def main(
     num_parcels: int = 200,
     start_step: Optional[int] = None, # 235, #
@@ -1002,6 +1074,7 @@ def main(
 ):
     key = jax.random.PRNGKey(SEED)
     key_d, key_v, key_m, key_t = jax.random.split(key, 4)
+    logging.info('Configuring dataset iteration')
     data_entities, val_entities = init_data_entities()
     instance_index_iter, total_epoch_size = init_data_iterator(
         data_entities,
@@ -1016,6 +1089,7 @@ def main(
     )
 
     # Configure the model and optimiser
+    logging.info('Initialising model architecture')
     coor_L, coor_R = get_coors()
     coor = {
         'cortex_L': coor_L,
@@ -1060,7 +1134,18 @@ def main(
                     key=jax.random.fold_in(key_d, (i + 1) * READOUT_INIT_KEY),
                 )
                 j += 1
-            target = form_kernel_model_target(ds=ds, task=task)
+            target, shard_categorical, split_indices = init_kernel_model_target(
+                ds=ds,
+                subject=subject,
+                task=task,
+            )
+            err = SimpleError(
+                split_indices=split_indices,
+                shard_categorical=shard_categorical,
+                confidence_multiplier=KERNEL_ERR_CONFIDENCE_FACTOR,
+                categorical_multiplier=KERNEL_ERR_CATEGORICAL_FACTOR,
+                continuous_multiplier=KERNEL_ERR_CONTINUOUS_FACTOR,
+            )
             krlst = initialise_kernel_model(
                 model=model,
                 T=T,
@@ -1069,6 +1154,7 @@ def main(
                 coor_L=coor_L,
                 coor_R=coor_R,
                 target=target,
+                err=err,
                 key=jax.random.fold_in(key_m, (i + 1) * READOUT_INIT_KEY),
             )
             krlst_ds = ds
@@ -1112,6 +1198,7 @@ def main(
     # i denotes the epoch
     # j denotes the step within the epoch
     # k denotes the total step
+    logging.info('Commencing training loop')
     for i in range(start_epoch, MAX_EPOCH + 1):
 
         # Training loop
@@ -1184,7 +1271,11 @@ def main(
                     linear_classifier_args = None
                     kernel_model_args = (
                         krlst,
-                        form_kernel_model_target(ds=ds, task=task),
+                        form_kernel_model_target(
+                            ds=ds,
+                            subject=subject,
+                            task=task,
+                        ),
                     )
                 else:
                     linear_classifier_args = None
@@ -1484,7 +1575,11 @@ def main(
                 linear_classifier_nu = CLASSIFIER_NU
                 kernel_model_nu = 0
             elif classify == 'kernel':
-                kernel_model_target = form_kernel_model_target(ds=ds, task=task)
+                kernel_model_target = form_kernel_model_target(
+                    ds=ds,
+                    subject=subject,
+                    task=task,
+                )
                 linear_classifier_nu = 0
                 kernel_model_nu = CLASSIFIER_NU
             else:
