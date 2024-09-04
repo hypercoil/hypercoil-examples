@@ -50,8 +50,16 @@ FORWARD_IN_DIM_ARCH = {
     'ELLGAT': (64, 256),
     'ELLGATBlock': (32, 64),
 }
+FORWARD_IN_DIM_ARCH = {
+    'ELLGAT': (64, 192),
+    'ELLGATBlock': (32, 64),
+}
 HIDDEN_DIM_ARCH = {
     'ELLGAT': (16, 64, 256),
+    'ELLGATBlock': (8, 16, 64),
+}
+HIDDEN_DIM_ARCH = {
+    'ELLGAT': (16, 64, 192),
     'ELLGATBlock': (8, 16, 64),
 }
 CONTRALATERAL_JITTER = 1e-4

@@ -22,10 +22,10 @@ from hypercoil_examples.atlas.data import (
 from hypercoil_examples.atlas.model import init_encoder_model
 from hypercoil_examples.atlas.positional import get_coors
 
-MAX_EPOCH = 9801
-CHECKPOINT_INTERVAL = 1960
-MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
-MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+MAX_EPOCH = 14785 # 9801
+CHECKPOINT_INTERVAL = 1848 # 1960
+MSC_SUBJECTS = ('01', '02', '03') #, '04', '05', '06', '07', '08', '09', '10',)
+MSC_SESSIONS = ('01', '02', '03') #, '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS = ('05', '06')
 MSC_TASKS = (
     'rest', 'motor_run-01', 'motor_run-02',
@@ -62,6 +62,7 @@ def main(last_checkpoint: Optional[int] = None):
             )
         ]
     num_entities = len(data_entities)
+    breakpoint()
     coor_L, coor_R = get_coors()
     model, _ = init_encoder_model(coor_L=coor_L)
     encode = eqx.filter_jit(model)

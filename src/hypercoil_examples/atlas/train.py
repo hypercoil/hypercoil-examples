@@ -24,7 +24,10 @@ from hypercoil.functional import (
     sym2vec,
 )
 from hypercoil_examples.atlas.behavioural import fetch_subject
-from hypercoil_examples.atlas.const import HCP_DATA_SPLIT_DEF_ROOT
+from hypercoil_examples.atlas.const import (
+    HCP_DATA_SPLIT_DEF_ROOT,
+    HCP_EXTRA_SUBJECT_MEASURES,
+)
 from hypercoil_examples.atlas.data import (
     get_hcp_dataset, get_msc_dataset, _get_data, inject_noise_to_zero_variance
 )
@@ -76,8 +79,8 @@ DATA_COMPARTMENTS = ('cortex_L', 'cortex_R')
 FORWARD_COMPARTMENTS = 'bilateral' # 'separate' #
 EPOCH_SIZE = {'HCP': 5, 'MSC': 5}
 VAL_SIZE = {'HCP': 5, 'MSC': 5}
-#EPOCH_SIZE = {'HCP': 500, 'MSC': 100}
-#VAL_SIZE = {'HCP': 160, 'MSC': 160}
+EPOCH_SIZE = {'HCP': 500, 'MSC': 100}
+VAL_SIZE = {'HCP': 160, 'MSC': 160}
 #MSC_SUBJECTS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
@@ -110,8 +113,6 @@ TASKS_TARGETS = {
     k: tuple(sorted(set(v[1] for v in vs)))
     for k, vs in TASKS.items()
 }
-DATASETS = ('MSC',) # ('HCP', 'MSC') #
-HCP_EXTRA_SUBJECT_MEASURES = '/tmp/HCPtabularfiltered.tsv'
 KERNEL_MODEL_TARGETS = {
     'MSC': ('__task__',),
     'HCP': (
@@ -126,20 +127,23 @@ KERNEL_MODEL_TARGETS = {
 KERNEL_ERR_CONFIDENCE_FACTOR = 1.
 KERNEL_ERR_CATEGORICAL_FACTOR = 1.
 KERNEL_ERR_CONTINUOUS_FACTOR = 1.
+
+DATASETS = ('HCP', 'MSC') # ('MSC',) #
+
 VISPATH = 'full' # 'parametric'
 VISUALISE_TEMPLATE = True
 VISUALISE_SINGLE = True
 
 ELLGAT_DROPOUT = 0.1
-ENERGY_NU = 1. # 0. #
+ENERGY_NU = .5 # 0. #
 RECON_NU = 1. # 0. #
 TETHER_NU = 1. # 0. #
 DIV_NU = 1e3 # 0. #
 CLASSIFIER_NU = 5. # 0. #
 TEMPLATE_ENERGY_NU = 1. # 0. #
 POINT_POTENTIALS_NU = 1. # 0. #
-DOUBLET_POTENTIALS_NU = 2.5 # 0. #
-MASS_POTENTIALS_NU = 100. # 0. #
+DOUBLET_POTENTIALS_NU = 5. # 0. #
+MASS_POTENTIALS_NU = 200. # 0. #
 VMF_SPATIAL_KAPPA = 50.
 VMF_SELECTIVITY_KAPPA = 20.
 FIXED_KAPPA = False
@@ -149,7 +153,10 @@ SMALL_KAPPA_NU = 1e0 # 0. #
 KRLST_KERNEL = CorrelationKernel()
 KRLST_FORGETTING_FACTOR = 0.999
 KRLST_REGULARISATION = 1e-2
-KRLST_DICTIONARY_SIZE = 256
+KRLST_DICTIONARY_SIZE = {
+    'HCP': 192,
+    'MSC': 64,
+}
 
 # Temperature sampler takes the form of a tuple:
 # The first element is the number of samples to take
@@ -240,7 +247,10 @@ def visdef():
         parcel_reduction: callable,
         cmap: str = 'magma',
         additional_overlay_primitives: Tuple[callable] = (),
+        additional_scalars_params: Mapping[str, Any] | None = None,
     ):
+        if additional_scalars_params is None:
+            additional_scalars_params = {}
         plot_f = plotdef(
             surf_from_archive(),
             add_surface_overlay(
@@ -248,7 +258,7 @@ def visdef():
                 surf_scalars_from_array(
                     scalars,
                     is_masked=True,
-                    allow_multihemisphere=False,
+                    **additional_scalars_params,
                 ),
                 *additional_overlay_primitives,
             ),
@@ -316,6 +326,7 @@ def visdef():
                 v2f_interpolation='mode',
             ),
         ),
+        additional_scalars_params={'allow_multihemisphere': False},
     )
     plot_confidence_f = parameterise_plot(
         'parcel_confidence',
@@ -848,9 +859,9 @@ def load_data(
         return None, key_e, (None, None, None, None), None
     if not suppress_logging:
         logging.info(
-            f'\n\n[{msg} {current_epoch} / {MAX_EPOCH}] '
-            f'[STEP {current_step} / {total_epoch_size}]'
-            f'(Overall index {overall_index} / '
+            f'\n\n[{msg} {current_epoch + 1} / {MAX_EPOCH}] '
+            f'[STEP {current_step + 1} / {total_epoch_size}]'
+            f'(Overall index {overall_index + 1} / '
             f'{MAX_EPOCH * total_epoch_size})\n'
             f'(ds-{ds} sub-{subject} ses-{session} task-{task})'
         )
@@ -871,10 +882,10 @@ def deserialise_if_exists(
     start_step: Optional[int] = None,
     total_epoch_size: int,
     classify: Literal['linear', 'kernel'] | None,
+    krlst_stash: Mapping,
 ):
     losses, epoch_history, epoch_history_val = [], [], []
     meta_acc, meta_acc_val = {}, {}
-    krlst_stash = None
     if FORWARD_COMPARTMENTS == 'bilateral':
         grad_info, updates_info = {}, {}
     else:
@@ -919,11 +930,16 @@ def deserialise_if_exists(
                 logging.info(
                     'No gradient diagnostics found--starting new record'
                 )
+        if classify == 'kernel':
+            for ds in DATASETS:
+                krlst = eqx.tree_deserialise_leaves(
+                    f'/tmp/ds-{ds}_KRLST_checkpoint{start_step}',
+                    like=krlst_stash[ds],
+                )
+                krlst_stash[ds] = krlst
         start_epoch = start_step // total_epoch_size
         # add 1 because saving is at step end
         start_step = start_step % total_epoch_size + 1
-        if classify == 'kernel':
-            krlst_stash = {ds: start_step for ds in DATASETS}
     else:
         start_epoch = 0
         start_step = 0
@@ -1028,7 +1044,8 @@ def form_kernel_model_target(
                 **spec_params,
             )
             targets += (new_target,)
-    return jnp.concatenate(targets)
+    target = jnp.concatenate(targets).astype(float)
+    return jnp.where(jnp.isnan(target), 0., target)
 
 
 def initialise_kernel_model(
@@ -1040,6 +1057,7 @@ def initialise_kernel_model(
     coor_R: Tensor,
     target: Tensor,
     err: SimpleError,
+    ds: str,
     *,
     key: 'jax.random.PRNGKey',
 ) -> KRLST:
@@ -1050,9 +1068,9 @@ def initialise_kernel_model(
     key_c, key_o = jax.random.split(key)
     krlst = KRLST(
         kernel=KRLST_KERNEL,
-        forgetting_factor=KRLST_FORGETTING_FACTOR,
-        regularisation=KRLST_REGULARISATION,
-        dictionary_size=KRLST_DICTIONARY_SIZE,
+        forgetting_factor=jnp.asarray(KRLST_FORGETTING_FACTOR),
+        regularisation=jnp.asarray(KRLST_REGULARISATION),
+        dictionary_size=KRLST_DICTIONARY_SIZE[ds],
         nlin=err,
     )
     connectome = estimate_connectome(
@@ -1069,7 +1087,7 @@ def initialise_kernel_model(
 
 def main(
     num_parcels: int = 200,
-    start_step: Optional[int] = None, # 235, #
+    start_step: Optional[int] = None, # 0, #
     classify: Literal['linear', 'kernel'] | None = 'kernel',
 ):
     key = jax.random.PRNGKey(SEED)
@@ -1112,6 +1130,7 @@ def main(
         key=key_m,
     )
     linear_classifier_target = readout_name = kernel_model_target = None
+    krlst_stash = None
     if classify == 'linear':
         model = extend_model_with_linear_readouts(
             model,
@@ -1155,16 +1174,11 @@ def main(
                 coor_R=coor_R,
                 target=target,
                 err=err,
+                ds=ds,
                 key=jax.random.fold_in(key_m, (i + 1) * READOUT_INIT_KEY),
             )
-            krlst_ds = ds
-            krlst_stash[ds] = 0
-            eqx.tree_serialise_leaves(
-                f'/tmp/ds-{krlst_ds}_KRLST_checkpoint0',
-                krlst,
-            )
+            krlst_stash[ds] = krlst
         _observe = eqx.filter_jit(observe)
-        _observe = observe
     encode = eqx.filter_jit(encoder)
     opt, opt_state = configure_optimiser(model)
 
@@ -1182,10 +1196,8 @@ def main(
         start_step=start_step,
         total_epoch_size=total_epoch_size,
         classify=classify,
+        krlst_stash=krlst_stash,
     )
-    if krlst_stash_ is not None:
-        krlst_stash = krlst_stash_
-        krlst_ds = None
 
     # Configure monitoring and diagnostics
     visualise, visualise_confidence = visdef()
@@ -1217,22 +1229,6 @@ def main(
             )
             if T is None:
                 continue
-            if classify == 'kernel' and ds != krlst_ds:
-                logging.info(
-                    f'KRLS-T: Changing dataset from {krlst_ds} to {ds}. '
-                    'Stashing current parameters and loading from '
-                    f'checkpoint {krlst_stash[ds]}'
-                )
-                eqx.tree_serialise_leaves(
-                    f'/tmp/ds-{krlst_ds}_KRLST_checkpoint{k}',
-                    krlst,
-                )
-                krlst_stash[krlst_ds] = k
-                krlst = eqx.tree_deserialise_leaves(
-                    f'/tmp/ds-{ds}_KRLST_checkpoint{krlst_stash[ds]}',
-                    like=krlst,
-                )
-                krlst_ds = ds
             if WINDOW_SAMPLER is not None:
                 Ts = sample_window(data=T, key=key_e)
             else:
@@ -1270,7 +1266,7 @@ def main(
                 elif classify == 'kernel':
                     linear_classifier_args = None
                     kernel_model_args = (
-                        krlst,
+                        krlst_stash[ds],
                         form_kernel_model_target(
                             ds=ds,
                             subject=subject,
@@ -1411,14 +1407,14 @@ def main(
                             temperature=temperature,
                             key=key_c,
                         )
-                        krlst = _observe(
-                            krlst=krlst,
+                        krlst_stash[ds] = _observe(
+                            krlst=krlst_stash[ds],
                             x=connectome,
                             y=kernel_model_args[1],
                             t=jnp.asarray(k, dtype=float),
                             key=key_o,
                         )
-                        kernel_model_args = (krlst, kernel_model_args[1])
+                        kernel_model_args = (krlst_stash[ds], kernel_model_args[1])
             meta = new_meta
             losses += [loss_]
             logging.info(
@@ -1499,21 +1495,11 @@ def main(
                     opt_state,
                 )
                 if classify == 'kernel':
-                    eqx.tree_serialise_leaves(
-                        f'/tmp/ds-{krlst_ds}_KRLST_checkpoint{k}',
-                        krlst,
-                    )
-                    krlst_stash[krlst_ds] = k
-                    krlst = eqx.tree_deserialise_leaves(
-                        f'/tmp/ds-{ds}_KRLST_checkpoint{krlst_stash[ds]}',
-                        like=krlst,
-                    )
-                    eqx.tree_serialise_leaves(
-                        f'/tmp/ds-{ds}_KRLST_checkpoint{k}',
-                        krlst,
-                    )
-                    krlst_stash[ds] = k
-                    krlst_ds = ds
+                    for ds in DATASETS:
+                        eqx.tree_serialise_leaves(
+                            f'/tmp/ds-{ds}_KRLST_checkpoint{k}',
+                            krlst_stash[ds],
+                        )
                 if FORWARD_COMPARTMENTS == 'bilateral':
                     with open('/tmp/grad_info.pkl', 'wb') as f:
                         pickle.dump(flatten_gradinfo(grad_info), f)
@@ -1607,7 +1593,7 @@ def main(
                         'mass_potentials_nu': MASS_POTENTIALS_NU,
                         'kernel_model_nu': kernel_model_nu,
                         'kernel_target': kernel_model_target,
-                        'kernel_model': krlst,
+                        'kernel_model': krlst_stash[ds],
                         'linear_classifier_nu': linear_classifier_nu,
                         'linear_classifier_target': linear_classifier_target,
                         'readout_name': readout_name,
@@ -1681,9 +1667,10 @@ def main(
 
 if __name__ == '__main__':
     import os
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
-    os.environ['TF_CPP_VMODULE'] = 'bfc_allocator=1'
+    #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
+    #os.environ['TF_CPP_VMODULE'] = 'bfc_allocator=1'
     #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.99'
     # This is slow, but jax's allocator consistently OOMs when it shouldn't
     os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     main()

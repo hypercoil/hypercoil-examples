@@ -45,6 +45,7 @@ def fetch_subject(
     subject_key = 'Subject',
 ) -> Tuple[Any, Sequence[int]]:
     import jax.numpy as jnp
+    import numpy as np
     subject = int(subject)
     if isinstance(ref, str):
         ref = pd.read_csv(ref, sep='\t').set_index(subject_key)
@@ -64,8 +65,10 @@ def fetch_subject(
         k: ref[v].values.astype(float)
         for k, v in categoricals.items()
     }
+    data = np.concatenate((continuous, *[e for e in categoricals.values()]))
+    data = np.where(np.isnan(data), 0., data)
     return (
-        jnp.concatenate((continuous, *[e for e in categoricals.values()])),
+        jnp.asarray(data),
         (len(continuous), *[len(e) for e in categoricals.values()][:-1]),
     )
 

@@ -18,6 +18,8 @@ import jax
 import jax.numpy as jnp
 import optax
 import pyvista as pv
+import templateflow.api as tflow
+from scipy.io import loadmat
 
 from hypercoil.engine import _to_jax_array
 from hypercoil.functional import residualise, sym2vec
@@ -34,6 +36,14 @@ from hypercoil_examples.atlas.model import (
 )
 from hypercoil_examples.atlas.positional import (
     get_coors
+)
+from hypercoil_examples.atlas.train import (
+    ENCODER_ARCH,
+    BLOCK_ARCH,
+    SERIAL_INJECTION_SITES,
+    VMF_SPATIAL_KAPPA,
+    VMF_SELECTIVITY_KAPPA,
+    FIXED_KAPPA,
 )
 from hyve import (
     Cell,
@@ -54,7 +64,7 @@ ENCODER_ARCH = '64x64'
 SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 
-VAL_SIZE = {'HCP': 160, 'MSC': 160}
+VAL_SIZE = {'HCP': 400, } #'MSC': 160}
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
 MSC_SUBJECTS_VAL = ('04', '07')
@@ -79,7 +89,7 @@ TASKS = {
         'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
     ),
 }
-DATASETS = ('HCP', 'MSC')
+DATASETS = ('HCP',) # 'MSC')
 
 VMF_SPATIAL_KAPPA = 50.
 VMF_SELECTIVITY_KAPPA = 20.
@@ -94,12 +104,17 @@ BASELINES = {
     'glasser360': f'{ATLAS_ROOT}/desc-glasser_res-0360_atlas.nii',
     #'gordon333': f'{ATLAS_ROOT}/desc-gordon_res-0333_atlas.nii',
     'schaefer400': f'{ATLAS_ROOT}/desc-schaefer_res-0400_atlas.nii',
+    'kong400': None
 }
+KONG_IDS = '/mnt/andromeda/Data/Kong2022_ArealMSHBM/HCP_subject_list.txt'
+KONG_PARCELLATIONS = '/mnt/andromeda/Data/Kong2022_ArealMSHBM/Parcellations/400/HCP_1029sub_400Parcels_Kong2022_gMSHBM.mat'
+LH_MASK = nb.load(tflow.get('fsLR', density='32k', hemi='L', desc='nomedialwall')).darrays[0].data.astype(bool)
+RH_MASK = nb.load(tflow.get('fsLR', density='32k', hemi='R', desc='nomedialwall')).darrays[0].data.astype(bool)
 
 
 def prepare_timeseries(
     num_parcels: int = 200,
-    start_epoch: Optional[int] = 20000,
+    start_epoch: Optional[int] = 24101,
 ):
     key = jax.random.PRNGKey(SEED)
     val_entities = {}
@@ -128,8 +143,13 @@ def prepare_timeseries(
         [val_entities[ds] for ds in DATASETS], []
     )
 
+    with open(KONG_IDS) as f:
+        kong_ids = f.read().split('\n')
+    kong_parcellations = loadmat(KONG_PARCELLATIONS)
     atlas = {}
     for baseline, path in BASELINES.items():
+        if path is None:
+            continue # Get it on a per-subject basis below
         atlas[baseline] = nb.load(path)
         atlas[baseline] = atlas[baseline].get_fdata().astype(int) - 1
         atlas[baseline] = np.where(
@@ -146,9 +166,11 @@ def prepare_timeseries(
         coor_R=coor_R,
         num_parcels=num_parcels,
         encoder_type=ENCODER_ARCH,
+        block_arch=BLOCK_ARCH,
         injection_points=SERIAL_INJECTION_SITES,
         spatial_kappa=VMF_SPATIAL_KAPPA,
         selectivity_kappa=VMF_SELECTIVITY_KAPPA,
+        fixed_kappa=FIXED_KAPPA,
         dropout=0,
     )
     #encode = eqx.filter_jit(encoder)
@@ -187,6 +209,7 @@ def prepare_timeseries(
                     pad_to_size=None,
                     key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
                 )
+                atlas['kong400'] = None
             elif ds == 'HCP':
                 subject = entity.get('subject')
                 session = entity.get('run')
@@ -198,6 +221,20 @@ def prepare_timeseries(
                     pad_to_size=None,
                     key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
                 )
+                # If it's HCP, evaluate the Kong parcellation
+                try:
+                    kong_idx = kong_ids.index(entity['subject'])
+                    kong_asgt = np.concatenate((
+                        kong_parcellations['lh_labels_all'][LH_MASK, kong_idx],
+                        kong_parcellations['rh_labels_all'][RH_MASK, kong_idx],
+                    ))
+                    atlas['kong400'] = np.where(
+                        (kong_asgt < 0)[..., None],
+                        0,
+                        np.eye(kong_asgt.max() + 1)[kong_asgt],
+                    ).squeeze().T[1:]
+                except ValueError:
+                    atlas['kong400'] = None
         except FileNotFoundError:
             print(
                 f'Data entity {entity} is absent. '
@@ -217,6 +254,7 @@ def prepare_timeseries(
             jax.random.normal(jax.random.fold_in(key_e, 54), T.shape),
             T,
         )
+
         encoder_result = encode(
             T=T_in,
             coor_L=coor_L,
@@ -281,6 +319,7 @@ def prepare_timeseries(
             **{
                 baseline: jnp.linalg.lstsq(atlas[baseline].T, T_in)[0]
                 for baseline in atlas
+                if atlas[baseline] is not None
             },
         }
         recon_err_baseline = {
@@ -288,6 +327,8 @@ def prepare_timeseries(
                 1 - ((atlas[baseline].T @ ts[baseline] - T_in) ** 2).sum() /
                 (T_in ** 2).sum()
             )
+            if atlas[baseline] is not None
+            else jnp.asarray(jnp.inf)
             for baseline in atlas
         }
         recon_err['ds'] += [ds]
@@ -314,6 +355,7 @@ def predict(
     from sklearn import svm
     models = list(BASELINES.keys()) + ['parametric', 'full']
     scores = {}
+    TASKS.pop('MSC')
     for ds, tasks in TASKS.items():
         scores[ds] = {}
         for name in models:

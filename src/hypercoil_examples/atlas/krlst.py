@@ -104,16 +104,18 @@ class KRLST(eqx.Module):
     _mu: Tensor | None = None
     _sigma: Tensor | None = None
     _Q: Tensor | None = None
-    _noise_power_numerator: Tensor = jnp.asarray(0.)
-    _noise_power_denominator: Tensor = jnp.asarray(1.)
-    _jitter: float = 1e-10
+    _noise_power_numerator: Tensor | None = None
+    _noise_power_denominator: Tensor | None = None
+    _jitter: Tensor = eqx.field(default_factory=lambda: jnp.asarray(1e-10))
 
     def __post_init__(self):
-        assert self.forgetting_factor >= 0 and self.forgetting_factor <= 1, (
-            'Forgetting factor must be between 0 and 1.'
-        )
+        if isinstance(self.regularisation, jax.core.Tracer):
+            return
         assert self.regularisation >= 0, (
             'Regularisation must be non-negative.'
+        )
+        assert self.forgetting_factor >= 0 and self.forgetting_factor <= 1, (
+            'Forgetting factor must be between 0 and 1.'
         )
         assert self.dictionary_size > 0, (
             'Dictionary size must be positive.'
@@ -233,6 +235,17 @@ class KRLST(eqx.Module):
         sigma = self._sigma / self.forgetting_factor
         return sigma, self._mu
 
+    def _sigma_mu_forget(self, key):
+        match self.forget_mode:
+            case 'B2P':
+                sigma, mu = self._forget_B2P(key=key)
+            case 'UI':
+                sigma, mu = self._forget_UI()
+        return sigma, mu
+
+    def _sigma_mu_default(self, key):
+        return self._sigma, self._mu
+
     def observe(
         self,
         x: Tensor,
@@ -248,15 +261,12 @@ class KRLST(eqx.Module):
             key_f, key_dx, key_xx = jax.random.split(key, 3)
         else:
             key_f, key_dx, key_xx = None, None, None
-        if self.forgetting_factor < 1:
-            match self.forget_mode:
-                case 'B2P':
-                    sigma, mu = self._forget_B2P(key=key_f)
-                case 'UI':
-                    sigma, mu = self._forget_UI()
-        else:
-            sigma = self._sigma
-            mu = self._mu
+        sigma, mu = jax.lax.cond(
+            self.forgetting_factor < 1,
+            self._sigma_mu_forget,
+            self._sigma_mu_default,
+            key_f,
+        )
 
         # Predict new sample
         K_dx = (
@@ -494,13 +504,17 @@ def main():
     regularisation = 1e-5           # Noise-to-signal ratio (used for regulariation)
     mode = "B2P"                    # Forget mode
     krlst = KRLST(kernel=kernel,
-                  forgetting_factor=forgetting_factor,
-                  regularisation=regularisation,
+                  forgetting_factor=jnp.asarray(forgetting_factor),
+                  regularisation=jnp.asarray(regularisation),
                   dictionary_size=M,
                   forget_mode=mode)
 
     # Train in online fashion using at most four basis elements
     krlst = krlst._initialise(X[0], y[0], 0)
+    eqx.tree_serialise_leaves(
+        f'/tmp/testKRLSTserialise',
+        krlst,
+    )
     _observe = eqx.filter_jit(observe)
     for t, a, b in zip(jnp.arange(1, 10), X[1:], y[1:]):
         krlst = _observe(krlst, a, b, t)
@@ -531,6 +545,11 @@ def main():
     plt.ylim(-10, 20)
     plt.legend(loc='upper left')
     plt.savefig('/tmp/krlst_result.png')
+
+    krlst2 = eqx.tree_deserialise_leaves(
+        f'/tmp/testKRLSTserialise',
+        like=krlst,
+    )
     breakpoint()
 
 
