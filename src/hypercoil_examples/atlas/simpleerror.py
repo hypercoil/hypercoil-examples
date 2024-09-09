@@ -15,6 +15,7 @@ from typing import Sequence, Optional
 import jax.numpy as jnp
 import equinox as eqx
 from optax import (
+    huber_loss,
     softmax_cross_entropy,
     squared_error,
 )
@@ -68,7 +69,8 @@ def simple_error(
             )[..., None].swapaxes(split_axis, -1)
             if c
             # else squared_error(p, t).mean(axis=split_axis, keepdims=True)
-            else continuous_multiplier * squared_error(p, t)
+            # else continuous_multiplier * squared_error(p, t)
+            else continuous_multiplier * huber_loss(p, t)
             for p, t, c in zip(predictions, targets, shard_categorical)
         ],
         axis=split_axis,

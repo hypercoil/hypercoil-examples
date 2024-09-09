@@ -126,7 +126,7 @@ KERNEL_MODEL_TARGETS = {
 }
 KERNEL_ERR_CONFIDENCE_FACTOR = 1.
 KERNEL_ERR_CATEGORICAL_FACTOR = 1.
-KERNEL_ERR_CONTINUOUS_FACTOR = 1.
+KERNEL_ERR_CONTINUOUS_FACTOR = 0.5
 
 DATASETS = ('HCP', 'MSC') # ('MSC',) #
 
@@ -139,7 +139,7 @@ ENERGY_NU = .5 # 0. #
 RECON_NU = 1. # 0. #
 TETHER_NU = 1. # 0. #
 DIV_NU = 1e3 # 0. #
-CLASSIFIER_NU = 5. # 0. #
+CLASSIFIER_NU = 20. # 0. #
 TEMPLATE_ENERGY_NU = 1. # 0. #
 POINT_POTENTIALS_NU = 1. # 0. #
 DOUBLET_POTENTIALS_NU = 5. # 0. #
@@ -151,7 +151,7 @@ BIG_KAPPA_NU = 1e-5 # 0. #
 SMALL_KAPPA_NU = 1e0 # 0. #
 
 KRLST_KERNEL = CorrelationKernel()
-KRLST_FORGETTING_FACTOR = 0.999
+KRLST_FORGETTING_FACTOR = 0.99
 KRLST_REGULARISATION = 1e-2
 KRLST_DICTIONARY_SIZE = {
     'HCP': 192,
@@ -1085,9 +1085,56 @@ def initialise_kernel_model(
     return krlst.observe(x=connectome, y=target, t=0, key=key_o)
 
 
+def checkpoint_model(
+    total_step: int,
+    model: eqx.Module,
+    opt_state: Any,
+    krlst_stash: Mapping,
+    grad_info: Mapping,
+    updates_info: Mapping,
+    classify: Literal['linear', 'kernel'] | None,
+) -> int:
+    last_checkpoint = (
+        total_step // CHECKPOINT_INTERVAL
+    ) * CHECKPOINT_INTERVAL
+    logging.info(
+        'Serialising model and optimiser state for checkpoint'
+    )
+    eqx.tree_serialise_leaves(
+        f'/tmp/parcellation_model_checkpoint{total_step}',
+        model,
+    )
+    eqx.tree_serialise_leaves(
+        f'/tmp/parcellation_optim_checkpoint{total_step}',
+        opt_state,
+    )
+    if classify == 'kernel':
+        for ds in DATASETS:
+            eqx.tree_serialise_leaves(
+                f'/tmp/ds-{ds}_KRLST_checkpoint{total_step}',
+                krlst_stash[ds],
+            )
+    if INTROSPECT_GRADIENTS:
+        if FORWARD_COMPARTMENTS == 'bilateral':
+            with open('/tmp/grad_info.pkl', 'wb') as f:
+                pickle.dump(flatten_gradinfo(grad_info), f)
+            with open('/tmp/updates_info.pkl', 'wb') as f:
+                pickle.dump(flatten_gradinfo(updates_info), f)
+        else:
+            with open('/tmp/grad_info_L.pkl', 'wb') as f:
+                pickle.dump(flatten_gradinfo(grad_info['L']), f)
+            with open('/tmp/updates_info_L.pkl', 'wb') as f:
+                pickle.dump(flatten_gradinfo(updates_info['L']), f)
+            with open('/tmp/grad_info_R.pkl', 'wb') as f:
+                pickle.dump(flatten_gradinfo(grad_info['R']), f)
+            with open('/tmp/updates_info_R.pkl', 'wb') as f:
+                pickle.dump(flatten_gradinfo(updates_info['R']), f)
+    return last_checkpoint
+
+
 def main(
     num_parcels: int = 200,
-    start_step: Optional[int] = None, # 0, #
+    start_step: Optional[int] = None, # 12600, #
     classify: Literal['linear', 'kernel'] | None = 'kernel',
 ):
     key = jax.random.PRNGKey(SEED)
@@ -1143,7 +1190,7 @@ def main(
         for i, ds in enumerate(DATASETS):
             T, j = None, 0
             while T is None:
-                T, _, (ds, subject, session, task), _ = load_data(
+                T, _, (_, subject, session, task), _ = load_data(
                     entity=data_entities[ds][j],
                     current_epoch=0,
                     current_step=0,
@@ -1161,9 +1208,9 @@ def main(
             err = SimpleError(
                 split_indices=split_indices,
                 shard_categorical=shard_categorical,
-                confidence_multiplier=KERNEL_ERR_CONFIDENCE_FACTOR,
-                categorical_multiplier=KERNEL_ERR_CATEGORICAL_FACTOR,
-                continuous_multiplier=KERNEL_ERR_CONTINUOUS_FACTOR,
+                confidence_multiplier=jnp.asarray(KERNEL_ERR_CONFIDENCE_FACTOR),
+                categorical_multiplier=jnp.asarray(KERNEL_ERR_CATEGORICAL_FACTOR),
+                continuous_multiplier=jnp.asarray(KERNEL_ERR_CONTINUOUS_FACTOR),
             )
             krlst = initialise_kernel_model(
                 model=model,
@@ -1482,39 +1529,25 @@ def main(
                         array_right=P['cortex_R'].T,
                     )
             if (k - last_checkpoint) // CHECKPOINT_INTERVAL > 0:
-                last_checkpoint = (
-                    k // CHECKPOINT_INTERVAL
-                ) * CHECKPOINT_INTERVAL
-                logging.info('Serialising model and optimiser state for checkpoint')
-                eqx.tree_serialise_leaves(
-                    f'/tmp/parcellation_model_checkpoint{k}',
-                    model,
+                last_checkpoint = checkpoint_model(
+                    total_step=k,
+                    model=model,
+                    opt_state=opt_state,
+                    krlst_stash=krlst_stash,
+                    grad_info=grad_info,
+                    updates_info=updates_info,
+                    classify=classify,
                 )
-                eqx.tree_serialise_leaves(
-                    f'/tmp/parcellation_optim_checkpoint{k}',
-                    opt_state,
-                )
-                if classify == 'kernel':
-                    for ds in DATASETS:
-                        eqx.tree_serialise_leaves(
-                            f'/tmp/ds-{ds}_KRLST_checkpoint{k}',
-                            krlst_stash[ds],
-                        )
-                if FORWARD_COMPARTMENTS == 'bilateral':
-                    with open('/tmp/grad_info.pkl', 'wb') as f:
-                        pickle.dump(flatten_gradinfo(grad_info), f)
-                    with open('/tmp/updates_info.pkl', 'wb') as f:
-                        pickle.dump(flatten_gradinfo(updates_info), f)
-                else:
-                    with open('/tmp/grad_info_L.pkl', 'wb') as f:
-                        pickle.dump(flatten_gradinfo(grad_info['L']), f)
-                    with open('/tmp/updates_info_L.pkl', 'wb') as f:
-                        pickle.dump(flatten_gradinfo(updates_info['L']), f)
-                    with open('/tmp/grad_info_R.pkl', 'wb') as f:
-                        pickle.dump(flatten_gradinfo(grad_info['R']), f)
-                    with open('/tmp/updates_info_R.pkl', 'wb') as f:
-                        pickle.dump(flatten_gradinfo(updates_info['R']), f)
-
+        last_checkpoint = checkpoint_model(
+            total_step=total_epoch_size * (i + 1),
+            model=model,
+            opt_state=opt_state,
+            krlst_stash=krlst_stash,
+            grad_info=grad_info,
+            updates_info=updates_info,
+            classify=classify,
+        )
+        start_step = 0
 
         # Evaluation loop (validation)
         epoch_entities_val = [
@@ -1670,7 +1703,7 @@ if __name__ == '__main__':
     #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
     #os.environ['TF_CPP_VMODULE'] = 'bfc_allocator=1'
     #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.99'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.90'
     # This is slow, but jax's allocator consistently OOMs when it shouldn't
-    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+    #os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     main()
