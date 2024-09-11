@@ -6,6 +6,9 @@ Evaluation loop
 ~~~~~~~~~~~~~~~
 Evaluation loop and metrics for the parcellation model
 """
+import logging
+import os
+import re
 import pickle
 from itertools import product
 from typing import Any, Mapping, Optional, Tuple
@@ -23,7 +26,10 @@ from scipy.io import loadmat
 
 from hypercoil.engine import _to_jax_array
 from hypercoil.functional import residualise, sym2vec
-from hypercoil_examples.atlas.const import HCP_DATA_SPLIT_DEF_ROOT
+from hypercoil_examples.atlas.const import (
+    HCP_DATA_SPLIT_DEF_ROOT,
+    HCP_EXTRA_SUBJECT_MEASURES,
+)
 from hypercoil_examples.atlas.cross2subj import visualise
 from hypercoil_examples.atlas.data import (
     get_hcp_dataset, get_msc_dataset, _get_data
@@ -60,11 +66,9 @@ from hyve import (
 
 # This eventually should go away as we will want to use all of the data
 SEED = 3923
-ENCODER_ARCH = '64x64'
-SERIAL_INJECTION_SITES = ('readout', 'residual')
 PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 
-VAL_SIZE = {'HCP': 400, } #'MSC': 160}
+VAL_SIZE = {'HCP': 800, } #'MSC': 160}
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
 MSC_SUBJECTS_VAL = ('04', '07')
@@ -91,9 +95,6 @@ TASKS = {
 }
 DATASETS = ('HCP',) # 'MSC')
 
-VMF_SPATIAL_KAPPA = 50.
-VMF_SELECTIVITY_KAPPA = 20.
-
 DATA_SHUFFLE_KEY = 7834
 DATA_SAMPLER_KEY = 9902
 READOUT_INIT_KEY = 5310
@@ -107,9 +108,16 @@ BASELINES = {
     'kong400': None
 }
 KONG_IDS = '/mnt/andromeda/Data/Kong2022_ArealMSHBM/HCP_subject_list.txt'
-KONG_PARCELLATIONS = '/mnt/andromeda/Data/Kong2022_ArealMSHBM/Parcellations/400/HCP_1029sub_400Parcels_Kong2022_gMSHBM.mat'
-LH_MASK = nb.load(tflow.get('fsLR', density='32k', hemi='L', desc='nomedialwall')).darrays[0].data.astype(bool)
-RH_MASK = nb.load(tflow.get('fsLR', density='32k', hemi='R', desc='nomedialwall')).darrays[0].data.astype(bool)
+KONG_PARCELLATIONS = (
+    '/mnt/andromeda/Data/Kong2022_ArealMSHBM/Parcellations/400/'
+    'HCP_1029sub_400Parcels_Kong2022_gMSHBM.mat'
+)
+LH_MASK = nb.load(
+    tflow.get('fsLR', density='32k', hemi='L', desc='nomedialwall')
+).darrays[0].data.astype(bool)
+RH_MASK = nb.load(
+    tflow.get('fsLR', density='32k', hemi='R', desc='nomedialwall')
+).darrays[0].data.astype(bool)
 
 
 def prepare_timeseries(
@@ -134,11 +142,7 @@ def prepare_timeseries(
                 ('LR', 'RL'), hcp_subjects_val, TASKS['HCP']
             )
         ]}
-    # Crude. We should at least make sure our classes are appropriately
-    # represented.
-    #val_entities = sum(
-    #    [val_entities[ds][:VAL_SIZE[ds]] for ds in DATASETS], []
-    #)
+
     val_entities = sum(
         [val_entities[ds] for ds in DATASETS], []
     )
@@ -263,7 +267,7 @@ def prepare_timeseries(
         )
         ts = {}
 
-        for name, fwd in [('parametric', model.regulariser_path), ('full', model)]:
+        for name, fwd in [('parametric', model.parametric_path), ('full', model)]:
             P, _, _ = eqx.filter_jit(fwd)(
                 coor={
                     'cortex_L': coor_L,
@@ -353,10 +357,17 @@ def predict(
 ):
     import pathlib
     from sklearn import svm
+    from sklearn.model_selection import GridSearchCV, cross_val_score, KFold
+    DATA_GETTER = {
+        'MSC': get_msc_dataset,
+        'HCP': get_hcp_dataset,
+    }
     models = list(BASELINES.keys()) + ['parametric', 'full']
     scores = {}
     TASKS.pop('MSC')
     for ds, tasks in TASKS.items():
+        if ds == 'HCP':
+            extra_measures = pd.read_csv(HCP_EXTRA_SUBJECT_MEASURES, sep='\t')
         scores[ds] = {}
         for name in models:
             tss = sorted(
@@ -370,19 +381,119 @@ def predict(
             connectomes = np.zeros(
                 (len(tss), int(num_parcels * (num_parcels - 1) / 2))
             )
-            targets = np.zeros((len(tss), len(tasks)))
+            task_targets = np.zeros((len(tss), len(tasks)))
+            if ds == 'HCP':
+                extra_targets = np.zeros((len(tss), extra_measures.shape[1] - 1))
             for i, ts in enumerate(tss):
                 data = np.load(ts)
+                subject_id = re.match(
+                    '.*_sub-(?P<subject>[A-Z0-9]*)_.*',
+                    str(ts),
+                ).group('subject')
+                session_id = re.match(
+                    '.*_ses-(?P<session>[A-Z0-9]*)_.*',
+                    str(ts),
+                ).group('session')
                 taskname = [
                     i for i in str(ts).split('/')[-1].split('_')
                     if i[:4] == 'task'
                 ][0][5:]
+                get_dataset = DATA_GETTER[ds]
+                _, confounds = get_dataset(
+                    subject_id,
+                    session_id,
+                    taskname,
+                    get_confounds=True,
+                )
+                if os.path.exists(confounds):
+                    # Censor the parcellated timeseries
+                    data = _get_data(
+                        cifti=None,
+                        data=data,
+                        confounds=confounds,
+                        normalise=False,
+                        gsr=False,
+                        filter_rps=True,
+                        censor_thresh=0.15,
+                        pad_to_size=None,
+                        censor_method='drop',
+                        key=None,
+                    )
+                else:
+                    logging.warning(
+                        f'No confounds found for {subject_id} {session_id} {taskname}'
+                    )
                 if taskname[:4] == 'REST':
                     taskname = 'REST'
                 connectomes[i] = sym2vec(np.corrcoef(data))
-                targets[i, tasks.index(taskname)] = 1
-            result = svm.LinearSVC().fit(connectomes[:(i // 2)], targets.argmax(-1)[:(i // 2)])
-            scores[ds][name] = result.score(connectomes[(i // 2):], targets.argmax(-1)[(i // 2):])
+                task_targets[i, tasks.index(taskname)] = 1
+                if ds == 'HCP':
+                    extra_targets[i] = extra_measures.loc[
+                        extra_measures['Subject'] == int(subject_id)
+                    ].values[0][1:]
+            # Run nested cross-validation
+            # Based on https://scikit-learn.org/stable/auto_examples/ ...
+            # ... model_selection/plot_nested_cross_validation_iris.html
+            NUM_TRIALS = 100 # 5 #
+            FOLDS_OUTER = 20 # 4 #
+            FOLDS_INNER = 20 # 4 #
+            param_grid = [
+                {
+                    'kernel': ['linear'],
+                    'C': [0.1, 1, 10, 100, 1000],
+                },
+                {
+                    'kernel': ['rbf'],
+                    'C': [0.1, 1, 10, 100, 1000],
+                    'gamma': [0.001, 0.0001, 'scale'],
+                },
+                {
+                    # Kong et al use a correlation kernel
+                    'kernel': [lambda x: np.corrcoef(x)],
+                    'C': [0.1, 1, 10, 100, 1000],
+                },
+            ]
+            model_base = svm.SVC()
+            non_nested_scores = np.zeros(NUM_TRIALS)
+            nested_scores = np.zeros(NUM_TRIALS)
+            for i in range(NUM_TRIALS):
+                logging.info(f'Running trial {i}')
+                inner_cv = KFold(
+                    n_splits=FOLDS_INNER,
+                    shuffle=True,
+                    random_state=i,
+                )
+                outer_cv = KFold(
+                    n_splits=FOLDS_OUTER,
+                    shuffle=True,
+                    random_state=i,
+                )
+                # Non_nested parameter search and scoring
+                # model = GridSearchCV(
+                #     estimator=model_base,
+                #     param_grid=param_grid,
+                #     cv=outer_cv,
+                #     n_jobs=-1,
+                # )
+                #model.fit(connectomes, task_targets.argmax(-1))
+                #non_nested_scores[i] = model.best_score_
+                # Nested CV with parameter optimization
+                model = GridSearchCV(
+                    estimator=model_base,
+                    param_grid=param_grid,
+                    cv=inner_cv,
+                    n_jobs=-1,
+                )
+                nested_score = cross_val_score(
+                    model,
+                    X=connectomes,
+                    y=task_targets.argmax(-1),
+                    cv=outer_cv,
+                    n_jobs=-1,
+                )
+                nested_scores[i] = nested_score.mean()
+
+            scores[ds][name] = (nested_scores, non_nested_scores)
     assert 0
 
 
