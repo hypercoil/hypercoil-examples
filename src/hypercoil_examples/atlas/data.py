@@ -82,7 +82,8 @@ def get_hcp_dataset(
 
 
 def _get_data(
-    cifti: str,
+    cifti: Optional[str] = None,
+    data: Optional[jnp.ndarray] = None,
     confounds: Optional[str] = None,
     normalise: bool = True,
     gsr: bool = True,
@@ -93,13 +94,14 @@ def _get_data(
     key: Optional['jax.random.PRNGKey'] = None,
 ):
     key = jax.random.PRNGKey(0) if key is None else key
-    try:
-        cifti = nb.load(cifti)
-    except nb.filebasedimages.ImageFileError:
-        # callers will be looking for FileNotFoundError
-        raise FileNotFoundError
-    data_full = cifti.get_fdata(dtype=np.float32).T
-    data = data_full[~cifti.header.get_axis(1).volume_mask]
+    if data is None:
+        try:
+            cifti = nb.load(cifti)
+        except nb.filebasedimages.ImageFileError:
+            # callers will be looking for FileNotFoundError
+            raise FileNotFoundError
+        data_full = cifti.get_fdata(dtype=np.float32).T
+        data = data_full[~cifti.header.get_axis(1).volume_mask]
     if normalise:
         data = data - data.mean(-1, keepdims=True)
         data = data / data.std(-1, keepdims=True)
