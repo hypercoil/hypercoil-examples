@@ -108,6 +108,7 @@ DATA_SAMPLER_KEY = 9902
 READOUT_INIT_KEY = 5310
 
 OUTPUT_DIR = '/mnt/andromeda/Data/atlas_ts/'
+#OUTPUT_DIR = '/Users/rastkociric/Downloads/atlas_ts/'
 ATLAS_ROOT = '/mnt/andromeda/Data/atlases/atlases/'
 BASELINES = {
     'glasser360': f'{ATLAS_ROOT}/desc-glasser_res-0360_atlas.nii',
@@ -130,7 +131,7 @@ RH_MASK = nb.load(
 
 def prepare_timeseries(
     num_parcels: int = 200,
-    start_epoch: Optional[int] = 24101,
+    start_epoch: Optional[int] = 15600,
 ):
     key = jax.random.PRNGKey(SEED)
     val_entities = {}
@@ -430,6 +431,7 @@ def predict(
                     extra_targets[i] = extra_measures.loc[
                         extra_measures['Subject'] == int(subject_id)
                     ].values[0][1:]
+            ids_ref = np.array(subject_ids)
             subject_ids = (
                 np.array(subject_ids)[..., None] ==
                 np.unique(subject_ids)[None, ...]
@@ -461,6 +463,8 @@ def predict(
             # Let's just always have the same count of inner and outer folds
             FOLDS_OUTER = 4 # 20 #
             FOLDS_INNER = 4 # 20 #
+            # CBIG likes this one, but it feels like cheating if I'm being honest
+            METRIC = 'predictive_COD' # 'corr' #
             linear_kernels = [linear_kernel(connectomes)]
             rbf_kernels = [
                 rbf_kernel(connectomes, gamma=gamma)
@@ -475,16 +479,22 @@ def predict(
             corr_kernels = [corr_kernel(connectomes)]
             cosine_kernels = [cosine_similarity(connectomes)]
             kernel_spec = linear_kernels + rbf_kernels + corr_kernels + cosine_kernels
-            for i, (target, target_name, var_kind) in enumerate(targets):
+            for i, (target, target_name, var_kind) in enumerate(targets[3:4]):
                 nested_scores = np.zeros(NUM_TRIALS)
                 scores[ds][name][target_name] = {}
                 results[ds][name][target_name] = [None for _ in range(NUM_TRIALS)]
                 regularisation_grid = [0.1, 1, 10, 100, 1000]
+                regularisation_grid = [
+                    1e-8, 0.00001, 0.0001, 0.001, 0.004, 0.007, 0.01, 0.04, 0.07, 0.1,
+                    0.4, 0.7, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 10, 15,
+                    20, 30, 40, 50, 60, 70, 80, 100, 150, 200,
+                    300, 500, 700, 1000, 10000, 100000, 1000000,
+                ]
                 if var_kind == 'categorical':
                     model_base = svm.SVC()
                     cv_base = StratifiedGroupKFold
                     cv_params = {'shuffle': True}
-                    regularisation = {'C': [C for C in regularisation_grid]}
+                    regularisation = {'C': [1 / (2 * alpha) for alpha in regularisation_grid]}
                 elif var_kind == 'continuous':
                     model_base = KernelRidge()
                     cv_base = GroupShuffleSplit
@@ -492,7 +502,7 @@ def predict(
                         'test_size': 1 / FOLDS_OUTER,
                     }
                     regularisation = {
-                        'alpha': [1 / (2 * C) for C in regularisation_grid]
+                        'alpha': [alpha for alpha in regularisation_grid]
                     }
                 param_grid = [
                     {
@@ -554,6 +564,38 @@ def predict(
                                     **clone(param_cfg, safe=False)
                                 )
                                 estimator.fit(X_train, y_train)
+                                y_pred = estimator.predict(X_test)
+                                # CBIG reference implementation:
+                                # https://github.com/ThomasYeoLab/CBIG/blob/master/ ...
+                                # utilities/matlab/predictive_models/utilities/ ...
+                                # CBIG_compute_prediction_acc_and_loss.m
+                                match METRIC:
+                                    case 'COD':
+                                        score = (
+                                            1 -
+                                            ((y_pred - y_test) ** 2).sum() /
+                                            ((y_test.mean() - y_test) **2).sum()
+                                        )
+                                    case 'predictive_COD':
+                                        score = (
+                                            1 -
+                                            ((y_pred - y_test) ** 2).sum() /
+                                            ((y_train.mean() - y_test) **2).sum()
+                                        )
+                                    case 'corr':
+                                        score = np.corrcoef(y_pred, y_test)[0, 1]
+                                    case 'MAE':
+                                        score = np.abs(y_pred - y_test).mean()
+                                    case 'MSE':
+                                        score = ((y_pred - y_test) ** 2).mean()
+                                    case 'MAE_norm':
+                                        score = np.abs(y_pred - y_test).mean() / y_test.std()
+                                    case 'MSE_norm':
+                                        # Don't know why it's variance here and
+                                        # std in the other case, but I'm just
+                                        # trying to be consistent with the
+                                        # implementation from CBIG
+                                        score = ((y_pred - y_test) ** 2).mean() / y_test.var()
                                 score = estimator.score(X_test, y_test)
                                 if score > best_score:
                                     best_score = score
@@ -635,9 +677,9 @@ def main(
     extract_ts: bool = False,
     num_parcels: int = 200,
 ):
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+    #os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    #os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     if extract_ts:
         prepare_timeseries(num_parcels=num_parcels)
     predict(num_parcels=num_parcels)
