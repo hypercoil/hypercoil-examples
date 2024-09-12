@@ -75,24 +75,31 @@ MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
 MSC_SUBJECTS_VAL = ('04', '07')
 TASKS = {
     'MSC': (
-        'rest', 'motor_run-01', 'motor_run-02',
-        'glasslexical_run-01', 'glasslexical_run-02',
-        'memoryfaces', 'memoryscenes', 'memorywords',
+        ('rest', 'rest'),
+        ('motor_run-01', 'motor'),
+        ('motor_run-02', 'motor'),
+        ('glasslexical_run-01', 'glasslexical'),
+        ('glasslexical_run-02', 'glasslexical'),
+        ('memoryfaces', 'memoryfaces'),
+        ('memoryscenes', 'memoryscenes'),
+        ('memorywords', 'memorywords'),
     ),
     'HCP': (
-        'REST1', 'REST2', 'EMOTION', 'GAMBLING',
-        'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
+        ('REST1', 'REST'),
+        ('REST2', 'REST'),
+        ('EMOTION', 'EMOTION'),
+        ('GAMBLING', 'GAMBLING'),
+        ('LANGUAGE', 'LANGUAGE'),
+        ('MOTOR', 'MOTOR'),
+        ('RELATIONAL', 'RELATIONAL'),
+        ('SOCIAL', 'SOCIAL'),
+        ('WM', 'WM'),
     ),
 }
-TASKS = {
-    'MSC': (
-        'rest', 'motor', 'glasslexical',
-        'memoryfaces', 'memoryscenes', 'memorywords',
-    ),
-    'HCP': (
-        'REST', 'EMOTION', 'GAMBLING',
-        'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM',
-    ),
+TASKS_FILES = {k: tuple(v[0] for v in vs) for k, vs in TASKS.items()}
+TASKS_TARGETS = {
+    k: tuple(sorted(set(v[1] for v in vs)))
+    for k, vs in TASKS.items()
 }
 DATASETS = ('HCP',) # 'MSC')
 
@@ -131,7 +138,7 @@ def prepare_timeseries(
         val_entities = {**val_entities, 'MSC': [
             {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
             for ses, sub, task in product(
-                MSC_SESSIONS, MSC_SUBJECTS_VAL, TASKS['MSC']
+                MSC_SESSIONS, MSC_SUBJECTS_VAL, TASKS_FILES['MSC']
             )
         ]}
     if 'HCP' in DATASETS:
@@ -140,7 +147,7 @@ def prepare_timeseries(
         val_entities = {**val_entities, 'HCP': [
             {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
             for run, sub, task in product(
-                ('LR', 'RL'), hcp_subjects_val, TASKS['HCP']
+                ('LR', 'RL'), hcp_subjects_val, TASKS_FILES['HCP']
             )
         ]}
 
@@ -396,7 +403,7 @@ def predict(
             connectomes = np.zeros(
                 (len(tss), int(num_parcels * (num_parcels - 1) / 2))
             )
-            task_targets = np.zeros((len(tss), len(tasks)))
+            task_targets = np.zeros((len(tss), len(TASKS_TARGETS[ds])))
             subject_ids = [None for _ in range(len(tss))]
             if ds == 'HCP':
                 extra_targets = np.zeros((len(tss), extra_measures.shape[1] - 1))
@@ -418,7 +425,7 @@ def predict(
                     taskname = 'REST'
                 subject_ids[i] = subject_id
                 connectomes[i] = sym2vec(np.corrcoef(data))
-                task_targets[i, tasks.index(taskname)] = 1
+                task_targets[i, TASKS_TARGETS[ds].index(dict(TASKS[ds])[taskname])] = 1
                 if ds == 'HCP':
                     extra_targets[i] = extra_measures.loc[
                         extra_measures['Subject'] == int(subject_id)
@@ -468,7 +475,7 @@ def predict(
             corr_kernels = [corr_kernel(connectomes)]
             cosine_kernels = [cosine_similarity(connectomes)]
             kernel_spec = linear_kernels + rbf_kernels + corr_kernels + cosine_kernels
-            for i, (target, target_name, var_kind) in enumerate(targets[1:3]):
+            for i, (target, target_name, var_kind) in enumerate(targets):
                 nested_scores = np.zeros(NUM_TRIALS)
                 scores[ds][name][target_name] = {}
                 results[ds][name][target_name] = [None for _ in range(NUM_TRIALS)]
@@ -494,6 +501,10 @@ def predict(
                         **regularisation,
                     },
                 ]
+                valid_index = np.where(~np.isnan(target))[0]
+                valid_connectomes = connectomes[valid_index]
+                valid_target = target[valid_index]
+                valid_group_id = subject_ids[valid_index]
                 for j in range(NUM_TRIALS):
                     logging.info(
                         f'Running trial {j + 1} / {NUM_TRIALS} for '
@@ -511,13 +522,17 @@ def predict(
                     )
                     non_nested_scores = np.zeros(FOLDS_OUTER)
                     for k, (train_index_o, test_index_o) in enumerate(
-                        outer_cv.split(X=connectomes, y=target, groups=subject_ids)
+                        outer_cv.split(
+                            X=valid_connectomes,
+                            y=valid_target,
+                            groups=valid_group_id,
+                        )
                     ):
                         for l, (train_index_i, test_index_i) in enumerate(
                             inner_cv.split(
-                                X=connectomes[train_index_o],
-                                y=target[train_index_o],
-                                groups=subject_ids[train_index_o],
+                                X=valid_connectomes[train_index_o],
+                                y=valid_target[train_index_o],
+                                groups=valid_group_id[train_index_o],
                             )
                         ):
                             logging.info(
@@ -528,10 +543,11 @@ def predict(
                             best_params = best_kernel = None
                             for param_cfg in grid_search(param_grid):
                                 X = param_cfg.pop('X')
-                                X_split = X[train_index_o][:, train_index_o]
+                                X_valid = X[valid_index][:, valid_index]
+                                X_split = X_valid[train_index_o][:, train_index_o]
                                 X_train = X_split[train_index_i][:, train_index_i]
                                 X_test = X_split[test_index_i][:, train_index_i]
-                                y_split = target[train_index_o]
+                                y_split = valid_target[train_index_o]
                                 y_train = y_split[train_index_i]
                                 y_test = y_split[test_index_i]
                                 estimator = clone(model_base).set_params(
@@ -542,12 +558,12 @@ def predict(
                                 if score > best_score:
                                     best_score = score
                                     best_params = param_cfg
-                                    best_kernel = X
+                                    best_kernel = X_valid
                         logging.info(f'Best score: {best_score}')
                         X_train = best_kernel[train_index_o][:, train_index_o]
                         X_test = best_kernel[test_index_o][:, train_index_o]
-                        y_train = target[train_index_o]
-                        y_test = target[test_index_o]
+                        y_train = valid_target[train_index_o]
+                        y_test = valid_target[test_index_o]
                         estimator = clone(model_base).set_params(
                             **clone(best_params, safe=False)
                         )
@@ -593,6 +609,7 @@ def predict(
 
                 scores[ds][name][target_name] = nested_scores
     assert 0
+    # {k: np.mean(v['age']) for k, v in scores['HCP'].items()}
 
 
 from functools import reduce
