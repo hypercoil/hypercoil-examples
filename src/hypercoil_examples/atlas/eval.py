@@ -465,17 +465,38 @@ def predict(
             # Run nested cross-validation
             # Based on https://scikit-learn.org/stable/auto_examples/ ...
             # ... model_selection/plot_nested_cross_validation_iris.html
+            # EDIT: sklearn approach is useless with precomputed kernel, and
+            #       miserably slow/wasteful if the kernel is computed every
+            #       time, especially because KRR explicitly doesn't allow
+            #       vectorisation. Weird design choice, but whatever,
+            #       Add it to the list of reasons I dislike turn-key,
+            #       hack-unfriendly software. Stage and remove this after
+            #       we manually build the CV loop in a non-terrible IDE
             NUM_TRIALS = 5 # 100 #
             # Let's just always have the same count of inner and outer folds
             FOLDS_OUTER = 4 # 20 #
             FOLDS_INNER = 4 # 20 #
+            linear_kernels = [linear_kernel(connectomes)]
+            rbf_kernels = [
+                rbf_kernel(connectomes, gamma=gamma)
+                for gamma in (
+                    .001,
+                    .0001,
+                    1 / (connectomes.shape[-1] * connectomes.var()),
+                )
+            ]
+            # corr and cosine *should* be the same since we're centering our
+            # data, and in practice they *are* very very close, but whatever
+            corr_kernels = [corr_kernel(connectomes)]
+            cosine_kernels = [cosine_similarity(connectomes)]
+            kernel_spec = linear_kernels + rbf_kernels + corr_kernels + cosine_kernels
             for i, (target, target_name, var_kind) in enumerate(targets[2:3]):
                 regularisation_grid = [0.1, 1, 10, 100, 1000]
                 if var_kind == 'categorical':
                     model_base = svm.SVC()
                     cv_base = StratifiedGroupKFold
                     cv_params = {'shuffle': True}
-                    regularisation = {'C': regularisation_grid}
+                    regularisation = {'C': [C for C in regularisation_grid]}
                 elif var_kind == 'continuous':
                     model_base = KernelRidge()
                     cv_base = GroupShuffleSplit
@@ -487,32 +508,8 @@ def predict(
                     }
                 param_grid = [
                     {
-                        'kernel': [linear_kernel],
-                        **regularisation,
-                    },
-                    {
-                        'kernel': [
-                            partial(rbf_kernel, gamma=gamma)
-                            for gamma in (
-                                .001,
-                                .0001,
-                                1 / (connectomes.shape[-1] * connectomes.var()),
-                            )
-                        ],
-                        'gamma': [
-                            .001,
-                            .0001,
-                            1 / (connectomes.shape[-1] * connectomes.var()),
-                        ]
-                        **regularisation,
-                    },
-                    {
-                        # Kong et al use a correlation kernel
-                        'kernel': [corr_kernel],
-                        **regularisation,
-                    },
-                    {
-                        'kernel': [cosine_similarity],
+                        'X': kernel_spec,
+                        'kernel': ['precomputed'],
                         **regularisation,
                     },
                 ]

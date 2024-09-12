@@ -36,6 +36,20 @@ import pandas as pd
 
 INPUT_FRAME = '/Users/rastkociric/Downloads/HCPtabular.csv'
 OUTPUT_FRAME = '/tmp/HCPtabularfiltered.tsv'
+HCP_MEASURES = {
+    'Vocabulary (picture matching)': 'PicVocab_Unadj',
+    'Reading (pronunciation)': 'ReadEng_Unadj',
+    'Relational processing': 'Relational_Task_Acc',
+    'Working memory (n-back)': 'WM_Task_Acc',
+    'Story comprehension': 'Language_Task_Story_Avg_Difficulty_Level',
+    'Spatial orientation': 'VSPLOT_TC',
+    'Processing speed': 'ProcSpeed_Unadj',
+    'Fluid intelligence (PMAT)': 'PMAT24_A_CR',
+    'Visual episodic memory': 'PicSeq_Unadj',
+    'Cognitive flexibility': 'CardSort_Unadj',
+    'Openness (NEO)': 'NEOFAC_O',
+    'Delay discounting': 'DDisc_AUC_40K',
+}
 
 
 def fetch_subject(
@@ -83,19 +97,7 @@ def filter_df_vars(
     columns = [
         'Subject',
         'Age',
-        'PicVocab_Unadj',
-        'ReadEng_Unadj',
-        'Relational_Task_Acc',
-        'WM_Task_Acc',
-        'Language_Task_Story_Avg_Difficulty_Level',
-        'VSPLOT_TC',
-        'ProcSpeed_Unadj',
-        'PMAT24_A_CR',
-        'PicSeq_Unadj',
-        'CardSort_Unadj',
-        'NEOFAC_O',
-        'DDisc_AUC_40K',
-    ]
+    ] + list(HCP_MEASURES.values())
     df = df[columns]
     df = pd.get_dummies(df)
     # There are not enough 36+ subjects to warrant a separate category.
