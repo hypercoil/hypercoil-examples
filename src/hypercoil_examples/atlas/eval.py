@@ -11,7 +11,7 @@ import os
 import re
 import pickle
 from itertools import product
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import equinox as eqx
 import nibabel as nb
@@ -365,6 +365,7 @@ def predict(
     import pathlib
     from functools import partial
     from sklearn import svm
+    from sklearn.base import clone
     from sklearn.kernel_ridge import KernelRidge
     from sklearn.metrics.pairwise import linear_kernel, rbf_kernel, cosine_similarity
     from sklearn.model_selection import GridSearchCV, cross_validate, GroupKFold, GroupShuffleSplit, StratifiedGroupKFold
@@ -382,6 +383,8 @@ def predict(
         scores[ds] = {}
         results[ds] = {}
         for name in models:
+            scores[ds][name] = {}
+            results[ds][name] = {}
             tss = sorted(
                 pathlib.Path(
                     f'{OUTPUT_DIR}'
@@ -411,31 +414,6 @@ def predict(
                     i for i in str(ts).split('/')[-1].split('_')
                     if i[:4] == 'task'
                 ][0][5:]
-                # get_dataset = DATA_GETTER[ds]
-                # _, confounds = get_dataset(
-                #     subject_id,
-                #     session_id,
-                #     taskname,
-                #     get_confounds=True,
-                # )
-                # if os.path.exists(confounds):
-                #     # Censor the parcellated timeseries
-                #     data = _get_data(
-                #         cifti=None,
-                #         data=data,
-                #         confounds=confounds,
-                #         normalise=False,
-                #         gsr=False,
-                #         filter_rps=True,
-                #         censor_thresh=0.15,
-                #         pad_to_size=None,
-                #         censor_method='drop',
-                #         key=None,
-                #     )
-                # else:
-                #     logging.warning(
-                #         f'No confounds found for {subject_id} {session_id} {taskname}'
-                #     )
                 if taskname[:4] == 'REST':
                     taskname = 'REST'
                 subject_ids[i] = subject_id
@@ -490,7 +468,10 @@ def predict(
             corr_kernels = [corr_kernel(connectomes)]
             cosine_kernels = [cosine_similarity(connectomes)]
             kernel_spec = linear_kernels + rbf_kernels + corr_kernels + cosine_kernels
-            for i, (target, target_name, var_kind) in enumerate(targets[2:3]):
+            for i, (target, target_name, var_kind) in enumerate(targets[1:3]):
+                nested_scores = np.zeros(NUM_TRIALS)
+                scores[ds][name][target_name] = {}
+                results[ds][name][target_name] = [None for _ in range(NUM_TRIALS)]
                 regularisation_grid = [0.1, 1, 10, 100, 1000]
                 if var_kind == 'categorical':
                     model_base = svm.SVC()
@@ -513,15 +494,10 @@ def predict(
                         **regularisation,
                     },
                 ]
-                non_nested_scores = np.zeros(NUM_TRIALS)
-                nested_scores = np.zeros(NUM_TRIALS)
-                results[ds][target_name] = {}
-                scores[ds][target_name] = {}
-                results[ds][target_name][name] = [None for _ in range(NUM_TRIALS)]
                 for j in range(NUM_TRIALS):
                     logging.info(
-                        f'Running trial {i} for parcellation '
-                        f'{name}, measure {target_name}'
+                        f'Running trial {j + 1} / {NUM_TRIALS} for '
+                        f'parcellation {name}, measure {target_name}'
                     )
                     inner_cv = cv_base(
                         n_splits=FOLDS_INNER,
@@ -533,30 +509,109 @@ def predict(
                         random_state=i * NUM_TRIALS + j,
                         **cv_params,
                     )
-                    model = GridSearchCV(
-                        estimator=model_base,
-                        param_grid=param_grid,
-                        cv=inner_cv,
-                        error_score='raise',
-                        #n_jobs=-1,
-                    )
-                    nested_result = cross_validate(
-                        model,
-                        X=connectomes,
-                        y=target,
-                        groups=subject_ids,
-                        cv=outer_cv,
-                        return_estimator=True,
-                        verbose=3,
-                        fit_params={'groups': subject_ids},
-                        error_score='raise',
-                        #n_jobs=-1,
-                    )
-                    nested_scores[j] = nested_result['test_score'].mean()
-                    results[ds][target_name][name][j] = nested_result
+                    non_nested_scores = np.zeros(FOLDS_OUTER)
+                    for k, (train_index_o, test_index_o) in enumerate(
+                        outer_cv.split(X=connectomes, y=target, groups=subject_ids)
+                    ):
+                        for l, (train_index_i, test_index_i) in enumerate(
+                            inner_cv.split(
+                                X=connectomes[train_index_o],
+                                y=target[train_index_o],
+                                groups=subject_ids[train_index_o],
+                            )
+                        ):
+                            logging.info(
+                                f'Nested CV: outer {k + 1} / {FOLDS_OUTER}, '
+                                f'inner {l + 1} / {FOLDS_INNER}'
+                            )
+                            best_score = -np.inf
+                            best_params = best_kernel = None
+                            for param_cfg in grid_search(param_grid):
+                                X = param_cfg.pop('X')
+                                X_split = X[train_index_o][:, train_index_o]
+                                X_train = X_split[train_index_i][:, train_index_i]
+                                X_test = X_split[test_index_i][:, train_index_i]
+                                y_split = target[train_index_o]
+                                y_train = y_split[train_index_i]
+                                y_test = y_split[test_index_i]
+                                estimator = clone(model_base).set_params(
+                                    **clone(param_cfg, safe=False)
+                                )
+                                estimator.fit(X_train, y_train)
+                                score = estimator.score(X_test, y_test)
+                                if score > best_score:
+                                    best_score = score
+                                    best_params = param_cfg
+                                    best_kernel = X
+                        logging.info(f'Best score: {best_score}')
+                        X_train = best_kernel[train_index_o][:, train_index_o]
+                        X_test = best_kernel[test_index_o][:, train_index_o]
+                        y_train = target[train_index_o]
+                        y_test = target[test_index_o]
+                        estimator = clone(model_base).set_params(
+                            **clone(best_params, safe=False)
+                        )
+                        estimator.fit(X_train, y_train)
+                        non_nested_scores[k] = estimator.score(X_test, y_test)
+                    nested_scores[j] = non_nested_scores.mean()
+                # for j in range(NUM_TRIALS):
+                #     logging.info(
+                #         f'Running trial {i} for parcellation '
+                #         f'{name}, measure {target_name}'
+                #     )
+                #     inner_cv = cv_base(
+                #         n_splits=FOLDS_INNER,
+                #         random_state=i * NUM_TRIALS + j,
+                #         **cv_params,
+                #     )
+                #     outer_cv = cv_base(
+                #         n_splits=FOLDS_OUTER,
+                #         random_state=i * NUM_TRIALS + j,
+                #         **cv_params,
+                #     )
+                #     model = GridSearchCV(
+                #         estimator=model_base,
+                #         param_grid=param_grid,
+                #         cv=inner_cv,
+                #         error_score='raise',
+                #         #n_jobs=-1,
+                #     )
+                #     nested_result = cross_validate(
+                #         model,
+                #         X=connectomes,
+                #         y=target,
+                #         groups=subject_ids,
+                #         cv=outer_cv,
+                #         return_estimator=True,
+                #         verbose=3,
+                #         fit_params={'groups': subject_ids},
+                #         error_score='raise',
+                #         #n_jobs=-1,
+                #     )
+                #    nested_scores[j] = nested_result['test_score'].mean()
+                #    results[ds][target_name][name][j] = nested_result
 
-                scores[ds][target_name][name] = (nested_scores, non_nested_scores)
+                scores[ds][name][target_name] = nested_scores
     assert 0
+
+
+from functools import reduce
+from itertools import chain, product
+
+def grid_search(grid_params: Mapping | Sequence[Mapping]):
+    """
+    Return an iterator over all param configurations,
+    because sklearn CV is useless
+    """
+    if isinstance(grid_params, Mapping):
+        grid_params = [grid_params]
+    yield from (
+        reduce(lambda e, f: {**e, **f}, z, {}) for z in
+        chain(*(
+            product(*[[{k: e} for e in v] for k, v in p.items()])
+            for p in grid_params
+        ))
+    )
 
 
 def main(
