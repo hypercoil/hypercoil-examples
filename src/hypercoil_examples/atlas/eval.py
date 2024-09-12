@@ -26,6 +26,7 @@ from scipy.io import loadmat
 
 from hypercoil.engine import _to_jax_array
 from hypercoil.functional import residualise, sym2vec
+from hypercoil_examples.atlas.behavioural import HCP_MEASURES
 from hypercoil_examples.atlas.const import (
     HCP_DATA_SPLIT_DEF_ROOT,
     HCP_EXTRA_SUBJECT_MEASURES,
@@ -352,23 +353,34 @@ def prepare_timeseries(
     pd.DataFrame(recon_err).to_csv(f'{OUTPUT_DIR}/recon_error.tsv', sep='\t')
 
 
+def corr_kernel(X, y=None):
+    if y is None: y = X
+    val = np.corrcoef(X, y)[:X.shape[-2], X.shape[-2]:]
+    return val
+
+
 def predict(
     num_parcels: int = 200, # not needed, for now
 ):
     import pathlib
+    from functools import partial
     from sklearn import svm
-    from sklearn.model_selection import GridSearchCV, cross_val_score, KFold
+    from sklearn.kernel_ridge import KernelRidge
+    from sklearn.metrics.pairwise import linear_kernel, rbf_kernel, cosine_similarity
+    from sklearn.model_selection import GridSearchCV, cross_validate, GroupKFold, GroupShuffleSplit, StratifiedGroupKFold
     DATA_GETTER = {
         'MSC': get_msc_dataset,
         'HCP': get_hcp_dataset,
     }
     models = list(BASELINES.keys()) + ['parametric', 'full']
     scores = {}
+    results = {}
     TASKS.pop('MSC')
     for ds, tasks in TASKS.items():
         if ds == 'HCP':
             extra_measures = pd.read_csv(HCP_EXTRA_SUBJECT_MEASURES, sep='\t')
         scores[ds] = {}
+        results[ds] = {}
         for name in models:
             tss = sorted(
                 pathlib.Path(
@@ -382,6 +394,7 @@ def predict(
                 (len(tss), int(num_parcels * (num_parcels - 1) / 2))
             )
             task_targets = np.zeros((len(tss), len(tasks)))
+            subject_ids = [None for _ in range(len(tss))]
             if ds == 'HCP':
                 extra_targets = np.zeros((len(tss), extra_measures.shape[1] - 1))
             for i, ts in enumerate(tss):
@@ -398,102 +411,154 @@ def predict(
                     i for i in str(ts).split('/')[-1].split('_')
                     if i[:4] == 'task'
                 ][0][5:]
-                get_dataset = DATA_GETTER[ds]
-                _, confounds = get_dataset(
-                    subject_id,
-                    session_id,
-                    taskname,
-                    get_confounds=True,
-                )
-                if os.path.exists(confounds):
-                    # Censor the parcellated timeseries
-                    data = _get_data(
-                        cifti=None,
-                        data=data,
-                        confounds=confounds,
-                        normalise=False,
-                        gsr=False,
-                        filter_rps=True,
-                        censor_thresh=0.15,
-                        pad_to_size=None,
-                        censor_method='drop',
-                        key=None,
-                    )
-                else:
-                    logging.warning(
-                        f'No confounds found for {subject_id} {session_id} {taskname}'
-                    )
+                # get_dataset = DATA_GETTER[ds]
+                # _, confounds = get_dataset(
+                #     subject_id,
+                #     session_id,
+                #     taskname,
+                #     get_confounds=True,
+                # )
+                # if os.path.exists(confounds):
+                #     # Censor the parcellated timeseries
+                #     data = _get_data(
+                #         cifti=None,
+                #         data=data,
+                #         confounds=confounds,
+                #         normalise=False,
+                #         gsr=False,
+                #         filter_rps=True,
+                #         censor_thresh=0.15,
+                #         pad_to_size=None,
+                #         censor_method='drop',
+                #         key=None,
+                #     )
+                # else:
+                #     logging.warning(
+                #         f'No confounds found for {subject_id} {session_id} {taskname}'
+                #     )
                 if taskname[:4] == 'REST':
                     taskname = 'REST'
+                subject_ids[i] = subject_id
                 connectomes[i] = sym2vec(np.corrcoef(data))
                 task_targets[i, tasks.index(taskname)] = 1
                 if ds == 'HCP':
                     extra_targets[i] = extra_measures.loc[
                         extra_measures['Subject'] == int(subject_id)
                     ].values[0][1:]
+            subject_ids = (
+                np.array(subject_ids)[..., None] ==
+                np.unique(subject_ids)[None, ...]
+            ).argmax(-1)
+            task_targets = (task_targets.argmax(-1), 'task', 'categorical')
+            targets = [task_targets]
+            if ds == 'HCP':
+                age_targets = (
+                    extra_targets[..., -3:].argmax(-1),
+                    'age',
+                    'categorical',
+                )
+                continuous_targets = [
+                    (e, list(HCP_MEASURES.keys())[i], 'continuous')
+                    for i, e in enumerate(extra_targets[..., :-3].T)
+                ]
+                targets = [task_targets] + [age_targets] + continuous_targets
             # Run nested cross-validation
             # Based on https://scikit-learn.org/stable/auto_examples/ ...
             # ... model_selection/plot_nested_cross_validation_iris.html
-            NUM_TRIALS = 100 # 5 #
-            FOLDS_OUTER = 20 # 4 #
-            FOLDS_INNER = 20 # 4 #
-            param_grid = [
-                {
-                    'kernel': ['linear'],
-                    'C': [0.1, 1, 10, 100, 1000],
-                },
-                {
-                    'kernel': ['rbf'],
-                    'C': [0.1, 1, 10, 100, 1000],
-                    'gamma': [0.001, 0.0001, 'scale'],
-                },
-                {
-                    # Kong et al use a correlation kernel
-                    'kernel': [lambda x: np.corrcoef(x)],
-                    'C': [0.1, 1, 10, 100, 1000],
-                },
-            ]
-            model_base = svm.SVC()
-            non_nested_scores = np.zeros(NUM_TRIALS)
-            nested_scores = np.zeros(NUM_TRIALS)
-            for i in range(NUM_TRIALS):
-                logging.info(f'Running trial {i}')
-                inner_cv = KFold(
-                    n_splits=FOLDS_INNER,
-                    shuffle=True,
-                    random_state=i,
-                )
-                outer_cv = KFold(
-                    n_splits=FOLDS_OUTER,
-                    shuffle=True,
-                    random_state=i,
-                )
-                # Non_nested parameter search and scoring
-                # model = GridSearchCV(
-                #     estimator=model_base,
-                #     param_grid=param_grid,
-                #     cv=outer_cv,
-                #     n_jobs=-1,
-                # )
-                #model.fit(connectomes, task_targets.argmax(-1))
-                #non_nested_scores[i] = model.best_score_
-                # Nested CV with parameter optimization
-                model = GridSearchCV(
-                    estimator=model_base,
-                    param_grid=param_grid,
-                    cv=inner_cv,
-                    n_jobs=-1,
-                )
-                nested_score = cross_val_score(
-                    model,
-                    X=connectomes,
-                    y=task_targets.argmax(-1),
-                    cv=outer_cv,
-                    n_jobs=-1,
-                )
-                nested_scores[i] = nested_score.mean()
+            NUM_TRIALS = 5 # 100 #
+            # Let's just always have the same count of inner and outer folds
+            FOLDS_OUTER = 4 # 20 #
+            FOLDS_INNER = 4 # 20 #
+            for i, (target, target_name, var_kind) in enumerate(targets[2:3]):
+                regularisation_grid = [0.1, 1, 10, 100, 1000]
+                if var_kind == 'categorical':
+                    model_base = svm.SVC()
+                    cv_base = StratifiedGroupKFold
+                    cv_params = {'shuffle': True}
+                    regularisation = {'C': regularisation_grid}
+                elif var_kind == 'continuous':
+                    model_base = KernelRidge()
+                    cv_base = GroupShuffleSplit
+                    cv_params = {
+                        'test_size': 1 / FOLDS_OUTER,
+                    }
+                    regularisation = {
+                        'alpha': [1 / (2 * C) for C in regularisation_grid]
+                    }
+                param_grid = [
+                    {
+                        'kernel': [linear_kernel],
+                        **regularisation,
+                    },
+                    {
+                        'kernel': [
+                            partial(rbf_kernel, gamma=gamma)
+                            for gamma in (
+                                .001,
+                                .0001,
+                                1 / (connectomes.shape[-1] * connectomes.var()),
+                            )
+                        ],
+                        'gamma': [
+                            .001,
+                            .0001,
+                            1 / (connectomes.shape[-1] * connectomes.var()),
+                        ]
+                        **regularisation,
+                    },
+                    {
+                        # Kong et al use a correlation kernel
+                        'kernel': [corr_kernel],
+                        **regularisation,
+                    },
+                    {
+                        'kernel': [cosine_similarity],
+                        **regularisation,
+                    },
+                ]
+                non_nested_scores = np.zeros(NUM_TRIALS)
+                nested_scores = np.zeros(NUM_TRIALS)
+                results[ds][target_name] = {}
+                scores[ds][target_name] = {}
+                results[ds][target_name][name] = [None for _ in range(NUM_TRIALS)]
+                for j in range(NUM_TRIALS):
+                    logging.info(
+                        f'Running trial {i} for parcellation '
+                        f'{name}, measure {target_name}'
+                    )
+                    inner_cv = cv_base(
+                        n_splits=FOLDS_INNER,
+                        random_state=i * NUM_TRIALS + j,
+                        **cv_params,
+                    )
+                    outer_cv = cv_base(
+                        n_splits=FOLDS_OUTER,
+                        random_state=i * NUM_TRIALS + j,
+                        **cv_params,
+                    )
+                    model = GridSearchCV(
+                        estimator=model_base,
+                        param_grid=param_grid,
+                        cv=inner_cv,
+                        error_score='raise',
+                        #n_jobs=-1,
+                    )
+                    nested_result = cross_validate(
+                        model,
+                        X=connectomes,
+                        y=target,
+                        groups=subject_ids,
+                        cv=outer_cv,
+                        return_estimator=True,
+                        verbose=3,
+                        fit_params={'groups': subject_ids},
+                        error_score='raise',
+                        #n_jobs=-1,
+                    )
+                    nested_scores[j] = nested_result['test_score'].mean()
+                    results[ds][target_name][name][j] = nested_result
 
-            scores[ds][name] = (nested_scores, non_nested_scores)
+                scores[ds][target_name][name] = (nested_scores, non_nested_scores)
     assert 0
 
 
@@ -501,6 +566,9 @@ def main(
     extract_ts: bool = False,
     num_parcels: int = 200,
 ):
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     if extract_ts:
         prepare_timeseries(num_parcels=num_parcels)
     predict(num_parcels=num_parcels)

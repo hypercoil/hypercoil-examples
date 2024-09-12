@@ -91,6 +91,7 @@ def _get_data(
     censor_thresh: float = 0.15,
     pad_to_size: Optional[int] = None,
     censor_method: Literal['drop', 'zero'] = 'drop',
+    t_rep: float = 0.72,
     key: Optional['jax.random.PRNGKey'] = None,
 ):
     key = jax.random.PRNGKey(0) if key is None else key
@@ -102,6 +103,7 @@ def _get_data(
             raise FileNotFoundError
         data_full = cifti.get_fdata(dtype=np.float32).T
         data = data_full[~cifti.header.get_axis(1).volume_mask]
+        t_rep = cifti.header.matrix._mims[0].series_step
     if normalise:
         data = data - data.mean(-1, keepdims=True)
         data = data / data.std(-1, keepdims=True)
@@ -117,7 +119,6 @@ def _get_data(
         rps = confounds[rp_cols].values
         rps[0] = rps[1]
         if filter_rps:
-            t_rep = cifti.header.matrix._mims[0].series_step
             if t_rep > 100: # Convert to seconds
                 t_rep /= 1000
             fs = 1 / t_rep
