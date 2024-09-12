@@ -81,17 +81,26 @@ def get_hcp_dataset(
     return data
 
 
+PARAM9KEY = sum(
+    [[f'trans_{d}', f'rot_{d}'] for d in ('x', 'y', 'z')], []
+) + ['white_matter', 'csf', 'global_signal']
+
+
 def _get_data(
     cifti: Optional[str] = None,
-    data: Optional[jnp.ndarray] = None,
     confounds: Optional[str] = None,
     normalise: bool = True,
-    gsr: bool = True,
+    mgtr: bool = True,
+    gsr: bool = False,
     filter_rps: bool = True,
     censor_thresh: float = 0.15,
     pad_to_size: Optional[int] = None,
     censor_method: Literal['drop', 'zero'] = 'drop',
     t_rep: float = 0.72,
+    filter_data: bool = True,
+    param36: bool = False,
+    *,
+    data: Optional[jnp.ndarray] = None,
     key: Optional['jax.random.PRNGKey'] = None,
 ):
     key = jax.random.PRNGKey(0) if key is None else key
@@ -104,30 +113,57 @@ def _get_data(
         data_full = cifti.get_fdata(dtype=np.float32).T
         data = data_full[~cifti.header.get_axis(1).volume_mask]
         t_rep = cifti.header.matrix._mims[0].series_step
+    if t_rep > 100: # Convert to seconds
+        t_rep /= 1000
     if normalise:
         data = data - data.mean(-1, keepdims=True)
         data = data / data.std(-1, keepdims=True)
         data = jnp.where(jnp.isnan(data), 0, data)
 
-    if gsr:
+    if mgtr or (gsr and not confounds):
+        # This is really MGTR, not GSR
         gs = data.mean(0, keepdims=True)
+        gsd = jnp.concatenate((np.zeros((1, 1)), np.diff(gs)), -1)
+        gs = jnp.concatenate((gs, gsd))
         data = residualise(data, gs)
     if confounds:
         confounds = pd.read_csv(confounds, sep='\t')
+        if param36:
+            param18key = PARAM9KEY + [f'{e}_derivative1' for e in PARAM9KEY]
+            param36key = param18key + [f'{e}_power2' for e in param18key]
+            param36model = confounds[param36key].values.T
+            # So that nothing explodes when we invert
+            breakpoint()
+            param36model = param36model - param36model.mean(-1, keepdims=True)
+            param36model = param36model / param36model.std(-1, keepdims=True)
+            param36model = jnp.where(jnp.isnan(param36model), 0, param36model)
+            data = residualise(data, param36model)
+        elif gsr:
+            if mgtr:
+                raise ValueError('Combining GSR and MGTR')
+            gs = confounds['global_signal'].values[None]
+            gsd = jnp.concatenate((np.zeros((1, 1)), np.diff(gs)), -1)
+            gs = jnp.concatenate((gs, gsd))
+            data = residualise(data, gs)
         rp_cols = ['trans_x', 'trans_y', 'trans_z', 'rot_x', 'rot_y', 'rot_z']
         rp_cols = [f'{e}_derivative1' for e in rp_cols]
-        rps = confounds[rp_cols].values
+        rps = np.array(confounds[rp_cols].values)
         rps[0] = rps[1]
+        fs = 1 / t_rep
         if filter_rps:
-            if t_rep > 100: # Convert to seconds
-                t_rep /= 1000
-            fs = 1 / t_rep
             fc = 0.1 # Cut-off frequency of the filter (6 bpm)
             filt = butter(N=1, Wn=fc, btype='low', fs=fs)
             rps = filtfilt(*filt, rps, axis=0)
         fd = jnp.abs(rps).sum(-1)
         tmask = fd <= censor_thresh
         surviving_frames = jnp.where(tmask)[0]
+        if filter_data:
+            fc = (0.01, 0.1)
+            filt = butter(N=1, Wn=fc, btype='bandpass', fs=fs)
+            if jnp.any(~tmask):
+                breakpoint()
+                jnp.interp
+            data = filtfilt(*filt, data, axis=-1)
         if pad_to_size is not None:
             base_size = tmask.sum()
             if pad_to_size <= base_size:
