@@ -124,20 +124,21 @@ class StaticEncoder(eqx.Module):
         *,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
-        # 1. Global signal regression
-        T = T - T.mean(-1, keepdims=True)
-        denom = T.std(-1, keepdims=True)
-        denom = jnp.where(denom == 0, 1., denom)
-        T = T / denom
-        gs = T.mean(0, keepdims=True)
-        T = residualise(T, gs)
-        # 2. Temporal encode
+        # We used to normalise / GSR here, but now it's done in the data
+        # loader
+        # T = T - T.mean(-1, keepdims=True)
+        # denom = T.std(-1, keepdims=True)
+        # denom = jnp.where(denom == 0, 1., denom)
+        # T = T / denom
+        # gs = T.mean(0, keepdims=True)
+        # T = residualise(T, gs)
+        # 1. Temporal encode
         X = self.temporal(T)
-        # 3. Spatial encode
+        # 2. Spatial encode
         S = {}
         S['cortex_L'] = self.spatial(coor_L, geom='cortex_L')
         S['cortex_R'] = self.spatial(coor_R, geom='cortex_R')
-        # 4. Alignment
+        # 3. Alignment
         new_M = new_M or {}
         slices = self.temporal.encoders[0].limits
         X = X.swapaxes(-1, -2)

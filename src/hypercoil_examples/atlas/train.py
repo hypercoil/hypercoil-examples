@@ -285,9 +285,14 @@ def visdef():
             name: str,
             array_left: Optional[jnp.ndarray] = None,
             array_right: Optional[jnp.ndarray] = None,
+            array: Optional[jnp.ndarray] = None,
         ):
-            array_left = parcel_reduction(array_left)
-            array_right = parcel_reduction(array_right)
+            if array_left is not None:
+                array_left = parcel_reduction(array_left)
+            if array_right is not None:
+                array_right = parcel_reduction(array_right)
+            if array is not None:
+                array = parcel_reduction(array)
             plot_f(
                 template='fsLR',
                 surf_projection='veryinflated',
@@ -306,6 +311,7 @@ def visdef():
                 **{
                     f'{scalars}_array_left': array_left,
                     f'{scalars}_array_right': array_right,
+                    f'{scalars}_array': array,
                     f'{scalars}_cmap': cmap,
                 }
             )
@@ -813,7 +819,9 @@ def get_exemplar(dataset: str):
         'MSC': _get_exemplar_msc,
         'HCP': _get_exemplar_hcp,
     }
-    return _get_data(EXEMPLAR_QUERY[dataset](), normalise=False, gsr=False)
+    return _get_data(
+        EXEMPLAR_QUERY[dataset](), normalise=False, denoising=None
+    )
 
 
 def load_data(
@@ -831,7 +839,6 @@ def load_data(
 
     try:
         ds = entity.get('ds')
-        # The encoder will handle data normalisation and GSR
         if ds == 'MSC':
             get_dataset = get_msc_dataset
             get_session = lambda e: e.get('session')
@@ -843,8 +850,7 @@ def load_data(
         task = entity.get('task')
         T = _get_data(
             *get_dataset(subject, session, task, get_confounds=True,),
-            normalise=False,
-            gsr=False,
+            denoising='mgtr+18',
             pad_to_size=WINDOW_SIZE,
             key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
         )
@@ -1135,7 +1141,7 @@ def checkpoint_model(
 
 def main(
     num_parcels: int = 200,
-    start_step: Optional[int] = None, # 12600, #
+    start_step: Optional[int] = None, # 15000, #
     classify: Literal['linear', 'kernel'] | None = 'kernel',
 ):
     key = jax.random.PRNGKey(SEED)
@@ -1161,7 +1167,6 @@ def main(
         'cortex_L': coor_L,
         'cortex_R': coor_R,
     }
-    # The encoder will handle data normalisation and GSR
     T = get_exemplar(DATASETS[0])
     model, encoder, template = init_full_model(
         T=T,

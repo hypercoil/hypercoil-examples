@@ -6,6 +6,7 @@ Template construction
 ~~~~~~~~~~~~~~~~~~~~~
 Training loop for template construction
 """
+import logging
 import pickle
 from itertools import product
 from typing import Optional
@@ -38,6 +39,11 @@ HCP_TASKS = (
 )
 DATASETS = ('HCP', 'MSC')
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] - %(message)s',
+)
+
 
 def null_spatial_encoder(*pparams, **params):
     return None
@@ -62,7 +68,6 @@ def main(last_checkpoint: Optional[int] = None):
             )
         ]
     num_entities = len(data_entities)
-    breakpoint()
     coor_L, coor_R = get_coors()
     model, _ = init_encoder_model(coor_L=coor_L)
     encode = eqx.filter_jit(model)
@@ -87,8 +92,7 @@ def main(last_checkpoint: Optional[int] = None):
                 task = entity.get('task')
                 T = _get_data(
                     *get_msc_dataset(subject, session, task, get_confounds=True,),
-                    normalise=False,
-                    gsr=False,
+                    denoising='mgtr+18',
                 )
             elif ds == 'HCP':
                 subject = entity.get('subject')
@@ -96,22 +100,22 @@ def main(last_checkpoint: Optional[int] = None):
                 task = entity.get('task')
                 T = _get_data(
                     *get_hcp_dataset(subject, session, task, get_confounds=True,),
-                    normalise=False,
-                    gsr=False,
+                    denoising='mgtr+18',
                 )
         except FileNotFoundError:
-            print(
+            logging.warning(
                 f'Data entity {entity} is absent. '
                 'Skipping'
             )
             continue
-        print(f'Epoch {i} (ds-{ds} sub-{subject} ses-{session} task-{task})')
+        logging.info(f'Epoch {i} (ds-{ds} sub-{subject} ses-{session} task-{task})')
         if jnp.any(jnp.isnan(T)):
-            print(
+            logging.warning(
                 f'Invalid data for entity sub-{subject} ses-{session}. '
                 'Skipping'
             )
             continue
+        logging.info('Encoding')
         _, (template, new_new_template, new_update_weight, _, _) = encode(
             T=T,
             coor_L=coor_L,
@@ -124,7 +128,7 @@ def main(last_checkpoint: Optional[int] = None):
             jnp.any(jnp.isnan(new_new_template['cortex_L'])) or
             jnp.any(jnp.isnan(new_new_template['cortex_R']))
         ):
-            print(
+            logging.warning(
                 f'Invalid data for entity sub-{subject} ses-{session}. '
                 'Skipping'
             )
@@ -144,7 +148,7 @@ def main(last_checkpoint: Optional[int] = None):
                 )
                 delta_norm = delta_norm_L + delta_norm_R
                 epoch_history += [(delta_norm,)]
-                print(f'Epoch {i} delta norm: {delta_norm}')
+                logging.info(f'Epoch {i} delta norm: {delta_norm}')
             template = {
                 compartment: model.temporal.rescale(new_template[compartment])
                 for compartment in ('cortex_L', 'cortex_R')
@@ -154,7 +158,7 @@ def main(last_checkpoint: Optional[int] = None):
             (i % CHECKPOINT_INTERVAL == 0) and
             (template['cortex_L'] is not None)
         ):
-            print('Serialising template for checkpoint')
+            logging.info('Serialising template for checkpoint')
             template_concat = np.asarray(jnp.concatenate(
                 (template['cortex_L'], template['cortex_R'])
             ))

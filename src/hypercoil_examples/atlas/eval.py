@@ -51,6 +51,7 @@ from hypercoil_examples.atlas.train import (
     VMF_SPATIAL_KAPPA,
     VMF_SELECTIVITY_KAPPA,
     FIXED_KAPPA,
+    visdef,
 )
 from hyve import (
     Cell,
@@ -129,6 +130,33 @@ RH_MASK = nb.load(
 ).darrays[0].data.astype(bool)
 
 
+def _test_mode(
+    kong_ids,
+    kong_parcellations,
+):
+    import matplotlib.pyplot as plt
+    import h5py
+    kong_idx = kong_ids.index('106016')
+    kong_asgt = np.concatenate((
+        kong_parcellations['lh_labels_all'][LH_MASK, kong_idx],
+        kong_parcellations['rh_labels_all'][RH_MASK, kong_idx],
+    ))
+    kong_atlas = np.where(
+        (kong_asgt < 0)[..., None],
+        0,
+        np.eye(kong_asgt.max() + 1)[kong_asgt],
+    ).squeeze().T[1:]
+    T0 = _get_data(*get_hcp_dataset('106016', 'LR', get_confounds=True), denoising='mgtr+18')
+    T1 = _get_data(*get_hcp_dataset('106016', 'RL', get_confounds=True), denoising='mgtr+18')
+    Tp = np.linalg.lstsq(kong_atlas.T, np.concatenate((T0, T1), -1))[0]
+    with h5py.File('/mnt/andromeda/Data/Kong2022_ArealMSHBM/FC/400/HCP_1029sub_400Parcels_Kong2022_gMSHBM_FC_group1.mat', 'r') as f:
+        refconn = f['corr_mat_sub_group'][:]
+    ref = refconn[-5]
+    print(np.corrcoef(sym2vec(np.corrcoef(Tp)), sym2vec(ref))[0, 1])
+    plt.imshow(np.corrcoef(Tp), vmin=-0.25, vmax=0.25, cmap='RdYlBu_r'); plt.colorbar(); plt.show()
+    breakpoint()
+
+
 def prepare_timeseries(
     num_parcels: int = 200,
     start_epoch: Optional[int] = 15600,
@@ -160,6 +188,7 @@ def prepare_timeseries(
         kong_ids = f.read().split('\n')
     kong_parcellations = loadmat(KONG_PARCELLATIONS)
     atlas = {}
+    visualise, _ = visdef()
     for baseline, path in BASELINES.items():
         if path is None:
             continue # Get it on a per-subject basis below
@@ -170,8 +199,13 @@ def prepare_timeseries(
             0,
             np.eye(atlas[baseline].max() + 1)[atlas[baseline]],
         ).squeeze().T
+        visualise(
+            name=f'atlas-{baseline}',
+            array=atlas[baseline].T,
+        )
+    #_test_mode(kong_ids, kong_parcellations)
 
-    T = _get_data(get_msc_dataset('01', '01'), normalise=False, gsr=False)
+    T = _get_data(get_msc_dataset('01', '01'), normalise=False, denoising=None)
     coor_L, coor_R = get_coors()
     model, encoder, template = init_full_model(
         T=T,
@@ -218,7 +252,7 @@ def prepare_timeseries(
                 T = _get_data(
                     *get_msc_dataset(subject, session, task, get_confounds=True,),
                     normalise=False,
-                    gsr=False,
+                    denoising=None,
                     pad_to_size=None,
                     key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
                 )
@@ -230,7 +264,7 @@ def prepare_timeseries(
                 T = _get_data(
                     *get_hcp_dataset(subject, session, task, get_confounds=True,),
                     normalise=False,
-                    gsr=False,
+                    denoising=None,
                     pad_to_size=None,
                     key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
                 )

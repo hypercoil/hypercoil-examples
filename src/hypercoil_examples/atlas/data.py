@@ -106,7 +106,7 @@ def _get_data(
         'param36',
         'mgtr+18',
         'mgtr+36',
-    ] = 'mgtr',
+    ] | None = 'mgtr+18',
     filter_rps: bool = True,
     filter_data: bool = True,
     censor_thresh: float = 0.15,
