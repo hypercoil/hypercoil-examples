@@ -124,8 +124,8 @@ class StaticEncoder(eqx.Module):
         *,
         key: Optional['jax.random.PRNGKey'] = None,
     ) -> Tuple[Tensor, Tensor]:
-        # We used to normalise / GSR here, but now it's done in the data
-        # loader
+        # We used to normalise / GSR here, but now it's done with greater
+        # flexibility in the data loader
         # T = T - T.mean(-1, keepdims=True)
         # denom = T.std(-1, keepdims=True)
         # denom = jnp.where(denom == 0, 1., denom)

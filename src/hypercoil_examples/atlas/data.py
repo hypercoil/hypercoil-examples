@@ -88,7 +88,9 @@ PARAM9KEY = sum(
 
 def _normalise(data: jnp.ndarray) -> jnp.ndarray:
     data = data - data.mean(-1, keepdims=True)
-    data = data / data.std(-1, keepdims=True)
+    denom = data.std(-1, keepdims=True)
+    denom = jnp.where(denom == 0, 1., denom)
+    data = data / denom
     data = jnp.where(jnp.isnan(data), 0, data)
     return data
 
