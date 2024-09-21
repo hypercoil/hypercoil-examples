@@ -6,7 +6,11 @@ Load and transform data
 ~~~~~~~~~~~~~~~~~~~~~~~
 Load and transform CIfTI-formatted neuroimaging data.
 """
-from typing import Literal, Optional
+import dataclasses
+import logging
+from itertools import product
+from pathlib import Path
+from typing import Literal, Mapping, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +23,163 @@ from hypercoil.functional import residualise
 from hypercoil_examples.atlas.const import (
     MSC_DATA_ROOT, HCP_DATA_ROOT
 )
+
+HCP_SEARCH_PATTERN = (
+    f'{HCP_DATA_ROOT}/'
+    '{subject}/MNINonLinear/Results/'
+    '?fMRI_{task}_{run}/?fMRI_{task}_{run}_'
+    'Atlas_MSMAll.dtseries.nii'
+)
+HCP_CONF_SEARCH_PATTERN = (
+    f'{HCP_DATA_ROOT}/'
+    '{subject}/MNINonLinear/Results/'
+    '?fMRI_{task}_{run}/Confound_Regressors.tsv'
+)
+MSC_SEARCH_PATTERN = (
+    f'{MSC_DATA_ROOT}/'
+    'sub-MSC{subject}_ses-func{session}_'
+    'task-{task}_space-fsLR_den-91k_bold.dtseries.nii'
+)
+MSC_CONF_SEARCH_PATTERN = (
+    f'{MSC_DATA_ROOT}/'
+    'sub-MSC{subject}_ses-func{session}_'
+    'task-{task}_desc-confounds_timeseries.tsv'
+)
+MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+TASKS = {
+    'MSC': (
+        ('rest', 'rest'),
+        ('motor_run-01', 'motor'),
+        ('motor_run-02', 'motor'),
+        ('glasslexical_run-01', 'glasslexical'),
+        ('glasslexical_run-02', 'glasslexical'),
+        ('memoryfaces', 'memoryfaces'),
+        ('memoryscenes', 'memoryscenes'),
+        ('memorywords', 'memorywords'),
+    ),
+    'HCP': (
+        ('REST1', 'REST'),
+        ('REST2', 'REST'),
+        ('EMOTION', 'EMOTION'),
+        ('GAMBLING', 'GAMBLING'),
+        ('LANGUAGE', 'LANGUAGE'),
+        ('MOTOR', 'MOTOR'),
+        ('RELATIONAL', 'RELATIONAL'),
+        ('SOCIAL', 'SOCIAL'),
+        ('WM', 'WM'),
+    ),
+}
+TASKS_FILES = {k: tuple(v[0] for v in vs) for k, vs in TASKS.items()}
+TASKS_TARGETS = {
+    k: tuple(sorted(set(v[1] for v in vs)))
+    for k, vs in TASKS.items()
+}
+HCP_RECORD_DEFAULTS = {
+    'ds': 'HCP',
+    'image_pattern': HCP_SEARCH_PATTERN,
+    'confounds_pattern': HCP_CONF_SEARCH_PATTERN,
+    'tasks': TASKS['HCP'],
+    'rest_tasks': ('REST1', 'REST2'),
+    'runs': ('LR', 'RL'),
+    '_default_run': 'LR',
+    '_default_task': 'REST1',
+}
+MSC_RECORD_DEFAULTS = {
+    'ds': 'MSC',
+    'image_pattern': MSC_SEARCH_PATTERN,
+    'confounds_pattern': MSC_CONF_SEARCH_PATTERN,
+    'tasks': TASKS['MSC'],
+    'rest_tasks': ('rest',),
+    'sessions': MSC_SESSIONS,
+    '_default_session': '01',
+    '_default_task': 'rest',
+}
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class SubjectRecord:
+    ds: str
+    ident: str
+    image_pattern: str
+    confounds_pattern: str | None = None
+    tasks: Sequence[str]
+    rest_tasks: Sequence[str] | None = None
+    sessions: Sequence[str] | None = None
+    runs: Sequence[str] | None = None
+    _default_session: str | None = None
+    _default_run: str | None = None
+    _default_task: str | None = None
+
+    @staticmethod
+    def resolve_pattern(pattern: str, arguments: Mapping[str, str]) -> str:
+        path = pattern.format(**arguments)
+        path = [e for e in Path('/').glob(path[1:])]
+        if len(path) != 1:
+            raise FileNotFoundError
+        return path[0]
+
+    def get_dataset(
+        self,
+        session: str | None = None,
+        run: str | None = None,
+        task: str | None = None,
+        get_confounds: bool = False,
+    ) -> str | Tuple[str, str]:
+        search_arguments = {
+            'subject': self.ident,
+            'session': session or self._default_session,
+            'run': run or self._default_run,
+            'task': task or self._default_task,
+        }
+        image_path = self.resolve_pattern(
+            pattern=self.image_pattern,
+            arguments=search_arguments,
+        )
+        if not get_confounds:
+            return image_path
+        confounds_path = self.resolve_pattern(
+            pattern=self.confounds_pattern,
+            arguments=search_arguments,
+        )
+        return image_path, confounds_path
+
+    def entity_iterator(self, entities: Sequence, get_confounds: bool = True):
+        for task, session, run in entities:
+            try:
+                yield self.get_dataset(
+                    session=session,
+                    run=run,
+                    task=task,
+                    get_confounds=get_confounds,
+                )
+            except FileNotFoundError:
+                logging.warning(
+                    f'Data entity subject={self.ident} session={session} '
+                    f'run={run} task={task} is absent. Skipping'
+                )
+                continue
+
+    def iterator(self, get_confounds: bool = True):
+        entities = product(
+            tuple(v[0] for v in self.tasks),
+            self.sessions if self.sessions is not None else (self.sessions,),
+            self.runs if self.runs is not None else (self.runs,),
+        )
+        yield from self.entity_iterator(
+            entities=entities,
+            get_confounds=get_confounds,
+        )
+
+    def rest_iterator(self, get_confounds: bool = True):
+        entities = product(
+            tuple(v[0] for v in self.tasks if v[0] in self.rest_tasks),
+            self.sessions if self.sessions is not None else (self.sessions,),
+            self.runs if self.runs is not None else (self.runs,),
+        )
+        yield from self.entity_iterator(
+            entities=entities,
+            get_confounds=get_confounds,
+        )
 
 
 def inject_noise_to_zero_variance(
@@ -115,7 +276,10 @@ def _get_data(
     pad_to_size: Optional[int] = None,
     censor_method: Literal['drop', 'zero'] = 'drop',
     t_rep: float = 0.72,
+    min_frames: int = 100,
+    min_frac_frames: float = 0.75,
     *,
+    on_qa_fail: Literal['raise', 'skip'] = 'skip',
     data: Optional[jnp.ndarray] = None,
     key: Optional['jax.random.PRNGKey'] = None,
 ):
@@ -145,7 +309,7 @@ def _get_data(
             confmodel = jnp.concatenate((confmodel, gsd))
             if denoising in ('mgtr+18', 'mgtr+36'):
                 confmodel = jnp.concatenate(
-                    (confmodel, confmodel ** 2), -1
+                    (confmodel, confmodel ** 2), -2
                 )
                 mgtr = pd.DataFrame({
                     'global_signal': confmodel[0],
@@ -167,6 +331,17 @@ def _get_data(
             confounds[rp_cols] = rps
         fd = jnp.abs(rps).sum(-1)
         tmask = fd <= censor_thresh
+        num_frames_surviving = tmask.sum()
+        if num_frames_surviving < min_frames or (
+            num_frames_surviving / len(tmask) < min_frac_frames
+        ):
+            #TODO
+            # callers will be looking for FileNotFoundError. We should change
+            # them and this before we upstream.
+            if on_qa_fail == 'raise':
+                raise FileNotFoundError
+            elif on_qa_fail == 'skip':
+                return None
         if denoising in ('mgtr+18', 'mgtr+36'):
             confounds[mgtr.columns] = mgtr
             if denoising == 'mgtr+18': denoising = 'param18'
@@ -177,6 +352,11 @@ def _get_data(
                 model_key = model_key + [f'{e}_power2' for e in model_key]
             confmodel = confounds[model_key].values.T
             # So that nothing explodes when we invert
+            confmodel[..., 0] = np.where(
+                np.isnan(confmodel[..., 0]),
+                confmodel[..., 1],
+                confmodel[..., 0],
+            )
             confmodel = _normalise(confmodel)
         elif denoising in ('gsr', 'gsr_deriv'):
             confmodel = confounds['global_signal'].values[None]
@@ -239,7 +419,8 @@ def _get_data(
             data = jnp.where(tmask[None, ...], data, 0)
             if confmodel is not None:
                 confmodel = jnp.where(tmask[None, ...], confmodel, 0)
-    data = residualise(data, confmodel)
+    if confmodel is not None:
+        data = residualise(data, confmodel)
     # Plug zero-variance vertices with ramp (for no NaNs in log prob)
     data = inject_noise_to_zero_variance(data, key=key)
     return data
