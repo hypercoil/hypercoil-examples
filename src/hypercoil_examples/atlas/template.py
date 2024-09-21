@@ -9,7 +9,7 @@ Training loop for template construction
 import logging
 import pickle
 from itertools import product
-from typing import Optional
+from typing import Mapping, Optional
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ from hypercoil_examples.atlas.model import init_encoder_model
 from hypercoil_examples.atlas.positional import get_coors
 
 MAX_EPOCH = 14785 # 9801
-CHECKPOINT_INTERVAL = 1848 # 1960
+CHECKPOINT_INTERVAL = 100 # 1848 # 1960 #
 MSC_SUBJECTS = ('01', '02', '03') #, '04', '05', '06', '07', '08', '09', '10',)
 MSC_SESSIONS = ('01', '02', '03') #, '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS = ('05', '06')
@@ -49,6 +49,31 @@ def null_spatial_encoder(*pparams, **params):
     return None
 
 
+def checkpoint_template(
+    template: Mapping,
+    update_weight: Optional[int] = 0,
+    new_template: Optional[Mapping] = None,
+):
+    logging.info('Serialising template for checkpoint')
+    template_concat = np.asarray(jnp.concatenate(
+        (template['cortex_L'], template['cortex_R'])
+    ))
+    np.save(
+        '/tmp/template.npy', template_concat, allow_pickle=False
+    )
+    if new_template is not None:
+        new_template_concat = np.asarray(jnp.concatenate(
+            (new_template['cortex_L'], new_template['cortex_R'])
+        ))
+        np.save(
+            '/tmp/new_template.npy',
+            new_template_concat,
+            allow_pickle=False,
+        )
+    with open('/tmp/templateupdateweight.txt', 'w') as f:
+        f.write(str(update_weight))
+
+
 def main(last_checkpoint: Optional[int] = None):
     data_entities = []
     if 'MSC' in DATASETS:
@@ -71,17 +96,42 @@ def main(last_checkpoint: Optional[int] = None):
     coor_L, coor_R = get_coors()
     model, _ = init_encoder_model(coor_L=coor_L)
     encode = eqx.filter_jit(model)
-    #encode = model
+    encode = model
     epoch_history = []
+    new_template = None
+    update_weight = 0
     if last_checkpoint is not None:
         template_concat = np.load('/tmp/template.npy')
+        # TODO: This should be a method of `encoder.temporal`
+        template = {
+            c: jax.lax.dynamic_slice(
+                template_concat,
+                (s[0],) + (0,) * (template_concat.ndim - 1),
+                (s[1],) + template_concat.shape[1:],
+            )
+            for c, s in model.temporal.encoders[0].limits.items()
+            if c in model.temporal.compartments
+        }
+        if (last_checkpoint % CHECKPOINT_INTERVAL == 0):
+            new_template = None
+            update_weight = 0
+        else:
+            new_template_concat = np.load('/tmp/new_template.npy')
+            new_template = {
+                c: jax.lax.dynamic_slice(
+                    new_template_concat,
+                    (s[0],) + (0,) * (new_template_concat.ndim - 1),
+                    (s[1],) + new_template_concat.shape[1:],
+                )
+                for c, s in model.temporal.encoders[0].limits.items()
+                if c in model.temporal.compartments
+            }
+            with open('/tmp/templateupdateweight.txt', 'r') as f:
+                update_weight = int(f.read())
         start_epoch = last_checkpoint
-        assert 0
     else:
         template = {'cortex_L': None, 'cortex_R': None}
         start_epoch = 0
-    new_template = None
-    update_weight = 0
     for i in range(start_epoch, MAX_EPOCH):
         entity = data_entities[i % num_entities]
         try:
@@ -93,6 +143,7 @@ def main(last_checkpoint: Optional[int] = None):
                 T = _get_data(
                     *get_msc_dataset(subject, session, task, get_confounds=True,),
                     denoising='mgtr+18',
+                    filter_data=False,
                 )
             elif ds == 'HCP':
                 subject = entity.get('subject')
@@ -101,6 +152,7 @@ def main(last_checkpoint: Optional[int] = None):
                 T = _get_data(
                     *get_hcp_dataset(subject, session, task, get_confounds=True,),
                     denoising='mgtr+18',
+                    filter_data=False,
                 )
         except FileNotFoundError:
             logging.warning(
@@ -137,7 +189,7 @@ def main(last_checkpoint: Optional[int] = None):
         update_weight = new_update_weight
         if (
             ((i % num_entities == 0)
-            and (i != 0))
+            and (new_template is not None))
         ):
             if template['cortex_L'] is not None:
                 delta_norm_L = jnp.linalg.norm(
@@ -154,20 +206,23 @@ def main(last_checkpoint: Optional[int] = None):
                 for compartment in ('cortex_L', 'cortex_R')
             }
             update_weight = 0
-        if (
+            checkpoint_template(
+                template=template,
+                new_template=None,
+            )
+        elif (
             (i % CHECKPOINT_INTERVAL == 0) and
             (template['cortex_L'] is not None)
         ):
-            logging.info('Serialising template for checkpoint')
-            template_concat = np.asarray(jnp.concatenate(
-                (template['cortex_L'], template['cortex_R'])
-            ))
-            np.save(
-                '/tmp/template.npy', template_concat, allow_pickle=False
+            checkpoint_template(
+                template=template,
+                new_template=new_template,
             )
     import matplotlib.pyplot as plt
     plt.plot([e[0] for e in epoch_history]) # training loss
     plt.savefig('/tmp/losses.png')
+    with open('/tmp/template_deltas.txt', 'w') as f:
+        f.write('\n'.join(str(e[0]) for e in epoch_history))
     assert 0
 
 
