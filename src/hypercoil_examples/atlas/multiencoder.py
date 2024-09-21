@@ -228,7 +228,11 @@ def configure_multiencoder(
         loc = enc
         scale = jnp.minimum(-2e-2 * jnp.log(jnp.abs(loc)), 5)
         return logistic_mixture_threshold(
-            incomplete_mahalanobis_transform(loc)[0], scale, k=0.9, axis=-1
+            incomplete_mahalanobis_transform(loc)[0],
+            #jnp.arctanh(jnp.where(jnp.isclose(loc, 1.), 1 - 1e-7, loc)),
+            scale,
+            k=0.9,
+            axis=-1,
         )
     multiencoder = MultiEncoder(
         encoders=encoders,

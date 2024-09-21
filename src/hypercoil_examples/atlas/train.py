@@ -147,8 +147,8 @@ MASS_POTENTIALS_NU = 200. # 0. #
 BIG_KAPPA_NU = 1e-5 # 0. #
 SMALL_KAPPA_NU = 1e0 # 0. #
 
-VMF_SPATIAL_KAPPA = 50.
-VMF_SELECTIVITY_KAPPA = 20.
+VMF_SPATIAL_KAPPA = 50. # 100000. #
+VMF_SELECTIVITY_KAPPA = 20. # 30. #
 FIXED_KAPPA = False
 
 KRLST_KERNEL = CorrelationKernel()
@@ -197,19 +197,6 @@ DATA_SHUFFLE_KEY = 7834
 DATA_SAMPLER_KEY = 9902
 READOUT_INIT_KEY = 5310
 ZERO_VAR_NOISE_KEY = 54
-
-
-jax.config.update('jax_debug_nans', True)
-forward_eval = eqx.filter_jit(forward)
-forward_backward = eqx.filter_value_and_grad(
-    eqx.filter_jit(forward),
-    has_aux=True,
-)
-# forward_backward = forward
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] - %(message)s',
-)
 
 
 class InvalidValueException(FloatingPointError):
@@ -851,6 +838,7 @@ def load_data(
         T = _get_data(
             *get_dataset(subject, session, task, get_confounds=True,),
             denoising='mgtr+18',
+            filter_data=False,
             pad_to_size=WINDOW_SIZE,
             key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
         )
@@ -886,7 +874,7 @@ def deserialise_if_exists(
     model: ForwardParcellationModel,
     opt_state: optax.OptState,
     *,
-    start_step: Optional[int] = None,
+    start_step: Optional[int | Literal['new']] = None,
     total_epoch_size: int,
     classify: Literal['linear', 'kernel'] | None,
     krlst_stash: Mapping,
@@ -898,6 +886,17 @@ def deserialise_if_exists(
     else:
         grad_info = {'L': {}, 'R': {}}
         updates_info = {'L': {}, 'R': {}}
+    if start_step == 'new':
+        import re
+        from pathlib import Path
+        try:
+            start_step = sorted([
+                int(re.search('[0-9]+', e.parts[-1]).group(0))
+                for e in Path('/tmp/').glob(
+                    'parcellation*model*checkpoint*.eqx'
+                )
+            ])[-1]
+        except IndexError: start_step = None
     if start_step is not None:
         model = eqx.tree_deserialise_leaves(
             f'/tmp/parcellation_model_checkpoint{start_step}',
@@ -1141,7 +1140,7 @@ def checkpoint_model(
 
 def main(
     num_parcels: int = 200,
-    start_step: Optional[int] = None, # 15000, #
+    start_step: Optional[int | Literal['new']] = 'new', # None, #
     classify: Literal['linear', 'kernel'] | None = 'kernel',
 ):
     key = jax.random.PRNGKey(SEED)
@@ -1706,6 +1705,17 @@ def main(
 
 if __name__ == '__main__':
     import os
+    jax.config.update('jax_debug_nans', True)
+    forward_eval = eqx.filter_jit(forward)
+    forward_backward = eqx.filter_value_and_grad(
+        eqx.filter_jit(forward),
+        has_aux=True,
+    )
+    # forward_backward = forward
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] - %(message)s',
+    )
     #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
     #os.environ['TF_CPP_VMODULE'] = 'bfc_allocator=1'
     #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
