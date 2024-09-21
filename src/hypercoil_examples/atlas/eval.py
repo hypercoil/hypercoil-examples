@@ -11,6 +11,7 @@ import os
 import re
 import pickle
 from itertools import product
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import equinox as eqx
@@ -33,7 +34,12 @@ from hypercoil_examples.atlas.const import (
 )
 from hypercoil_examples.atlas.cross2subj import visualise
 from hypercoil_examples.atlas.data import (
-    get_hcp_dataset, get_msc_dataset, _get_data
+    get_hcp_dataset,
+    get_msc_dataset,
+    _get_data,
+    SubjectRecord,
+    HCP_RECORD_DEFAULTS,
+    MSC_RECORD_DEFAULTS,
 )
 from hypercoil_examples.atlas.model import (
     init_full_model,
@@ -73,36 +79,9 @@ PATHWAYS = ('regulariser', 'full') # ('full',) ('regulariser',)
 VAL_SIZE = {'HCP': 800, } #'MSC': 160}
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
-MSC_SUBJECTS_VAL = ('04', '07')
-TASKS = {
-    'MSC': (
-        ('rest', 'rest'),
-        ('motor_run-01', 'motor'),
-        ('motor_run-02', 'motor'),
-        ('glasslexical_run-01', 'glasslexical'),
-        ('glasslexical_run-02', 'glasslexical'),
-        ('memoryfaces', 'memoryfaces'),
-        ('memoryscenes', 'memoryscenes'),
-        ('memorywords', 'memorywords'),
-    ),
-    'HCP': (
-        ('REST1', 'REST'),
-        ('REST2', 'REST'),
-        ('EMOTION', 'EMOTION'),
-        ('GAMBLING', 'GAMBLING'),
-        ('LANGUAGE', 'LANGUAGE'),
-        ('MOTOR', 'MOTOR'),
-        ('RELATIONAL', 'RELATIONAL'),
-        ('SOCIAL', 'SOCIAL'),
-        ('WM', 'WM'),
-    ),
-}
-TASKS_FILES = {k: tuple(v[0] for v in vs) for k, vs in TASKS.items()}
-TASKS_TARGETS = {
-    k: tuple(sorted(set(v[1] for v in vs)))
-    for k, vs in TASKS.items()
-}
-DATASETS = ('HCP',) # 'MSC')
+MSC_SUBJECTS_VAL = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
+DATASETS = ('MSC',) # ('HCP',) #
+NUM_SPLITS = {'HCP': 2, 'MSC': 5}
 
 DATA_SHUFFLE_KEY = 7834
 DATA_SAMPLER_KEY = 9902
@@ -157,32 +136,190 @@ def _test_mode(
     breakpoint()
 
 
-def prepare_timeseries(
-    num_parcels: int = 200,
-    start_epoch: Optional[int] = 15600,
-):
-    key = jax.random.PRNGKey(SEED)
-    val_entities = {}
+def aggregate_entities():
+    records = {}
     if 'MSC' in DATASETS:
-        val_entities = {**val_entities, 'MSC': [
-            {'ds': 'MSC', 'session': ses, 'subject': sub, 'task': task}
-            for ses, sub, task in product(
-                MSC_SESSIONS, MSC_SUBJECTS_VAL, TASKS_FILES['MSC']
-            )
-        ]}
+        records['MSC'] = [
+            SubjectRecord(ident=e, **MSC_RECORD_DEFAULTS)
+            for e in MSC_SUBJECTS_VAL
+        ]
     if 'HCP' in DATASETS:
         with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_val.txt', 'r') as f:
             hcp_subjects_val = f.read().splitlines()
-        val_entities = {**val_entities, 'HCP': [
-            {'ds': 'HCP', 'run': run, 'subject': sub, 'task': task}
-            for run, sub, task in product(
-                ('LR', 'RL'), hcp_subjects_val, TASKS_FILES['HCP']
-            )
-        ]}
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_template.txt', 'r') as f:
+            hcp_subjects_val += f.read().splitlines()
+        records['HCP'] = [
+            SubjectRecord(ident=e, **HCP_RECORD_DEFAULTS)
+            for e in hcp_subjects_val
+        ]
 
-    val_entities = sum(
-        [val_entities[ds] for ds in DATASETS], []
+    records = sum(
+        [records[ds] for ds in DATASETS], []
     )
+    return records
+
+
+def template_parcellation(model, template, coor, name: str):
+    visualise, _ = visdef()
+    P = {
+        compartment: jax.nn.softmax(
+            model.regulariser[compartment].selectivity_distribution.log_prob(
+                template[compartment]
+            ) + model.regulariser[compartment].spatial_distribution.log_prob(
+                coor[compartment]
+            ),
+            -1,
+        )
+        for compartment in ('cortex_L', 'cortex_R')
+    }
+    P = np.block([
+        [P['cortex_L'], np.zeros_like(P['cortex_L'])],
+        [np.zeros_like(P['cortex_R']), P['cortex_R']],
+    ])
+    visualise(
+        name=f'atlas-{name}',
+        array=P,
+    )
+    np.save(
+        f'{OUTPUT_DIR}/parcellations/{name}.npy',
+        np.asarray(P),
+        allow_pickle=False,
+    )
+
+
+def create_parcellations(
+    num_parcels: int = 200,
+    start_epoch: Optional[int] = 15600,
+    rerun_all: bool = False,
+):
+    os.makedirs(f'{OUTPUT_DIR}/parcellations/', exist_ok=True)
+    key = jax.random.PRNGKey(SEED)
+    visualise, _ = visdef()
+    records = aggregate_entities()
+    T = _get_data(
+        records[0].get_dataset(), normalise=False, denoising=None
+    )
+    coor_L, coor_R = get_coors()
+    model, encoder, template = init_full_model(
+        T=T,
+        coor_L=coor_L,
+        coor_R=coor_R,
+        num_parcels=num_parcels,
+        encoder_type=ENCODER_ARCH,
+        block_arch=BLOCK_ARCH,
+        injection_points=SERIAL_INJECTION_SITES,
+        spatial_kappa=VMF_SPATIAL_KAPPA,
+        selectivity_kappa=VMF_SELECTIVITY_KAPPA,
+        fixed_kappa=FIXED_KAPPA,
+        dropout=0,
+    )
+    template_parcellation(
+        model,
+        template,
+        coor={
+            'cortex_L': coor_L,
+            'cortex_R': coor_R,
+        },
+        name='groupTemplateInitOnly',
+    )
+    encode = eqx.filter_jit(encoder)
+    #encode = encoder
+    if start_epoch is not None:
+        model = eqx.tree_deserialise_leaves(
+            f'/tmp/parcellation_model_checkpoint{start_epoch}',
+            like=model,
+        )
+        try:
+            with open('/tmp/epoch_history.pkl', 'rb') as f:
+                epoch_history = pickle.load(f)
+        except FileNotFoundError:
+            print('No epoch history found--starting new record')
+        template_parcellation(
+            model,
+            template,
+            coor={
+                'cortex_L': coor_L,
+                'cortex_R': coor_R,
+            },
+            name='groupTemplate',
+        )
+    forward_modes = [
+        ('parametric', eqx.filter_jit(model.parametric_path)),
+        ('full', eqx.filter_jit(model)),
+    ]
+    for i, record in enumerate(records):
+        if not rerun_all:
+            outputs = Path(f'{OUTPUT_DIR}').glob(
+                f'parcellations/*{record.ident}split*_atlas-*_ts.npy'
+            )
+            if len(list(outputs)) == (2 * (NUM_SPLITS[record.ds] + 1)):
+                logging.info(f'Found complete results for {record.ident}!')
+                continue
+        logging.info(
+            f'Fetching records for subject {record.ident} '
+            f'[{i + 1} / {len(records)}]'
+        )
+        data = [
+            _get_data(*e) for e in record.rest_iterator()
+        ]
+        data = [np.asarray(e) for e in data if e is not None]
+        num_records = len(data)
+        if num_records < (2 * NUM_SPLITS[record.ds]):
+            logging.warning(f'Insufficient data for {record.ident}!')
+            continue
+        block_size = num_records // NUM_SPLITS[record.ds]
+        logging.info(
+            f'Computing {2 * (NUM_SPLITS[record.ds] + 1)} parcellations '
+            f'for subject {record.ident}'
+        )
+        for split in range(NUM_SPLITS[record.ds] + 1):
+            match split:
+                case 0:
+                    data_split = data
+                case _:
+                    data_split = data[
+                        ((split - 1) * block_size):(split * block_size)
+                    ]
+            T = jnp.concatenate(data_split, -1)
+            encoder_result = encode(
+                T=T,
+                coor_L=coor_L,
+                coor_R=coor_R,
+                M=template,
+            )
+            for name, fwd in forward_modes:
+                P, _, _ = fwd(
+                    coor={
+                        'cortex_L': coor_L,
+                        'cortex_R': coor_R,
+                    },
+                    encoder=encoder,
+                    encoder_result=encoder_result,
+                    compartments=('cortex_L', 'cortex_R'),
+                    encoder_type=ENCODER_ARCH,
+                    injection_points=SERIAL_INJECTION_SITES,
+                    inference=True,
+                    key=key, # Should do nothing
+                )
+                P = np.block([
+                    [P['cortex_L'], np.zeros_like(P['cortex_R'])],
+                    [np.zeros_like(P['cortex_L']), P['cortex_R']],
+                ])
+                if (i % 3) == 0:
+                    visualise(
+                        name=f'atlas-{name}{record.ident}split{split}',
+                        array=P.T,
+                    )
+                np.save(
+                    f'{OUTPUT_DIR}/parcellations/{name}{record.ident}split{split}_atlas-{name}_ts.npy',
+                    np.asarray(P),
+                    allow_pickle=False,
+                )
+    assert 0
+
+
+def prepare_timeseries():
+    val_entities = aggregate_entities()
 
     with open(KONG_IDS) as f:
         kong_ids = f.read().split('\n')
@@ -205,34 +342,6 @@ def prepare_timeseries(
         )
     #_test_mode(kong_ids, kong_parcellations)
 
-    T = _get_data(get_msc_dataset('01', '01'), normalise=False, denoising=None)
-    coor_L, coor_R = get_coors()
-    model, encoder, template = init_full_model(
-        T=T,
-        coor_L=coor_L,
-        coor_R=coor_R,
-        num_parcels=num_parcels,
-        encoder_type=ENCODER_ARCH,
-        block_arch=BLOCK_ARCH,
-        injection_points=SERIAL_INJECTION_SITES,
-        spatial_kappa=VMF_SPATIAL_KAPPA,
-        selectivity_kappa=VMF_SELECTIVITY_KAPPA,
-        fixed_kappa=FIXED_KAPPA,
-        dropout=0,
-    )
-    #encode = eqx.filter_jit(encoder)
-    encode = encoder
-    if start_epoch is not None:
-        model = eqx.tree_deserialise_leaves(
-            f'/tmp/parcellation_model_checkpoint{start_epoch}',
-            like=model,
-        )
-        try:
-            with open('/tmp/epoch_history.pkl', 'rb') as f:
-                epoch_history = pickle.load(f)
-        except FileNotFoundError:
-            print('No epoch history found--starting new record')
-
     # EVALUATION
     recon_err = {
         'ds': [], 'subject': [], 'session': [], 'task': [],
@@ -244,7 +353,6 @@ def prepare_timeseries(
 
         try:
             ds = entity.get('ds')
-            # The encoder will handle data normalisation and GSR
             if ds == 'MSC':
                 subject = entity.get('subject')
                 session = entity.get('session')
@@ -711,11 +819,12 @@ def main(
     extract_ts: bool = False,
     num_parcels: int = 200,
 ):
+    create_parcellations(num_parcels=num_parcels)
     #os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     #os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     if extract_ts:
-        prepare_timeseries(num_parcels=num_parcels)
+        prepare_timeseries()
     predict(num_parcels=num_parcels)
 
 
