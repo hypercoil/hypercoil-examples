@@ -143,15 +143,24 @@ class SubjectRecord:
         )
         return image_path, confounds_path
 
-    def entity_iterator(self, entities: Sequence, get_confounds: bool = True):
+    def entity_iterator(
+        self,
+        entities: Sequence,
+        get_confounds: bool = True,
+        identifiers: bool = False,
+    ):
         for task, session, run in entities:
             try:
-                yield self.get_dataset(
+                item = self.get_dataset(
                     session=session,
                     run=run,
                     task=task,
                     get_confounds=get_confounds,
                 )
+                if identifiers:
+                    yield item, (task, session, run)
+                else:
+                    yield item
             except FileNotFoundError:
                 logging.warning(
                     f'Data entity subject={self.ident} session={session} '
@@ -159,7 +168,11 @@ class SubjectRecord:
                 )
                 continue
 
-    def iterator(self, get_confounds: bool = True):
+    def iterator(
+        self,
+        get_confounds: bool = True,
+        identifiers: bool = False,
+    ):
         entities = product(
             tuple(v[0] for v in self.tasks),
             self.sessions if self.sessions is not None else (self.sessions,),
@@ -168,9 +181,14 @@ class SubjectRecord:
         yield from self.entity_iterator(
             entities=entities,
             get_confounds=get_confounds,
+            identifiers=identifiers,
         )
 
-    def rest_iterator(self, get_confounds: bool = True):
+    def rest_iterator(
+        self,
+        get_confounds: bool = True,
+        identifiers: bool = False,
+    ):
         entities = product(
             tuple(v[0] for v in self.tasks if v[0] in self.rest_tasks),
             self.sessions if self.sessions is not None else (self.sessions,),
@@ -179,6 +197,7 @@ class SubjectRecord:
         yield from self.entity_iterator(
             entities=entities,
             get_confounds=get_confounds,
+            identifiers=identifiers,
         )
 
 
