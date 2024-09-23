@@ -489,6 +489,94 @@ def recon_error_plot():
     fig.savefig('/tmp/reconstruction_error.svg')
 
 
+def incorporate_block(blockwise: Tensor, overall: Tuple[Tensor, int]):
+    if len(blockwise):
+        blockwise = (blockwise.sum(0), blockwise.shape[0])
+        denom = (overall[1] + blockwise[1])
+        overall = (overall[0] * overall[1] + blockwise[0] * blockwise[1]) / denom, denom
+    return overall
+
+
+def prepare_replication_material(model: str = 'full'):
+    from hypercoil.loss.functional import js_divergence
+    os.makedirs(f'{OUTPUT_DIR}/replication/', exist_ok=True)
+    os.makedirs(f'{OUTPUT_DIR}/metrics/', exist_ok=True)
+    block_size = 2
+    for ds in DATASETS:
+        ds_parcellations = sorted(tuple(Path(f'{OUTPUT_DIR}/parcellations/').glob(f'ds-{ds}*')))
+        ds_parcellations = [
+            e for e in
+            sorted(tuple(Path(f'{OUTPUT_DIR}/parcellations/').glob(f'ds-{ds}*atlas-{model}*')))
+            if re.match('.*split-[^0].*', str(e))
+        ]
+        num_parcellations = len(ds_parcellations)
+        num_loci = np.load(ds_parcellations[0]).shape[-1]
+        distance_matrix = jnp.zeros((num_parcellations, num_parcellations))
+        coinstance_matrix = jnp.zeros((num_parcellations, num_parcellations)).astype(bool)
+        intra = (jnp.zeros(num_loci,), 0)
+        inter = (jnp.zeros(num_loci,), 0)
+        confidence = (jnp.zeros(num_loci,), 0)
+        nblocks_ax = np.ceil(num_parcellations / block_size).astype(int)
+        nblocks = ((nblocks_ax + 1) * nblocks_ax / 2).astype(int)
+        ax0 = list(ds_parcellations)
+        index0 = 0
+        while ax0:
+            ax1 = list(ax0)
+            if block_size == 1: ax1 = ax1[1:]
+            index1 = index0
+            block0, ax0 = ax0[:block_size], ax0[block_size:]
+            ident0 = [e.parts[-1].split('_')[1] for e in block0[:5]]
+            material0 = jnp.stack([np.load(e).T for e in block0])
+            confidence = incorporate_block(material0.max(-1), confidence)
+            while ax1:
+                logging.info(f'Outer block [{index0 + block_size} / {num_parcellations}]')
+                logging.info(f'Inner block [{index1 + block_size} / {num_parcellations}]')
+                block1, ax1 = ax1[:block_size], ax1[block_size:]
+                ident1 = [e.parts[-1].split('_')[1] for e in block1[:5]]
+                block_coinstance = np.asarray(ident0)[:, None] == np.asarray(ident1)[None, :]
+                coinstance_matrix = coinstance_matrix.at[
+                    index0:(index0 + block_size), index1:(index1 + block_size)
+                ].set(block_coinstance)
+                coinstance_matrix = coinstance_matrix.at[
+                    index1:(index1 + block_size), index0:(index0 + block_size)
+                ].set(block_coinstance.T)
+                if index1 == index0:
+                    material1 = material0
+                else:
+                    material1 = jnp.stack([np.load(e).T for e in block1])
+                div = js_divergence(material0[:, None, ...], material1[None, ...], axis=-1).squeeze(-1)
+                block_distance = jnp.nanmean(jnp.sqrt(div), -1)
+                distance_matrix = distance_matrix.at[
+                    index0:(index0 + block_size), index1:(index1 + block_size)
+                ].set(block_distance)
+                distance_matrix = distance_matrix.at[
+                    index1:(index1 + block_size), index0:(index0 + block_size)
+                ].set(block_distance.T)
+                if index1 == index0:
+                    mask = jnp.zeros_like(block_coinstance).at[
+                        jnp.triu_indices_from(block_coinstance, k=1)
+                    ].set(1).astype(bool)
+                else:
+                    mask = jnp.ones_like(block_coinstance).astype(bool)
+                intra = incorporate_block(div[block_coinstance & mask], intra)
+                inter = incorporate_block(div[~block_coinstance & mask], inter)
+                index1 += block_size
+            index0 += block_size
+        divoverall = (intra[0] * intra[1] + inter[0] * inter[1]) / (intra[0] + inter[1])
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_divtotal.npy', np.asarray(divoverall), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_distance.npy', np.asarray(distance_matrix), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_coinstance.npy', np.asarray(coinstance_matrix), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_divinter.npy', np.asarray(inter[0]), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_divintra.npy', np.asarray(intra[0]), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_confidence.npy', np.asarray(intra[0]), allow_pickle=False)
+        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_divinterdenom', 'w') as f:
+            f.write(str(inter[1]))
+        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_divintradenom', 'w') as f:
+            f.write(str(intra[1]))
+        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_confidencedenom', 'w') as f:
+            f.write(str(confidence[1]))
+
+
 def corr_kernel(X, y=None):
     if y is None: y = X
     val = np.corrcoef(X, y)[:X.shape[-2], X.shape[-2]:]
