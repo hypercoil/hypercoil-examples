@@ -25,6 +25,7 @@ from hypercoil.init import (
 from hypercoil.engine import Tensor
 from hypercoil.nn.atlas import AtlasLinear
 
+from hypercoil_examples.atlas.beta import param_bimodal_beta
 from hypercoil_examples.atlas.const import MSC_DATA_ROOT
 from hypercoil_examples.atlas.cross2subj import visualise
 from hypercoil_examples.atlas.data import _get_data, get_msc_dataset
@@ -107,15 +108,6 @@ def doublet_energy(
     coassignment = jnp.einsum('...snd,...sd->...sn', Q[..., D, :], Q)
     result = -doublet.log_prob(coassignment)
     return jnp.where(D >= 0, result, 0)
-
-
-def param_bimodal_beta(n_classes: int):
-    """Bimodal beta distribution with a minimum at the maximum entropy"""
-    from hypercoil_examples.atlas.beta import BetaCompat
-    alpha = jnp.log(n_classes) / (
-        jnp.log(n_classes) - jnp.log(1 - 1 / n_classes)
-    ).item()
-    return BetaCompat(alpha, 1 - alpha)
 
 
 def compute_dccc(

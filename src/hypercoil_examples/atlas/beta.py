@@ -9,6 +9,8 @@ numpyro is flaky and erratic when used with equinox (de)serialisation.
 """
 from typing import Sequence
 import equinox as eqx
+import jax
+import jax.numpy as jnp
 from numpyro.distributions import Beta
 from hypercoil.engine import Tensor
 from hypercoil.init import VonMisesFisher
@@ -57,3 +59,10 @@ class VMFCompat(eqx.Module):
             parameterise=self.parameterise,
         ).log_prob(value=value)
 
+
+def param_bimodal_beta(n_classes: int):
+    """Bimodal beta distribution with a minimum at the maximum entropy"""
+    alpha = jnp.log(n_classes) / (
+        jnp.log(n_classes) - jnp.log(1 - 1 / n_classes)
+    ).item()
+    return BetaCompat(alpha, 1 - alpha)
