@@ -164,12 +164,17 @@ def get_coors():
 
 def main():
     import templateflow.api as tflow
+    import pyvista as pv
+    import lytemaps as nmaps
     from hyve import (
+        Cell,
+        ColGroupSpec,
         plotdef,
         surf_from_archive,
         surf_scalars_from_array,
         plot_to_image,
-        save_grid,
+        # save_grid,
+        save_figure,
     )
     coor_L_path = tflow.get(
         'fsLR', density='32k', hemi='L', space=None, suffix='sphere'
@@ -195,22 +200,69 @@ def main():
     ge_R = ge(coor_R, geom='cortex_R')
     ge_all = jnp.concatenate((ge_L, ge_R), axis=0)
 
+    layout = Cell() / Cell() << (1 / 2)
+    layout = layout | Cell() | layout << (1 / 3)
+    layout = Cell() | layout << (1 / 36)
+    annotations = {
+        0: dict(elements=['subtitle']),
+        1: dict(
+            hemisphere='left',
+            view='lateral',
+        ),
+        2: dict(
+            hemisphere='left',
+            view='medial',
+        ),
+        3: dict(view='dorsal'),
+        4: dict(
+            hemisphere='right',
+            view='lateral',
+        ),
+        5: dict(
+            hemisphere='right',
+            view='medial',
+        ),
+    }
+    layout = layout.annotate(annotations)
     plot_f = plotdef(
         surf_from_archive(),
         #surf_scalars_from_array('projection', is_masked=False),
         surf_scalars_from_array('projection', is_masked=True),
         plot_to_image(),
-        save_grid(
-            n_cols=8,
-            n_rows=pe_L.shape[-1],
-            padding=10,
-            canvas_size=(3200, 300 * pe_L.shape[-1]),
+        save_figure(
+            canvas_size=(1200, 450 * pe_L.shape[-1]),
+            layout_kernel=layout,
+            group_spec = [
+                ColGroupSpec(
+                    variable='surfscalars',
+                ),
+            ],
             canvas_color=(0, 0, 0),
             fname_spec='scalars-encoding',
             sort_by=['surfscalars'],
             scalar_bar_action='collect',
         ),
+        # save_grid(
+        #     n_cols=8,
+        #     n_rows=pe_L.shape[-1],
+        #     padding=10,
+        #     canvas_size=(3200, 300 * pe_L.shape[-1]),
+        #     canvas_color=(0, 0, 0),
+        #     fname_spec='scalars-encoding',
+        #     sort_by=['surfscalars'],
+        #     scalar_bar_action='collect',
+        # ),
     )
+    # TODO: Add as overlays once we have a good mapping system for hyve's
+    #       core plotter. Right now the mapper is dumb and doesn't know how to
+    #       map just one overlay arg over calls while holding all others.
+    # mwl = nb.load(str(
+    #     tflow.get('fsLR', density='32k', hemi='L', desc='nomedialwall')
+    # )).darrays[0].data
+    # mwr = nb.load(str(
+    #     tflow.get('fsLR', density='32k', hemi='R', desc='nomedialwall')
+    # )).darrays[0].data
+    # curv = nmaps.datasets.fetch_fslr()['sulc']
     for k, v in {'pe': (pe_L, pe_R), 'ge': (ge_L, ge_R)}.items():
         plot_f(
             template='fsLR',
@@ -222,11 +274,17 @@ def main():
             surf_scalars_cmap='RdYlBu_r',
             surf_projection=('veryinflated',),
             hemisphere=['left', 'right', None],
+            # views={
+            #     'left': ('medial', 'lateral'),
+            #     'right': ('medial', 'lateral'),
+            #     'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
+            # },
             views={
                 'left': ('medial', 'lateral'),
                 'right': ('medial', 'lateral'),
-                'both': ('dorsal', 'ventral', 'anterior', 'posterior'),
+                'both': ('dorsal',),
             },
+            theme=pv.themes.DarkTheme(),
             output_dir='/tmp',
             fname_spec=f'scalars-{k}',
             window_size=(800, 600),
