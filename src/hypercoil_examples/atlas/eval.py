@@ -80,7 +80,7 @@ VAL_SIZE = {'HCP': 800, } #'MSC': 160}
 MSC_SESSIONS = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
 MSC_SUBJECTS_TRAIN = ('01', '02', '03', '08')
 MSC_SUBJECTS_VAL = ('01', '02', '03', '04', '05', '06', '07', '08', '09', '10',)
-DATASETS = ('MSC',) # ('HCP',) #
+DATASETS = ('MSC', 'HCP',) # ('MSC',) # ('HCP',) #
 NUM_SPLITS = {'HCP': 2, 'MSC': 5}
 
 DATA_SHUFFLE_KEY = 7834
@@ -311,7 +311,7 @@ def create_parcellations(
                         array=P.T,
                     )
                 np.save(
-                    f'{OUTPUT_DIR}/parcellations/{name}{record.ident}split{split}_atlas-{name}_ts.npy',
+                    f'{OUTPUT_DIR}/parcellations/ds-{record.ds}_subject-{record.ident}_split-{split}_atlas-{name}_probseg.npy',
                     np.asarray(P),
                     allow_pickle=False,
                 )
@@ -319,7 +319,10 @@ def create_parcellations(
 
 
 def prepare_timeseries():
-    val_entities = aggregate_entities()
+    os.makedirs(f'{OUTPUT_DIR}/ts/', exist_ok=True)
+    os.makedirs(f'{OUTPUT_DIR}/metrics/', exist_ok=True)
+    key = jax.random.PRNGKey(SEED)
+    records = aggregate_entities()
 
     with open(KONG_IDS) as f:
         kong_ids = f.read().split('\n')
@@ -341,44 +344,48 @@ def prepare_timeseries():
             array=atlas[baseline].T,
         )
     #_test_mode(kong_ids, kong_parcellations)
+    for template in ('groupTemplate', 'groupTemplateInitOnly'):
+        atlas[template] = np.load(
+            f'{OUTPUT_DIR}/parcellations/{template}.npy'
+        ).T
 
     # EVALUATION
+    model_keys = {}
+    for model_type in ('full', 'parametric'):
+        model_keys[model_type] = [model_type] + [
+            f'{model_type}_split-{i + 1}'
+            for i in range(max(NUM_SPLITS.values()))
+        ]
     recon_err = {
-        'ds': [], 'subject': [], 'session': [], 'task': [],
-        'full': [], 'parametric': [], **{b: [] for b in BASELINES},
+        'ds': [], 'subject': [], 'session': [], 'task': [], 'run': [],
+        **{b: [] for b in BASELINES},
+        **{a: [] for a in atlas.keys()},
+        **{f: [] for f in model_keys['full']},
+        **{p: [] for p in model_keys['parametric']},
     }
-    for i in range(len(val_entities)):
-        entity = val_entities[i]
-        key_e = jax.random.fold_in(key, i)
-
-        try:
-            ds = entity.get('ds')
-            if ds == 'MSC':
-                subject = entity.get('subject')
-                session = entity.get('session')
-                task = entity.get('task')
+    for i, record in enumerate(records):
+        subject = record.ident
+        for e, (task, session, run) in record.iterator(identifiers=True):
+            logging.info(
+                f'Computing time series and explained variance for subject='
+                f'{record.ident} session={session} run={run} task={task}'
+            )
+            try:
                 T = _get_data(
-                    *get_msc_dataset(subject, session, task, get_confounds=True,),
-                    normalise=False,
-                    denoising=None,
-                    pad_to_size=None,
-                    key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
+                    *e,
+                    key=jax.random.fold_in(key, DATA_SAMPLER_KEY),
                 )
-                atlas['kong400'] = None
-            elif ds == 'HCP':
-                subject = entity.get('subject')
-                session = entity.get('run')
-                task = entity.get('task')
-                T = _get_data(
-                    *get_hcp_dataset(subject, session, task, get_confounds=True,),
-                    normalise=False,
-                    denoising=None,
-                    pad_to_size=None,
-                    key=jax.random.fold_in(key_e, DATA_SAMPLER_KEY),
+            except Exception:
+                T = None
+            if T is None:
+                logging.warning(
+                    f'Data entity subject={subject} session={session} '
+                    f'run={run} task={task} is absent. Skipping'
                 )
-                # If it's HCP, evaluate the Kong parcellation
+                continue
+            if record.ds == 'HCP':
                 try:
-                    kong_idx = kong_ids.index(entity['subject'])
+                    kong_idx = kong_ids.index(subject)
                     kong_asgt = np.concatenate((
                         kong_parcellations['lh_labels_all'][LH_MASK, kong_idx],
                         kong_parcellations['rh_labels_all'][RH_MASK, kong_idx],
@@ -390,117 +397,56 @@ def prepare_timeseries():
                     ).squeeze().T[1:]
                 except ValueError:
                     atlas['kong400'] = None
-        except FileNotFoundError:
-            print(
-                f'Data entity {entity} is absent. '
-                'Skipping'
-            )
-            continue
-        print(f'Evaluation {i} (ds-{ds} sub-{subject} ses-{session} task-{task})')
-        if jnp.any(jnp.isnan(T)):
-            print(
-                f'Invalid data for entity sub-{subject} ses-{session}. '
-                'Skipping'
-            )
-            breakpoint()
-            continue
-        T_in = jnp.where(
-            jnp.isclose(T.std(-1), 0)[..., None],
-            jax.random.normal(jax.random.fold_in(key_e, 54), T.shape),
-            T,
-        )
+            else:
+                atlas['kong400'] = None
 
-        encoder_result = encode(
-            T=T_in,
-            coor_L=coor_L,
-            coor_R=coor_R,
-            M=template,
-        )
-        ts = {}
-
-        for name, fwd in [('parametric', model.parametric_path), ('full', model)]:
-            P, _, _ = eqx.filter_jit(fwd)(
-                coor={
-                    'cortex_L': coor_L,
-                    'cortex_R': coor_R,
-                },
-                encoder=encoder,
-                encoder_result=encoder_result,
-                compartments=('cortex_L', 'cortex_R'),
-                encoder_type=ENCODER_ARCH,
-                injection_points=SERIAL_INJECTION_SITES,
-                inference=True,
-                key=key,
-            )
-            (_, (_, _, _, _, T_in)) = encoder_result
-            csize = {
-                compartment: encoder.temporal.encoders[0].limits[compartment]
-                for compartment in ('cortex_L', 'cortex_R')
-            }
-            compartment_T = {
-                compartment: T_in[..., start:(start + size), :]
-                for compartment, (start, size) in csize.items()
-            }
-            compartment_ts = {
-                compartment: jnp.linalg.lstsq(
-                    P[compartment].T, TT
-                )[0]
-                for compartment, TT in compartment_T.items()
-            }
-            ts[name] = jnp.concatenate(list(compartment_ts.values()), 0)
-            recon_err[name] += [
-                (1 - sum({
-                    compartment: (
-                        ((P[compartment].T @ ts - compartment_T[compartment]) ** 2).sum() /
-                        (T_in **2).sum()
+            for model_type in ('parametric', 'full'):
+                for i in range(max(NUM_SPLITS.values()) + 1):
+                    match i:
+                        case 0:
+                            model_key = model_type
+                        case _:
+                            model_key = f'{model_type}_split-{i}'
+                    model_path = Path(
+                        f'{OUTPUT_DIR}/parcellations/subject-{record.ident}_'
+                        f'split-{i}_atlas-{model_type}_probseg.npy'
                     )
-                    for compartment, ts in compartment_ts.items()
-                }.values())).item()
-            ]
+                    if model_path.exists():
+                        atlas[model_key] = np.load(model_path)
+                    else:
+                        atlas[model_key] = None
+            ts = {
+                name: jnp.linalg.lstsq(parc.T, T)[0]
+                for name, parc in atlas.items()
+                if parc is not None
+            }
+            recon_err_instance = {
+                name: (
+                    1 - ((parc.T @ ts[name] - T) ** 2).sum() /
+                    (T ** 2).sum()
+                ).item()
+                if parc is not None
+                else np.nan
+                for name, parc in atlas.items()
+            }
+            recon_err['ds'] += [record.ds]
+            recon_err['subject'] += [subject]
+            recon_err['session'] += [session]
+            recon_err['run'] += [run]
+            recon_err['task'] += [task]
+            for k, v in recon_err_instance.items():
+                recon_err[k] += [v]
+            for name, data in ts.items():
+                np.save(
+                    f'{OUTPUT_DIR}/ts/ds-{record.ds}_sub-{subject}_'
+                    f'ses-{session}_task-{task}_atlas-{name}_ts.npy',
+                    np.asarray(data),
+                    allow_pickle=False,
+                )
 
-        T_in = T - T.mean(-1, keepdims=True)
-        T_in = T_in / T_in.std(-1, keepdims=True)
-        T_in = jnp.where(jnp.isnan(T_in), 0, T_in)
-        gs = T_in.mean(0, keepdims=True)
-        T_in = residualise(T_in, gs)
-        T_in = jnp.where(
-            jnp.isclose(T_in.std(-1), 0)[..., None],
-            jax.random.normal(jax.random.fold_in(key_e, 54), T_in.shape),
-            T_in,
-        )
-
-        ts = {
-            **ts,
-            **{
-                baseline: jnp.linalg.lstsq(atlas[baseline].T, T_in)[0]
-                for baseline in atlas
-                if atlas[baseline] is not None
-            },
-        }
-        recon_err_baseline = {
-            baseline: (
-                1 - ((atlas[baseline].T @ ts[baseline] - T_in) ** 2).sum() /
-                (T_in ** 2).sum()
-            )
-            if atlas[baseline] is not None
-            else jnp.asarray(jnp.inf)
-            for baseline in atlas
-        }
-        recon_err['ds'] += [ds]
-        recon_err['subject'] += [subject]
-        recon_err['session'] += [session]
-        recon_err['task'] += [task]
-        for k, v in recon_err_baseline.items():
-            recon_err[k] += [v.item()]
-        for name, data in ts.items():
-            np.save(
-                f'{OUTPUT_DIR}/ds-{ds}_sub-{subject}_ses-{session}_task-{task}_atlas-{name}_ts.npy',
-                np.asarray(data),
-                allow_pickle=False,
-            )
-        if i % 10 == 0:
-            pd.DataFrame(recon_err).to_csv(f'{OUTPUT_DIR}/recon_error.tsv', sep='\t')
-    pd.DataFrame(recon_err).to_csv(f'{OUTPUT_DIR}/recon_error.tsv', sep='\t')
+        pd.DataFrame(recon_err).to_csv(f'{OUTPUT_DIR}/metrics/recon_error.tsv', sep='\t', index=False)
+    pd.DataFrame(recon_err).to_csv(f'{OUTPUT_DIR}/metrics/recon_error.tsv', sep='\t', index=False)
+    assert 0
 
 
 def corr_kernel(X, y=None):
@@ -819,12 +765,12 @@ def main(
     extract_ts: bool = False,
     num_parcels: int = 200,
 ):
-    create_parcellations(num_parcels=num_parcels)
-    #os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-    #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    #os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
-    if extract_ts:
-        prepare_timeseries()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] - %(message)s',
+    )
+    #create_parcellations(num_parcels=num_parcels)
+    #prepare_timeseries()
     predict(num_parcels=num_parcels)
 
 
