@@ -449,6 +449,46 @@ def prepare_timeseries():
     assert 0
 
 
+def recon_error_plot():
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    recon_df = pd.read_csv(f'{OUTPUT_DIR}/metrics/recon_error.tsv', sep='\t')
+    atlases = tuple(BASELINES.keys()) + ('full', 'parametric')
+    datasets = recon_df.ds.unique()
+    fig, ax = plt.subplots(len(datasets), 2, figsize=(12, 6 * len(datasets)), layout='tight')
+    for i, dataset in enumerate(datasets):
+        recon_ds_df = recon_df[recon_df.ds == dataset]
+        recon_ds_df = recon_ds_df.set_index(['ds', 'subject', 'task', 'session', 'run'])
+        avail_atlases = [
+            k
+            for k, v in
+            recon_ds_df[list(atlases)].isna().all().to_dict().items()
+            if not v
+        ]
+        missing = recon_ds_df[avail_atlases].isna().any(axis=1)
+        recon_ds_df = recon_ds_df[~missing]
+        recon_ds_df['full_min'] = recon_ds_df[
+            [e for e in recon_ds_df.columns if 'full' in e]
+        ].min(1, skipna=True)
+        recon_ds_df['parametric_min'] = recon_ds_df[
+            [e for e in recon_ds_df.columns if 'parametric' in e]
+        ].min(1, skipna=True)
+        to_plot = recon_ds_df[avail_atlases]
+        sns.violinplot(to_plot, palette='rocket', ax=ax[i][0])
+        ax[i][0].set_xlabel('Atlas')
+        ax[i][0].set_ylabel('variance explained')
+        ax[i][0].set_title(f'Reconstruction: {dataset}')
+        to_plot = recon_ds_df.sort_values('full').reset_index()[avail_atlases + ['full_min', 'parametric_min']]
+        to_plot_l = to_plot.select_dtypes('number').reset_index().melt(id_vars='index')
+        is_min = [e[-3:] == 'min' for e in to_plot_l['variable']]
+        to_plot_l['variable'] = [e[:-4] if e[-4:] == '_min' else e for e in to_plot_l['variable']]
+        to_plot_l['kind'] = ['min' if e else '' for e in is_min]
+        to_plot_l = to_plot_l.rename(columns={'index': 'arg sort full', 'value': 'variance explained', 'variable': 'atlas'})
+        sns.lineplot(to_plot_l, x='arg sort full', y='variance explained', hue='atlas', style='kind', palette='rocket', linewidth=0.75, ax=ax[i][1])
+        ax[i][1].set_title(f'Instance reconstruction: {dataset}')
+    fig.savefig('/tmp/reconstruction_error.svg')
+
+
 def corr_kernel(X, y=None):
     if y is None: y = X
     val = np.corrcoef(X, y)[:X.shape[-2], X.shape[-2]:]
@@ -771,6 +811,7 @@ def main(
     )
     #create_parcellations(num_parcels=num_parcels)
     #prepare_timeseries()
+    #recon_error_plot()
     predict(num_parcels=num_parcels)
 
 
