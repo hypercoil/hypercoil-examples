@@ -563,18 +563,217 @@ def prepare_replication_material(model: str = 'full'):
                 index1 += block_size
             index0 += block_size
         divoverall = (intra[0] * intra[1] + inter[0] * inter[1]) / (intra[0] + inter[1])
-        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_divtotal.npy', np.asarray(divoverall), allow_pickle=False)
-        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_distance.npy', np.asarray(distance_matrix), allow_pickle=False)
-        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_coinstance.npy', np.asarray(coinstance_matrix), allow_pickle=False)
-        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_divinter.npy', np.asarray(inter[0]), allow_pickle=False)
-        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_divintra.npy', np.asarray(intra[0]), allow_pickle=False)
-        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_confidence.npy', np.asarray(intra[0]), allow_pickle=False)
-        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_divinterdenom', 'w') as f:
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_distance.npy', np.asarray(distance_matrix), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_coinstance.npy', np.asarray(coinstance_matrix), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divinter.npy', np.asarray(inter[0]), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divintra.npy', np.asarray(intra[0]), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divtotal.npy', np.asarray(divoverall), allow_pickle=False)
+        np.save(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_confidence.npy', np.asarray(confidence[0]), allow_pickle=False)
+        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divinterdenom', 'w') as f:
             f.write(str(inter[1]))
-        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_divintradenom', 'w') as f:
+        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divintradenom', 'w') as f:
             f.write(str(intra[1]))
-        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_confidencedenom', 'w') as f:
+        with open(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_confidencedenom', 'w') as f:
             f.write(str(confidence[1]))
+
+
+def discr(
+    distance: jnp.ndarray,
+    ident: np.ndarray,
+) -> jnp.ndarray:
+    key = ident[distance.argsort(-1)]
+    replicate = (key[..., 0][..., None] == key[..., 1:])
+    num_replicates = replicate.sum(-1, keepdims=True)
+    cumrepl = replicate.cumsum(-1)
+    violations = ((num_replicates - cumrepl) * ~replicate).sum(-1)
+    num_replicates = num_replicates.squeeze()
+    return 1 - violations / (
+        (violations.size - 1 - num_replicates) * num_replicates
+    )
+
+
+def replication_analysis(permutation_key: int = 73, null_samples: int = 100):
+    import matplotlib.pyplot as plt
+    import pyvista as pv
+    import seaborn as sns
+    from hyve import (
+        Cell,
+        plotdef,
+        add_surface_overlay,
+        draw_surface_boundary,
+        plot_to_image,
+        save_figure,
+        surf_from_archive,
+        surf_scalars_from_array,
+        vertex_to_face,
+    )
+    from hypercoil_examples.atlas.energy import medial_wall_arrays, curv_arrays
+    layout = Cell() / Cell() << (1 / 2)
+    layout = layout | Cell() | layout << (1 / 3)
+    layout = layout | Cell() << (4 / 5)
+    medialwall_L, medialwall_R = medial_wall_arrays()
+    curv_L, curv_R = curv_arrays()
+    parcellation = np.load(f'{OUTPUT_DIR}/parcellations/groupTemplate.npy').argmax(-1)
+    annotations = {
+        0: dict(
+            hemisphere='left',
+            view='lateral',
+        ),
+        1: dict(
+            hemisphere='left',
+            view='medial',
+        ),
+        2: dict(view='dorsal'),
+        3: dict(
+            hemisphere='right',
+            view='lateral',
+        ),
+        4: dict(
+            hemisphere='right',
+            view='medial',
+        ),
+        5: dict(
+            elements=['scalar_bar'],
+        ),
+    }
+    layout = layout.annotate(annotations)
+    plot_f = plotdef(
+        surf_from_archive(),
+        surf_scalars_from_array(
+            'parcellation',
+            plot=False,
+            allow_multihemisphere=False,
+        ),
+        add_surface_overlay(
+            'medialwall',
+            surf_scalars_from_array('medialwall', is_masked=False),
+            vertex_to_face('medialwall', interpolation='mode'),
+        ),
+        add_surface_overlay(
+            'dataset',
+            surf_scalars_from_array(
+                'dataset',
+                is_masked=True,
+            ),
+            vertex_to_face('dataset', interpolation='mean'),
+        ),
+        add_surface_overlay(
+            'curv',
+            surf_scalars_from_array('curv', is_masked=False),
+            vertex_to_face('curv', interpolation='mean'),
+        ),
+        add_surface_overlay(
+            'parcellation_boundary',
+            draw_surface_boundary(
+                'parcellation',
+                'parcellation_boundary',
+                #target_domain='vertex',
+                target_domain='face',
+                num_steps=0,
+                v2f_interpolation='mode',
+            ),
+        ),
+        plot_to_image(),
+        save_figure(
+            layout_kernel=layout,
+            padding=0,
+            canvas_size=(1500, 500),
+            canvas_color=(0, 0, 0),
+            fname_spec='scalars-{surfscalars}',
+            scalar_bar_action='collect',
+        ),
+    )
+
+    for ds in DATASETS:
+        for model in ('parametric', 'full'):
+            distance = np.load(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_distance.npy')
+            coinstance = np.load(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_coinstance.npy')
+            div_intra = np.load(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divintra.npy')
+            div_inter = np.load(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divinter.npy')
+            div_total = np.load(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_divtotal.npy')
+            confidence = np.load(f'{OUTPUT_DIR}/replication/ds-{ds}_atlas-{model}_confidence.npy')
+            levels, ident = jnp.unique(coinstance, axis=0, return_inverse=True)
+            fig, ax = plt.subplots(figsize=(8, 8), layout='tight')
+            ax.imshow(distance, cmap='rocket_r', vmin=0.15, vmax=0.3)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            num_instances = distance.shape[0]
+            for i, (l0, l1) in enumerate(zip(ident[1:], ident[:-1])):
+                if l0 == l1:
+                    ax.axvline(num_instances - i - 1.5, color='white', linewidth=.5)
+                    ax.axhline(i + 0.5, color='white', linewidth=.5)
+                else:
+                    ax.axvline(num_instances - i - 1.5, color='white', linewidth=1.5)
+                    ax.axhline(i + 0.5, color='white', linewidth=1.5)
+            fig.savefig(f'/tmp/measure-distance_ds-{ds}_atlas-{model}.svg')
+            per_instance_discr = discr(distance, ident)
+            jnp.where(levels, per_instance_discr[None, :], jnp.nan)
+            null_key = jax.random.PRNGKey(permutation_key)
+            discr_null = [None for _ in range(null_samples)]
+            for i in range(null_samples):
+                ident_null = jax.random.permutation(jax.random.fold_in(null_key, i), ident)
+                discr_null[i] = discr(distance, ident_null)
+            discr_null = jnp.stack(discr_null)
+            order = jnp.argsort(per_instance_discr)
+            discr_null = discr_null[..., order]
+            discr_ordered = per_instance_discr[order]
+            plt.figure(figsize=(10, 8), layout='tight')
+            sns.swarmplot(pd.DataFrame({i: discr_null[..., i] for i in range(num_instances)}), size=2, color='grey')
+            sns.despine()
+            plt.scatter(range(num_instances), discr_ordered, color='purple', s=25)
+            plt.xticks([])
+            plt.xlabel('Data instance (arg sort)')
+            plt.ylabel('Discriminability')
+            plt.savefig(f'/tmp/measure-discr_ds-{ds}_atlas-{model}.svg')
+            div_resid = div_inter - div_inter @ div_intra / jnp.linalg.norm(div_intra) ** 2 * div_intra
+            for name, short, scalars in (
+                ('JS divergence (within)', 'divintra', div_intra),
+                ('JS divergence (between)', 'divinter', div_inter),
+                ('JS divergence', 'divtotal', div_total),
+                ('Delta divergence', 'divdelta', div_inter - div_intra),
+                ('Divergence residuals', 'divresid', div_resid),
+                ('confidence', 'confidence', confidence),
+            ):
+                if short == 'divresid':
+                    cmap_negative = 'bone'
+                else:
+                    cmap_negative = None
+                plot_f(
+                    template='fsLR',
+                    surf_projection='veryinflated',
+                    window_size=(600, 500),
+                    hemisphere=['left', 'right', 'both'],
+                    views={
+                        'left': ('medial', 'lateral'),
+                        'right': ('medial', 'lateral'),
+                        'both': ('dorsal',),
+                    },
+                    theme=pv.themes.DarkTheme(),
+                    output_dir='/tmp',
+                    fname_spec=f'measure-{short}_ds-{ds}_atlas-{model}',
+                    load_mask=True,
+                    dataset_array=scalars,
+                    dataset_cmap='rocket',
+                    dataset_cmap_negative=cmap_negative,
+                    dataset_scalar_bar_style={
+                        'name': name,
+                        'orientation': 'v',
+                    },
+                    curv_array_left=curv_L,
+                    curv_array_right=curv_R,
+                    curv_cmap='gray',
+                    curv_clim=(-5e-1, 5e-1),
+                    curv_alpha=0.3,
+                    parcellation_array=parcellation,
+                    parcellation_boundary_color='black',
+                    parcellation_boundary_alpha=0.6,
+                    medialwall_array_left=medialwall_L,
+                    medialwall_array_right=medialwall_R,
+                    medialwall_cmap='binary',
+                    medialwall_clim=(0.99, 1),
+                    medialwall_below_color=(0, 0, 0, 0),
+                )
+    assert 0
 
 
 def corr_kernel(X, y=None):
@@ -900,6 +1099,9 @@ def main(
     #create_parcellations(num_parcels=num_parcels)
     #prepare_timeseries()
     #recon_error_plot()
+    #prepare_replication_material('full')
+    #prepare_replication_material('parametric');
+    replication_analysis()
     predict(num_parcels=num_parcels)
 
 
