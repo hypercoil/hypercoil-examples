@@ -12,7 +12,7 @@ import re
 import pickle
 from itertools import product
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Literal, Mapping, Optional, Sequence, Tuple
 
 import equinox as eqx
 import nibabel as nb
@@ -108,6 +108,12 @@ LH_MASK = nb.load(
 RH_MASK = nb.load(
     tflow.get('fsLR', density='32k', hemi='R', desc='nomedialwall')
 ).darrays[0].data.astype(bool)
+LH_COOR = nb.load(
+    tflow.get('fsLR', density='32k', hemi='L', space=None, suffix='sphere')
+).darrays[0].data[LH_MASK]
+RH_COOR = nb.load(
+    tflow.get('fsLR', density='32k', hemi='R', space=None, suffix='sphere')
+).darrays[0].data[RH_MASK]
 
 
 def _test_mode(
@@ -205,6 +211,37 @@ def aggregate_time_series(ds: str, name: str, split: int = 0):
                 f'atlas-{name}_ts.npy'
             ),
             tasks=tuple((k, v) for k, v in tasks.items()),
+            rest_tasks=rest_tasks,
+            sessions=sessions,
+        )
+        for e in subjects
+    ]
+    return records
+
+
+def aggregate_parcellations(ds: str, name: str, split: int = 0):
+    tasks = dict(TASKS[ds])
+    if ds == 'MSC':
+        raise ValueError('Parcellation-based prediction is only compatible with HCP')
+    elif ds == 'HCP':
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_val.txt', 'r') as f:
+            subjects = f.read().splitlines()
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_template.txt', 'r') as f:
+            subjects += f.read().splitlines()
+        sessions = None
+        runs = None
+        tasks = ((None, None),)
+        rest_tasks = ()
+    records = [
+        SubjectRecord(
+            ds=ds,
+            ident=e,
+            image_pattern=(
+                f'{OUTPUT_DIR}/parcellations/ds-{ds}_' +
+                'subject-{subject}_' +
+                f'split-{split}_atlas-{name}_probseg.npy'
+            ),
+            tasks=tasks,
             rest_tasks=rest_tasks,
             sessions=sessions,
         )
@@ -862,6 +899,7 @@ def grid_search(grid_params: Mapping | Sequence[Mapping]):
 
 
 def predict(
+    predict_on: Literal['connectomes', 'parcellations'],
     num_parcels: int = 200, # not needed, for now
 ):
     import pathlib
@@ -877,7 +915,7 @@ def predict(
     FOLDS_OUTER = 4 # 20 #
     FOLDS_INNER = 4 # 20 #
     # CBIG likes this one, but it feels like cheating if I'm being honest
-    METRIC = 'corr' # 'predictive_COD' #
+    METRIC = 'corr' # 'predictiveCOD' #
     models = list(BASELINES.keys()) + ['parametric', 'full', 'groupTemplate', 'groupTemplateInitOnly']
     ds_ = []
     model_ = []
@@ -885,43 +923,65 @@ def predict(
     score_ = []
     scores = {}
     results = {}
+    match predict_on:
+        case 'connectomes':
+            aggregate = aggregate_time_series
+        case 'parcellations':
+            aggregate = aggregate_parcellations
+            sphere_coor = np.concatenate((LH_COOR, RH_COOR))
+        case _:
+            raise ValueError(f'Invalid feature set: {predict_on}')
     for ds, tasks in TASKS.items():
         objectives = ('task',)
         if ds == 'HCP':
             extra_measures = pd.read_csv(HCP_EXTRA_SUBJECT_MEASURES, sep='\t')
             objectives = ('task', 'beh')
+        if predict_on == 'parcellations':
+            objectives = tuple(obj for obj in objectives if obj != 'task')
         scores[ds] = {}
         results[ds] = {}
         for objective, name in product(objectives, models):
             scores[ds][name] = {}
             results[ds][name] = {}
-            if objective == 'task':
+            if objective == 'task' and ds == 'MSC':
                 split = 0
             else:
                 split = 1
             records = sorted(
-                aggregate_time_series(ds, name, split=split),
+                aggregate(ds, name, split=split),
                 key=lambda x: x.ident,
             )
-            connectomes = []
+            features = []
             targets = []
             subject_ids = []
             i = 0
             for record in records:
                 subject = record.ident
-                if objective == 'task':
+                if objective == 'task' or predict_on == 'parcellations':
                     iterator = record.iterator
                 else:
                     iterator = record.rest_iterator
-                for ts, (task, session, run) in iterator(
+                for features_path, (task, session, run) in iterator(
                     identifiers=True,
                     get_confounds=False,
                 ):
-                    data = np.load(ts)
-                    task = dict(TASKS[ds])[task]
+                    data = np.load(features_path)
                     subject_ids += [subject]
-                    connectomes += [sym2vec(np.corrcoef(data))]
+                    if predict_on == 'connectomes':
+                        features += [sym2vec(np.corrcoef(data))]
+                    elif predict_on == 'parcellations':
+                        parcel_sizes = data.sum(-1)
+                        parcel_coor = data @ sphere_coor
+                        parcel_coor = (
+                            parcel_coor / np.linalg.norm(parcel_coor, axis=-1, keepdims=True)
+                        )
+                        features += [
+                            np.concatenate(
+                                (parcel_sizes, parcel_coor.ravel())
+                            )
+                        ]
                     if objective == 'task':
+                        task = dict(TASKS[ds])[task]
                         targets += [
                             jnp.zeros(len(TASKS_TARGETS[ds])).at[
                                 TASKS_TARGETS[ds].index(task)
@@ -933,9 +993,9 @@ def predict(
                                 extra_measures['Subject'] == int(subject)
                             ].values[0][1:]
                         ]
-            if len(connectomes) == 0:
+            if len(features) == 0:
                 continue
-            connectomes = np.asarray(connectomes)
+            features = np.asarray(features)
             targets = np.asarray(targets)
             ids_ref = np.asarray(subject_ids)
             subject_ids = (
@@ -965,19 +1025,19 @@ def predict(
             #       Add it to the list of reasons I dislike turn-key,
             #       hack-unfriendly software. Stage and remove this after
             #       we manually build the CV loop in a non-terrible IDE
-            linear_kernels = [linear_kernel(connectomes)]
+            linear_kernels = [linear_kernel(features)]
             rbf_kernels = [
-                rbf_kernel(connectomes, gamma=gamma)
+                rbf_kernel(features, gamma=gamma)
                 for gamma in (
                     .001,
                     .0001,
-                    1 / (connectomes.shape[-1] * connectomes.var()),
+                    1 / (features.shape[-1] * features.var()),
                 )
             ]
             # corr and cosine *should* be the same since we're centering our
             # data, and in practice they *are* very very close, but whatever
-            corr_kernels = [corr_kernel(connectomes)]
-            cosine_kernels = [cosine_similarity(connectomes)]
+            corr_kernels = [corr_kernel(features)]
+            cosine_kernels = [cosine_similarity(features)]
             kernel_spec = linear_kernels + rbf_kernels + corr_kernels + cosine_kernels
             for i, (target, target_name, var_kind) in enumerate(targets):
                 nested_scores = np.zeros(NUM_TRIALS)
@@ -1013,13 +1073,14 @@ def predict(
                     },
                 ]
                 valid_index = np.where(~np.isnan(target))[0]
-                valid_connectomes = connectomes[valid_index]
+                valid_features = features[valid_index]
                 valid_target = target[valid_index]
                 valid_group_id = subject_ids[valid_index]
                 for j in range(NUM_TRIALS):
                     logging.info(
                         f'Running trial {j + 1} / {NUM_TRIALS} for '
-                        f'parcellation {name}, measure {target_name}'
+                        f'parcellation {name}, measure {target_name}, '
+                        f'{len(features)} instances'
                     )
                     inner_cv = cv_base(
                         n_splits=FOLDS_INNER,
@@ -1034,14 +1095,14 @@ def predict(
                     non_nested_scores = np.zeros(FOLDS_OUTER)
                     for k, (train_index_o, test_index_o) in enumerate(
                         outer_cv.split(
-                            X=valid_connectomes,
+                            X=valid_features,
                             y=valid_target,
                             groups=valid_group_id,
                         )
                     ):
                         for l, (train_index_i, test_index_i) in enumerate(
                             inner_cv.split(
-                                X=valid_connectomes[train_index_o],
+                                X=valid_features[train_index_o],
                                 y=valid_target[train_index_o],
                                 groups=valid_group_id[train_index_o],
                             )
@@ -1077,7 +1138,7 @@ def predict(
                                             ((y_pred - y_test) ** 2).sum() /
                                             ((y_test.mean() - y_test) **2).sum()
                                         )
-                                    case 'predictive_COD':
+                                    case 'predictiveCOD':
                                         score = (
                                             1 -
                                             ((y_pred - y_test) ** 2).sum() /
@@ -1089,9 +1150,9 @@ def predict(
                                         score = np.abs(y_pred - y_test).mean()
                                     case 'MSE':
                                         score = ((y_pred - y_test) ** 2).mean()
-                                    case 'MAE_norm':
+                                    case 'MAEnorm':
                                         score = np.abs(y_pred - y_test).mean() / y_test.std()
-                                    case 'MSE_norm':
+                                    case 'MSEnorm':
                                         # Don't know why it's variance here and
                                         # std in the other case, but I'm just
                                         # trying to be consistent with the
@@ -1120,9 +1181,21 @@ def predict(
 
                 scores[ds][name][target_name] = nested_scores
     results_df = pd.DataFrame({'ds': ds_, 'model': model_, 'target': target_, 'score': score_})
-    results_df.to_csv(f'{OUTPUT_DIR}/metrics/metric-{METRIC}_prediction.tsv', sep='\t', index=None)
+    results_df.to_csv(f'{OUTPUT_DIR}/metrics/on-{predict_on}_metric-{METRIC}_prediction.tsv', sep='\t', index=None)
     assert 0
     # {k: np.mean(v['age']) for k, v in scores['HCP'].items()}
+
+
+def plot_prediction_result():
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    # hardcode for now
+    df = pd.read_csv('/mnt/andromeda/Data/atlas_ts/metrics/on-connectomes_metric-predictiveCOD_prediction.tsv', sep='\t')
+    df['variable'] = [f'{j} ({i})' for i, j in zip(df.ds, df.target)]
+    plt.figure(figsize=(12, 9), layout='tight')
+    sns.boxplot(df, x='variable', y='score', hue='model')
+    plt.xticks(rotation=80); plt.axhline(ls=':', color='grey')
+    plt.savefig('/tmp/prediction.svg')
 
 
 def main(
@@ -1138,8 +1211,8 @@ def main(
     #recon_error_plot()
     #prepare_replication_material('full')
     #prepare_replication_material('parametric');
-    replication_analysis()
-    predict(num_parcels=num_parcels)
+    #replication_analysis()
+    predict(predict_on='parcellations', num_parcels=num_parcels)
 
 
 if __name__ == '__main__':
