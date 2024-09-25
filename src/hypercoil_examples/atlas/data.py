@@ -102,7 +102,7 @@ class SubjectRecord:
     ident: str
     image_pattern: str
     confounds_pattern: str | None = None
-    tasks: Sequence[str]
+    tasks: Sequence[Tuple[str, str]]
     rest_tasks: Sequence[str] | None = None
     sessions: Sequence[str] | None = None
     runs: Sequence[str] | None = None

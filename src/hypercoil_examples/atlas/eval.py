@@ -40,6 +40,7 @@ from hypercoil_examples.atlas.data import (
     SubjectRecord,
     HCP_RECORD_DEFAULTS,
     MSC_RECORD_DEFAULTS,
+    TASKS,
 )
 from hypercoil_examples.atlas.model import (
     init_full_model,
@@ -156,6 +157,59 @@ def aggregate_entities():
     records = sum(
         [records[ds] for ds in DATASETS], []
     )
+    return records
+
+
+def aggregate_time_series(ds: str, name: str, split: int = 0):
+    tasks = dict(TASKS[ds])
+    if ds == 'MSC':
+        subjects = MSC_SUBJECTS_VAL
+        sessions = MSC_SESSIONS
+        if split != 0:
+            sessions = (2 * split - 1, 2 * split)
+            sessions = tuple(f'{e:02d}' for e in sessions)
+        runs = None
+        rest_tasks = ('rest',)
+    elif ds == 'HCP':
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_val.txt', 'r') as f:
+            subjects = f.read().splitlines()
+        with open(f'{HCP_DATA_SPLIT_DEF_ROOT}/split_template.txt', 'r') as f:
+            subjects += f.read().splitlines()
+        sessions = None
+        runs = ('LR', 'RL')
+        rest_tasks = ('REST1', 'REST2')
+        match split:
+            case 1:
+                tasks.pop('REST2')
+                runs = ('LR',)
+                rest_tasks = ('REST1',)
+            case 2:
+                tasks.pop('REST2')
+                runs = ('RL',)
+                rest_tasks = ('REST1',)
+            case 3:
+                tasks.pop('REST1')
+                runs = ('LR',)
+                rest_tasks = ('REST2',)
+            case 4:
+                tasks.pop('REST1')
+                runs = ('RL',)
+                rest_tasks = ('REST2',)
+    records = [
+        SubjectRecord(
+            ds=ds,
+            ident=e,
+            image_pattern=(
+                f'{OUTPUT_DIR}/ts/ds-{ds}_' +
+                'sub-{subject}_ses-{session}_task-{task}_' + #'run-{run}'
+                f'atlas-{name}_ts.npy'
+            ),
+            tasks=tuple((k, v) for k, v in tasks.items()),
+            rest_tasks=rest_tasks,
+            sessions=sessions,
+        )
+        for e in subjects
+    ]
     return records
 
 
@@ -348,6 +402,7 @@ def prepare_timeseries():
         atlas[template] = np.load(
             f'{OUTPUT_DIR}/parcellations/{template}.npy'
         ).T
+    assert 0
 
     # EVALUATION
     model_keys = {}
@@ -439,7 +494,7 @@ def prepare_timeseries():
             for name, data in ts.items():
                 np.save(
                     f'{OUTPUT_DIR}/ts/ds-{record.ds}_sub-{subject}_'
-                    f'ses-{session}_task-{task}_atlas-{name}_ts.npy',
+                    f'ses-{session}_task-{task}_run-{run}_atlas-{name}_ts.npy',
                     np.asarray(data),
                     allow_pickle=False,
                 )
@@ -491,7 +546,7 @@ def recon_error_plot():
 
 def incorporate_block(blockwise: Tensor, overall: Tuple[Tensor, int]):
     if len(blockwise):
-        blockwise = (blockwise.sum(0), blockwise.shape[0])
+        blockwise = (blockwise.mean(0), blockwise.shape[0])
         denom = (overall[1] + blockwise[1])
         overall = (overall[0] * overall[1] + blockwise[0] * blockwise[1]) / denom, denom
     return overall
@@ -698,13 +753,14 @@ def replication_analysis(permutation_key: int = 73, null_samples: int = 100):
             ax.set_xticks([])
             ax.set_yticks([])
             num_instances = distance.shape[0]
+            interlw = 1.5 if num_instances < 100 else 0.5
             for i, (l0, l1) in enumerate(zip(ident[1:], ident[:-1])):
-                if l0 == l1:
+                if l0 == l1 and num_instances < 100:
                     ax.axvline(num_instances - i - 1.5, color='white', linewidth=.5)
                     ax.axhline(i + 0.5, color='white', linewidth=.5)
-                else:
-                    ax.axvline(num_instances - i - 1.5, color='white', linewidth=1.5)
-                    ax.axhline(i + 0.5, color='white', linewidth=1.5)
+                elif l0 != l1:
+                    ax.axvline(num_instances - i - 1.5, color='white', linewidth=interlw)
+                    ax.axhline(i + 0.5, color='white', linewidth=interlw)
             fig.savefig(f'/tmp/measure-distance_ds-{ds}_atlas-{model}.svg')
             per_instance_discr = discr(distance, ident)
             jnp.where(levels, per_instance_discr[None, :], jnp.nan)
@@ -717,8 +773,12 @@ def replication_analysis(permutation_key: int = 73, null_samples: int = 100):
             order = jnp.argsort(per_instance_discr)
             discr_null = discr_null[..., order]
             discr_ordered = per_instance_discr[order]
+            discr_null_df = pd.DataFrame({i: discr_null[..., i] for i in range(num_instances)})
             plt.figure(figsize=(10, 8), layout='tight')
-            sns.swarmplot(pd.DataFrame({i: discr_null[..., i] for i in range(num_instances)}), size=2, color='grey')
+            if num_instances < 100:
+                sns.swarmplot(discr_null_df, size=2, color='grey')
+            else:
+                sns.violinplot(discr_null_df, cut=0, color='grey')
             sns.despine()
             plt.scatter(range(num_instances), discr_ordered, color='purple', s=25)
             plt.xticks([])
@@ -782,6 +842,25 @@ def corr_kernel(X, y=None):
     return val
 
 
+
+def grid_search(grid_params: Mapping | Sequence[Mapping]):
+    """
+    Return an iterator over all param configurations, because
+    sklearn CV is unfortunately useless for our case
+    """
+    from functools import reduce
+    from itertools import chain, product
+    if isinstance(grid_params, Mapping):
+        grid_params = [grid_params]
+    yield from (
+        reduce(lambda e, f: {**e, **f}, z, {}) for z in
+        chain(*(
+            product(*[[{k: e} for e in v] for k, v in p.items()])
+            for p in grid_params
+        ))
+    )
+
+
 def predict(
     num_parcels: int = 200, # not needed, for now
 ):
@@ -792,78 +871,90 @@ def predict(
     from sklearn.kernel_ridge import KernelRidge
     from sklearn.metrics.pairwise import linear_kernel, rbf_kernel, cosine_similarity
     from sklearn.model_selection import GridSearchCV, cross_validate, GroupKFold, GroupShuffleSplit, StratifiedGroupKFold
-    DATA_GETTER = {
-        'MSC': get_msc_dataset,
-        'HCP': get_hcp_dataset,
-    }
-    models = list(BASELINES.keys()) + ['parametric', 'full']
+    from hypercoil_examples.atlas.data import TASKS, TASKS_TARGETS
+    NUM_TRIALS = 5 # 100 #
+    # Let's just always have the same count of inner and outer folds
+    FOLDS_OUTER = 4 # 20 #
+    FOLDS_INNER = 4 # 20 #
+    # CBIG likes this one, but it feels like cheating if I'm being honest
+    METRIC = 'corr' # 'predictive_COD' #
+    models = list(BASELINES.keys()) + ['parametric', 'full', 'groupTemplate', 'groupTemplateInitOnly']
+    ds_ = []
+    model_ = []
+    target_ = []
+    score_ = []
     scores = {}
     results = {}
-    TASKS.pop('MSC')
     for ds, tasks in TASKS.items():
+        objectives = ('task',)
         if ds == 'HCP':
             extra_measures = pd.read_csv(HCP_EXTRA_SUBJECT_MEASURES, sep='\t')
+            objectives = ('task', 'beh')
         scores[ds] = {}
         results[ds] = {}
-        for name in models:
+        for objective, name in product(objectives, models):
             scores[ds][name] = {}
             results[ds][name] = {}
-            tss = sorted(
-                pathlib.Path(
-                    f'{OUTPUT_DIR}'
-                ).glob(
-                    f'ds-{ds}_sub-*_ses-*_task-*_atlas-{name}_ts.npy'
-                )
+            if objective == 'task':
+                split = 0
+            else:
+                split = 1
+            records = sorted(
+                aggregate_time_series(ds, name, split=split),
+                key=lambda x: x.ident,
             )
-            num_parcels = np.load(tss[0]).shape[0]
-            connectomes = np.zeros(
-                (len(tss), int(num_parcels * (num_parcels - 1) / 2))
-            )
-            task_targets = np.zeros((len(tss), len(TASKS_TARGETS[ds])))
-            subject_ids = [None for _ in range(len(tss))]
-            if ds == 'HCP':
-                extra_targets = np.zeros((len(tss), extra_measures.shape[1] - 1))
-            for i, ts in enumerate(tss):
-                data = np.load(ts)
-                subject_id = re.match(
-                    '.*_sub-(?P<subject>[A-Z0-9]*)_.*',
-                    str(ts),
-                ).group('subject')
-                session_id = re.match(
-                    '.*_ses-(?P<session>[A-Z0-9]*)_.*',
-                    str(ts),
-                ).group('session')
-                taskname = [
-                    i for i in str(ts).split('/')[-1].split('_')
-                    if i[:4] == 'task'
-                ][0][5:]
-                if taskname[:4] == 'REST':
-                    taskname = 'REST'
-                subject_ids[i] = subject_id
-                connectomes[i] = sym2vec(np.corrcoef(data))
-                task_targets[i, TASKS_TARGETS[ds].index(dict(TASKS[ds])[taskname])] = 1
-                if ds == 'HCP':
-                    extra_targets[i] = extra_measures.loc[
-                        extra_measures['Subject'] == int(subject_id)
-                    ].values[0][1:]
-            ids_ref = np.array(subject_ids)
+            connectomes = []
+            targets = []
+            subject_ids = []
+            i = 0
+            for record in records:
+                subject = record.ident
+                if objective == 'task':
+                    iterator = record.iterator
+                else:
+                    iterator = record.rest_iterator
+                for ts, (task, session, run) in iterator(
+                    identifiers=True,
+                    get_confounds=False,
+                ):
+                    data = np.load(ts)
+                    task = dict(TASKS[ds])[task]
+                    subject_ids += [subject]
+                    connectomes += [sym2vec(np.corrcoef(data))]
+                    if objective == 'task':
+                        targets += [
+                            jnp.zeros(len(TASKS_TARGETS[ds])).at[
+                                TASKS_TARGETS[ds].index(task)
+                            ].set(1.),
+                        ]
+                    else:
+                        targets += [
+                                extra_measures.loc[
+                                extra_measures['Subject'] == int(subject)
+                            ].values[0][1:]
+                        ]
+            if len(connectomes) == 0:
+                continue
+            connectomes = np.asarray(connectomes)
+            targets = np.asarray(targets)
+            ids_ref = np.asarray(subject_ids)
             subject_ids = (
                 np.array(subject_ids)[..., None] ==
                 np.unique(subject_ids)[None, ...]
             ).argmax(-1)
-            task_targets = (task_targets.argmax(-1), 'task', 'categorical')
-            targets = [task_targets]
-            if ds == 'HCP':
+            if objective == 'task':
+                targets = [(targets.argmax(-1), 'task', 'categorical')]
+            elif ds == 'HCP':
                 age_targets = (
-                    extra_targets[..., -3:].argmax(-1),
+                    targets[..., -3:].argmax(-1),
                     'age',
                     'categorical',
                 )
                 continuous_targets = [
-                    (e, list(HCP_MEASURES.keys())[i], 'continuous')
-                    for i, e in enumerate(extra_targets[..., :-3].T)
+                    (e.astype(float), list(HCP_MEASURES.keys())[i], 'continuous')
+                    for i, e in enumerate(targets[..., :-3].T)
                 ]
-                targets = [task_targets] + [age_targets] + continuous_targets
+                targets = [age_targets] + continuous_targets
             # Run nested cross-validation
             # Based on https://scikit-learn.org/stable/auto_examples/ ...
             # ... model_selection/plot_nested_cross_validation_iris.html
@@ -874,12 +965,6 @@ def predict(
             #       Add it to the list of reasons I dislike turn-key,
             #       hack-unfriendly software. Stage and remove this after
             #       we manually build the CV loop in a non-terrible IDE
-            NUM_TRIALS = 5 # 100 #
-            # Let's just always have the same count of inner and outer folds
-            FOLDS_OUTER = 4 # 20 #
-            FOLDS_INNER = 4 # 20 #
-            # CBIG likes this one, but it feels like cheating if I'm being honest
-            METRIC = 'predictive_COD' # 'corr' #
             linear_kernels = [linear_kernel(connectomes)]
             rbf_kernels = [
                 rbf_kernel(connectomes, gamma=gamma)
@@ -894,13 +979,14 @@ def predict(
             corr_kernels = [corr_kernel(connectomes)]
             cosine_kernels = [cosine_similarity(connectomes)]
             kernel_spec = linear_kernels + rbf_kernels + corr_kernels + cosine_kernels
-            for i, (target, target_name, var_kind) in enumerate(targets[3:4]):
+            for i, (target, target_name, var_kind) in enumerate(targets):
                 nested_scores = np.zeros(NUM_TRIALS)
                 scores[ds][name][target_name] = {}
                 results[ds][name][target_name] = [None for _ in range(NUM_TRIALS)]
-                regularisation_grid = [0.1, 1, 10, 100, 1000]
+                #regularisation_grid = [0.1, 1, 10, 100, 1000]
                 regularisation_grid = [
-                    1e-8, 0.00001, 0.0001, 0.001, 0.004, 0.007, 0.01, 0.04, 0.07, 0.1,
+                    1e-8, 0.00001, 0.0001, 0.001, 0.004, 0.007,
+                    0.01, 0.04, 0.07, 0.1,
                     0.4, 0.7, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 10, 15,
                     20, 30, 40, 50, 60, 70, 80, 100, 150, 200,
                     300, 500, 700, 1000, 10000, 100000, 1000000,
@@ -1027,65 +1113,16 @@ def predict(
                         estimator.fit(X_train, y_train)
                         non_nested_scores[k] = estimator.score(X_test, y_test)
                     nested_scores[j] = non_nested_scores.mean()
-                # for j in range(NUM_TRIALS):
-                #     logging.info(
-                #         f'Running trial {i} for parcellation '
-                #         f'{name}, measure {target_name}'
-                #     )
-                #     inner_cv = cv_base(
-                #         n_splits=FOLDS_INNER,
-                #         random_state=i * NUM_TRIALS + j,
-                #         **cv_params,
-                #     )
-                #     outer_cv = cv_base(
-                #         n_splits=FOLDS_OUTER,
-                #         random_state=i * NUM_TRIALS + j,
-                #         **cv_params,
-                #     )
-                #     model = GridSearchCV(
-                #         estimator=model_base,
-                #         param_grid=param_grid,
-                #         cv=inner_cv,
-                #         error_score='raise',
-                #         #n_jobs=-1,
-                #     )
-                #     nested_result = cross_validate(
-                #         model,
-                #         X=connectomes,
-                #         y=target,
-                #         groups=subject_ids,
-                #         cv=outer_cv,
-                #         return_estimator=True,
-                #         verbose=3,
-                #         fit_params={'groups': subject_ids},
-                #         error_score='raise',
-                #         #n_jobs=-1,
-                #     )
-                #    nested_scores[j] = nested_result['test_score'].mean()
-                #    results[ds][target_name][name][j] = nested_result
+                    ds_ += [ds]
+                    model_ += [name]
+                    target_ += [target_name]
+                    score_ += [nested_scores[j].item()]
 
                 scores[ds][name][target_name] = nested_scores
+    results_df = pd.DataFrame({'ds': ds_, 'model': model_, 'target': target_, 'score': score_})
+    results_df.to_csv(f'{OUTPUT_DIR}/metrics/metric-{METRIC}_prediction.tsv', sep='\t', index=None)
     assert 0
     # {k: np.mean(v['age']) for k, v in scores['HCP'].items()}
-
-
-from functools import reduce
-from itertools import chain, product
-
-def grid_search(grid_params: Mapping | Sequence[Mapping]):
-    """
-    Return an iterator over all param configurations,
-    because sklearn CV is useless
-    """
-    if isinstance(grid_params, Mapping):
-        grid_params = [grid_params]
-    yield from (
-        reduce(lambda e, f: {**e, **f}, z, {}) for z in
-        chain(*(
-            product(*[[{k: e} for e in v] for k, v in p.items()])
-            for p in grid_params
-        ))
-    )
 
 
 def main(
